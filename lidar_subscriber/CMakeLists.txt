@@ -49,3 +49,11 @@ target_link_libraries(ndt_omp_mapping_node
   # pclomp
   OpenMP::OpenMP_CXX
 )
+
+add_executable(ndt_rosbag_mapping_node src/ndt_rosbag_mapping_node.cpp)
+target_link_libraries(ndt_rosbag_mapping_node
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
