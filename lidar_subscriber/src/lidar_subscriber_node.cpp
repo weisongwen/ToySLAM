@@ -6,7 +6,7 @@
 #include <string>
 #include <boost/filesystem.hpp>
 
-class PointCloudSaver
+class PointCloudSaver 
 {
 public:
     PointCloudSaver() : nh_("~"), save_count_(0)

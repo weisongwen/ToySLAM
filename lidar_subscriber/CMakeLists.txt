@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(lidar_subscriber)
+project(ToySLAM)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
