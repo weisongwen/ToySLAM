@@ -38,5 +38,7 @@
 1. Clone this repository into your ROS workspace:
    ```bash
    cd ~/catkin_ws/src
-   git clone https://github.com/your_username/ToySLAM.git
+   git clone https://github.com/weisongwen/ToySLAM
+   catkin_make
+   rosrun ToySLAM  ndt_rosbag_mapping_node /home/wws/Download/UrbanNav-HK_Whampoa-20210521_sensors.bag
    ```
