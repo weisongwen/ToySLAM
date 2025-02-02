@@ -39,6 +39,8 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIRT,
     (double, timestamp, timestamp)
 )
 
+
+
 class LOAMOdometry {
 public:
     LOAMOdometry() : nh_("~"), map_cloud_(new pcl::PointCloud<PointXYZIRT>()) {

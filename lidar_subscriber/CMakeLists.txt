@@ -26,8 +26,8 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_ros
 )
 
-# find_package(PCL 1.8 REQUIRED COMPONENTS common io filters)
-find_package(PCL REQUIRED)
+find_package(PCL 1.8 REQUIRED COMPONENTS common io filters kdtree)
+# find_package(PCL REQUIRED)
 
 find_package(OpenMP REQUIRED)
 
