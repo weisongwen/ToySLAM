@@ -37,9 +37,13 @@ find_package(Eigen3)
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIR}
+
+  geometry_msgs
+  visualization_msgs
+  xmlrpcpp
 )
 
-# find_package(Ceres REQUIRED)
+find_package(Ceres REQUIRED)
 
 
 find_package(Gflags)
@@ -95,6 +99,22 @@ target_link_libraries(ndt_rosbag_mapping_node
 
 add_executable(GPSRAIM_node src/GPSRAIM.cpp)
 target_link_libraries(GPSRAIM_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
+
+add_executable(uwb_node src/uwb_node.cpp)
+target_link_libraries(uwb_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
+
+add_executable(uwb_imu_node src/uwb_imu_node.cpp)
+target_link_libraries(uwb_imu_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   # pclomp
