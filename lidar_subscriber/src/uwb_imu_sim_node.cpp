@@ -8,7 +8,7 @@
 #include <cmath>
 #include <random>
 #include <deque>
-
+#include <nav_msgs/Odometry.h>
 #include <ceres/ceres.h>
 #include <Eigen/Dense>
 
@@ -24,7 +24,10 @@ public:
             uwb_pubs_[i] = nh_.advertise<sensor_msgs::Range>("/uwb_beacon_" + std::to_string(i), 10);
         }
         marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_markers", 1);
-        path_pub_ = nh_.advertise<nav_msgs::Path>("receiver_path", 10);
+        path_pub_ = nh_.advertise<nav_msgs::Path>("receiver_GT_path", 10);
+        user_path_pub_ = nh_.advertise<nav_msgs::Path>("user_path", 10);
+
+        pub_latest_odometry = nh_.advertise<geometry_msgs::PoseStamped>("UWBPoistion", 1000);
 
         // Beacon positions (x, y, z) in meters
         beacon_positions_ = {
@@ -47,6 +50,26 @@ public:
         uwb_timer_ = nh_.createTimer(ros::Duration(1.0/10.0), &SensorSimulator::publishUwb, this);
         vis_timer_ = nh_.createTimer(ros::Duration(0.1), &SensorSimulator::publishVisualization, this);
     }
+
+public:
+    struct RangeResidual {
+        RangeResidual(const Eigen::Vector3d& anchor, double measurement)
+            : anchor_(anchor), measurement_(measurement) {}
+
+        template <typename T>
+        bool operator()(const T* const position, T* residual) const {
+            T dx = position[0] - T(anchor_.x());
+            T dy = position[1] - T(anchor_.y());
+            T dz = position[2] - T(anchor_.z());
+            T distance = ceres::sqrt(dx*dx + dy*dy + dz*dz);
+            residual[0] = distance - T(measurement_);
+            // std::cout<<"residual[0] -> " << residual[0]<<"\n";
+            return true;
+        }
+
+        Eigen::Vector3d anchor_;
+        double measurement_;
+    };
 
 private:
     void publishImu(const ros::TimerEvent&) {
@@ -92,15 +115,31 @@ private:
         pose.pose.position = current_position_;
         path_.poses.push_back(pose);
 
+        //user position based on Cere solver least square 
+        pose.pose.position.x = user_pos(0);
+        pose.pose.position.y = user_pos(1);
+        pose.pose.position.z = user_pos(2);
+        path_user_position.poses.push_back(pose);
+
+        pub_latest_odometry.publish(pose);
+
         // Keep only last 100 poses
-        if(path_.poses.size() > 600) {
+        if(path_.poses.size() > 1200) {
             path_.poses.erase(path_.poses.begin());
         }
         path_.header.stamp = ros::Time::now();
         path_.header.frame_id = "map";
+
+        // Keep only last 100 poses ()
+        // if(path_user_position.poses.size() > 1200) {
+        //     path_user_position.poses.erase(path_user_position.poses.begin());
+        // }
+        path_user_position.header.stamp = ros::Time::now();
+        path_user_position.header.frame_id = "map";
     }
 
     void publishUwb(const ros::TimerEvent&) {
+        std::vector<double> measurements;
         for(size_t i=0; i<beacon_positions_.size(); i++) {
             sensor_msgs::Range uwb_msg;
             uwb_msg.header.stamp = ros::Time::now();
@@ -118,37 +157,52 @@ private:
             uwb_msg.range = distance + uwb_noise_(*gen_);
 
             uwb_pubs_[i].publish(uwb_msg);
+            measurements.push_back(uwb_msg.range);
         }
+
+        // when the imu data is availble, do the least square 
+        ceres::Problem problem;
+        Eigen::Vector3d position(1,0,0); // Perturbed initial guess
+        // double positioN[3]={1,0,0};
+        for (size_t i = 0; i < beacon_positions_.size(); ++i) {
+            Eigen::Vector3d anchor(beacon_positions_[i][0], beacon_positions_[i][1], beacon_positions_[i][2]);
+            ceres::CostFunction* cost_function =
+                new ceres::AutoDiffCostFunction<RangeResidual, 1, 3>(
+                    new RangeResidual(anchor, measurements[i]));
+            
+            ceres::LossFunction* loss_function = nullptr;
+            if (use_huber_loss_) {
+                loss_function = new ceres::HuberLoss(huber_loss_threshold_);
+            }
+
+            problem.AddResidualBlock(cost_function, new ceres::HuberLoss(0.1), position.data());
+            problem.AddResidualBlock(cost_function, NULL, position.data());
+            // problem.AddResidualBlock(cost_function, loss_function, positioN);
+        }
+        ceres::Solver::Options options;
+        // options.max_num_iterations = 20; // max_iterations_
+        // options.linear_solver_type = ceres::DENSE_QR;
+        // options.minimizer_progress_to_stdout = false;
+        // options.function_tolerance = solver_tolerance_;
+
+        options.use_nonmonotonic_steps = true;
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        options.trust_region_strategy_type = ceres::TrustRegionStrategyType::DOGLEG;
+        options.dogleg_type = ceres::DoglegType::SUBSPACE_DOGLEG;
+        options.num_threads = 8;
+        options.max_num_iterations = 258;
+
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        ceres::Solve(options, &problem, &summary);
+
+        ROS_DEBUG_COND(summary.termination_type != ceres::CONVERGENCE,
+                      "Optimization failed to converge: %s", 
+                      summary.FullReport().c_str());
+        user_pos = position;
+        // std::cout<<"user position-> " << position <<std::endl;
     }
 
-    // void publishVisualization(const ros::TimerEvent&) {
-    //     // Publish beacon markers
-    //     visualization_msgs::MarkerArray markers;
-    //     for(size_t i=0; i<beacon_positions_.size(); i++) {
-    //         visualization_msgs::Marker marker;
-    //         marker.header.frame_id = "map";
-    //         marker.header.stamp = ros::Time::now();
-    //         marker.ns = "uwb_beacons";
-    //         marker.id = i;
-    //         marker.type = visualization_msgs::Marker::SPHERE;
-    //         marker.action = visualization_msgs::Marker::ADD;
-    //         marker.pose.position.x = beacon_positions_[i][0];
-    //         marker.pose.position.y = beacon_positions_[i][1];
-    //         marker.pose.position.z = beacon_positions_[i][2];
-    //         marker.pose.orientation.w = 1.0;
-    //         marker.scale.x = marker.scale.y = marker.scale.z = 0.5;
-    //         marker.color.r = 1.0;
-    //         marker.color.g = 0.0;
-    //         marker.color.b = 0.0;
-    //         marker.color.a = 1.0;
-    //         marker.lifetime = ros::Duration();
-    //         markers.markers.push_back(marker);
-    //     }
-
-    //     // Publish receiver trajectory
-    //     path_pub_.publish(path_);
-    //     marker_pub_.publish(markers);
-    // }
 
     void publishVisualization(const ros::TimerEvent&) {
         // Publish beacon markers
@@ -213,6 +267,7 @@ private:
         
         // Publish receiver trajectory
         path_pub_.publish(path_);
+        user_path_pub_.publish(path_user_position);
     }
 
     ros::NodeHandle nh_;
@@ -220,6 +275,8 @@ private:
     std::vector<ros::Publisher> uwb_pubs_;
     ros::Publisher marker_pub_;
     ros::Publisher path_pub_;
+    ros::Publisher user_path_pub_;
+    ros::Publisher pub_latest_odometry;
     ros::Timer imu_timer_;
     ros::Timer uwb_timer_;
     ros::Timer vis_timer_;
@@ -230,8 +287,20 @@ private:
     std::normal_distribution<double> uwb_noise_;
     
     std::vector<std::vector<double>> beacon_positions_;
+    // std::vector<Eigen::Vector3d> beacon_positions_;
+    //Eigen::Vector3d
+
     geometry_msgs::Point current_position_;
     nav_msgs::Path path_;
+    nav_msgs::Path path_user_position;
+
+    // Optimization parameters
+    int max_iterations_;
+    double solver_tolerance_;
+    std::string linear_solver_type_;
+    bool use_huber_loss_;
+    double huber_loss_threshold_;
+    Eigen::Vector3d user_pos;
 };
 
 int main(int argc, char** argv) {

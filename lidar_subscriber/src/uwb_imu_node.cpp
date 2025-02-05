@@ -316,8 +316,8 @@ struct UWBFactor : public ceres::SizedCostFunction<1, 7> {
 class FusionNode {
 public:
     FusionNode() : nh_("~") {
-        imu_sub_ = nh_.subscribe("/imu", 1000, &FusionNode::imuCallback, this);
-        uwb_sub_ = nh_.subscribe("/uwb", 10, &FusionNode::uwbCallback, this);
+        imu_sub_ = nh_.subscribe("/sensor_simulator/imu_data", 1000, &FusionNode::imuCallback, this);
+        uwb_sub_ = nh_.subscribe("/sensor_simulator/UWBPoistion", 10, &FusionNode::uwbCallback, this);
         pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/fused_pose", 10);
 
         // Initialize states
