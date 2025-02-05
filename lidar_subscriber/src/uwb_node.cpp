@@ -9,10 +9,12 @@
 
 // roslaunch ToySLAM fusion.launch 
 
+// simulate the UWB ranging measurements and do the positioning
+
 class UWBPositionEstimator {
 public:
     UWBPositionEstimator() : nh_("~"), gen_(std::random_device{}()) {
-        loadParameters();
+        loadParameters(); // load the anchor position, etc
         initializePublishers();
         initializeMarkers();
         initializeTimer();

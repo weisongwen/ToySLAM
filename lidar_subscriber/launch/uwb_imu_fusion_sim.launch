@@ -1,0 +1,9 @@
+<launch>
+    <node pkg="ToySLAM" type="uwb_imu_sim_node" name="sensor_simulator" output="screen">
+        
+    </node>
+
+    <!-- Optional: Launch RViz with pre-configured settings -->
+    <node pkg="rviz" type="rviz" name="rviz" 
+        args="-d $(find ToySLAM)/config/uwb_imu.rviz"/>
+</launch>
