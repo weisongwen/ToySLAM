@@ -121,7 +121,13 @@ private:
         pose.pose.position.z = user_pos(2);
         path_user_position.poses.push_back(pose);
 
-        pub_latest_odometry.publish(pose);
+        nav_msgs::Odometry odometry;
+        odometry.header.stamp = ros::Time::now();
+        odometry.header.frame_id = "map";
+        odometry.pose.pose.position.x = user_pos(0);
+        odometry.pose.pose.position.y = user_pos(1);
+        odometry.pose.pose.position.z = user_pos(2);
+        pub_latest_odometry.publish(odometry);
 
         // Keep only last 100 poses
         if(path_.poses.size() > 1200) {
