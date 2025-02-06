@@ -326,7 +326,7 @@ public:
         Vector3d p(parameters[0]);
         residuals[0] = p.x() - z_.x();
         residuals[1] = p.y() - z_.y();
-        residuals[2] = p.z() - z_.z();
+        residuals[2] = p.z() - z_.z(); 
         return true;
     }
     
