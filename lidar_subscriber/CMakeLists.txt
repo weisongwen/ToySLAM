@@ -129,6 +129,15 @@ target_link_libraries(uwb_imu_sim_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
   OpenMP::OpenMP_CXX
 )
 
+add_executable(uwb_imu_EKF_node src/uwb_imu_EKF_node.cpp)
+target_link_libraries(uwb_imu_EKF_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
+
+
 # add_executable(loam_mapping_node src/loam_mapping_node.cpp)
 # target_link_libraries(loam_mapping_node
 #   ${catkin_LIBRARIES}

@@ -11,6 +11,7 @@
 #include <nav_msgs/Odometry.h>
 #include <ceres/ceres.h>
 #include <Eigen/Dense>
+#include <geometry_msgs/PointStamped.h>
 
 #include <vector>
 
@@ -29,6 +30,8 @@ public:
 
         pub_latest_odometry = nh_.advertise<nav_msgs::Odometry>("UWBPoistion", 1000);
 
+        pub_latest_odometry_ps = nh_.advertise<geometry_msgs::PointStamped>("UWBPoistionPS", 1000);
+
         // Beacon positions (x, y, z) in meters
         beacon_positions_ = {
             {5.0, 5.0, 0.0},
@@ -46,7 +49,7 @@ public:
         uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
 
         // Setup timers
-        imu_timer_ = nh_.createTimer(ros::Duration(1.0/500.0), &SensorSimulator::publishImu, this);
+        imu_timer_ = nh_.createTimer(ros::Duration(1.0/200.0), &SensorSimulator::publishImu, this);
         uwb_timer_ = nh_.createTimer(ros::Duration(1.0/10.0), &SensorSimulator::publishUwb, this);
         vis_timer_ = nh_.createTimer(ros::Duration(0.1), &SensorSimulator::publishVisualization, this);
     }
@@ -81,7 +84,7 @@ private:
         const double t = ros::Time::now().toSec();
         imu_msg.linear_acceleration.x = 0.5 * std::sin(t) + accel_noise_(*gen_);
         imu_msg.linear_acceleration.y = 0.2 * std::cos(0.5 * t) + accel_noise_(*gen_);
-        imu_msg.linear_acceleration.z = 9.8 + accel_noise_(*gen_);
+        imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
 
         // Simulate gyroscope data (rad/s)
         imu_msg.angular_velocity.x = 0.1 * std::sin(0.3 * t) + gyro_noise_(*gen_);
@@ -128,6 +131,14 @@ private:
         odometry.pose.pose.position.y = user_pos(1);
         odometry.pose.pose.position.z = user_pos(2);
         pub_latest_odometry.publish(odometry);
+
+        // geometry_msgs::PointStamped est_msg;
+        // est_msg.header = odometry.header;
+        
+        // est_msg.point.x = user_pos(0);
+        // est_msg.point.y = user_pos(1);
+        // est_msg.point.z = user_pos(2);
+        // pub_latest_odometry_ps.publish(est_msg);
 
         // Keep only last 100 poses
         if(path_.poses.size() > 1200) {
@@ -206,7 +217,16 @@ private:
                       "Optimization failed to converge: %s", 
                       summary.FullReport().c_str());
         user_pos = position;
-        std::cout<<"user position-> " << position <<std::endl;
+        // std::cout<<"user position-> " << position <<std::endl;
+
+        geometry_msgs::PointStamped est_msg;
+        est_msg.header.stamp = ros::Time::now();
+        est_msg.header.frame_id = "map";
+        
+        est_msg.point.x = user_pos(0);
+        est_msg.point.y = user_pos(1);
+        est_msg.point.z = user_pos(2);
+        pub_latest_odometry_ps.publish(est_msg);
     }
 
 
@@ -283,6 +303,7 @@ private:
     ros::Publisher path_pub_;
     ros::Publisher user_path_pub_;
     ros::Publisher pub_latest_odometry;
+    ros::Publisher pub_latest_odometry_ps;
     ros::Timer imu_timer_;
     ros::Timer uwb_timer_;
     ros::Timer vis_timer_;
