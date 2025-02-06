@@ -27,7 +27,7 @@ public:
         path_pub_ = nh_.advertise<nav_msgs::Path>("receiver_GT_path", 10);
         user_path_pub_ = nh_.advertise<nav_msgs::Path>("user_path", 10);
 
-        pub_latest_odometry = nh_.advertise<geometry_msgs::PoseStamped>("UWBPoistion", 1000);
+        pub_latest_odometry = nh_.advertise<nav_msgs::Odometry>("UWBPoistion", 1000);
 
         // Beacon positions (x, y, z) in meters
         beacon_positions_ = {
@@ -206,7 +206,7 @@ private:
                       "Optimization failed to converge: %s", 
                       summary.FullReport().c_str());
         user_pos = position;
-        // std::cout<<"user position-> " << position <<std::endl;
+        std::cout<<"user position-> " << position <<std::endl;
     }
 
 

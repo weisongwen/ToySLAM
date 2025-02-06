@@ -313,6 +313,27 @@ struct UWBFactor : public ceres::SizedCostFunction<1, 7> {
     double measurement_;
 };
 
+class UWBFactorLoose : public ceres::CostFunction {
+public:
+    UWBFactorLoose(const Vector3d& z) : z_(z) {
+        set_num_residuals(3);
+        mutable_parameter_block_sizes()->push_back(3);  
+    }
+
+    virtual bool Evaluate(double const*const* parameters,
+                          double* residuals,
+                          double** jacobians) const {
+        Vector3d p(parameters[0]);
+        residuals[0] = p.x() - z_.x();
+        residuals[1] = p.y() - z_.y();
+        residuals[2] = p.z() - z_.z();
+        return true;
+    }
+    
+private:
+    Vector3d z_;
+};
+
 class FusionNode {
 public:
     FusionNode() : nh_("~") {
