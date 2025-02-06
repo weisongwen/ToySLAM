@@ -8,6 +8,7 @@
 - **NDT-Based Registration**: Efficient alignment of 3D point clouds using the NDT implementation.
 - **Real-Time Visualization**: Live preview of registered point clouds and **trajectory** in RViz.
 - **Configurable Parameters**: Tune algorithm behavior via ROS parameters for optimal performance.
+- **Configurable Parameters**: Tune algorithm behavior via ROS parameters for optimal performance.
 
 ### Nodes
 1. **lidar_subscriber_node.cpp**: subscribe the 3D LiDAR point clouds from the rosbag file and save the point clouds to the PCD files.
@@ -42,3 +43,20 @@
    catkin_make
    rosrun ToySLAM  ndt_rosbag_mapping_node /home/wws/Download/UrbanNav-HK_Whampoa-20210521_sensors.bag
    ```
+
+
+## NEW updates for further extension (Optional)
+1. ```uwb_node.cpp```
+    - simulate the UWB ranging measurements and do the positioning
+    - ```roslaunch ToySLAM fusion.launch ```
+
+2. ```uwb_imu_node.cpp```
+    - UWB/IMU fusion via sliding window optimization
+    - ```rosrun ToySLAM uwb_imu_node ```
+
+3. ```uwb_imu_sim_node.cpp```
+    - UWB/IMU data simulation. Perform the least square estimation for UWB ranging measurements with visualization
+    - ```roslaunch ToySLAM uwb_imu_fusion_sim.launch ```
+4. ```uwb_imu_EKF_node.cpp```
+    - UWB/IMU fusion with EKF. The simulated IMU data is not correct, please use the dataset ```2025-02-06-16-30-08.bag```
+    - ```rosrun ToySLAM uwb_imu_EKF_node ```

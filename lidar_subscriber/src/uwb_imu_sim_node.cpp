@@ -80,16 +80,34 @@ private:
         imu_msg.header.stamp = ros::Time::now();
         imu_msg.header.frame_id = "map";
 
-        // Simulate accelerometer data (m/s²)
         const double t = ros::Time::now().toSec();
-        imu_msg.linear_acceleration.x = 0.5 * std::sin(t) + accel_noise_(*gen_);
-        imu_msg.linear_acceleration.y = 0.2 * std::cos(0.5 * t) + accel_noise_(*gen_);
-        imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
+        if(0) // default version
+        {
+            // Simulate accelerometer data (m/s²)
+            imu_msg.linear_acceleration.x = 0.5 * std::sin(t) + accel_noise_(*gen_);
+            imu_msg.linear_acceleration.y = 0.2 * std::cos(0.5 * t) + accel_noise_(*gen_);
+            imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
 
-        // Simulate gyroscope data (rad/s)
-        imu_msg.angular_velocity.x = 0.1 * std::sin(0.3 * t) + gyro_noise_(*gen_);
-        imu_msg.angular_velocity.y = 0.05 * std::cos(0.2 * t) + gyro_noise_(*gen_);
-        imu_msg.angular_velocity.z = 0.2 * std::sin(0.1 * t) + gyro_noise_(*gen_);
+            // Simulate gyroscope data (rad/s)
+            imu_msg.angular_velocity.x = 0.1 * std::sin(0.3 * t) + gyro_noise_(*gen_);
+            imu_msg.angular_velocity.y = 0.05 * std::cos(0.2 * t) + gyro_noise_(*gen_);
+            imu_msg.angular_velocity.z = 0.2 * std::sin(0.1 * t) + gyro_noise_(*gen_);
+        }
+        else  // revised version
+        {
+            // Simulate accelerometer data (m/s²)
+            
+            imu_msg.linear_acceleration.x = 3 * -0.5*0.5 * std::sin(t) + accel_noise_(*gen_);
+            imu_msg.linear_acceleration.y = 3 * -1*0.5*0.5* std::cos(0.5 * t) + accel_noise_(*gen_);
+            imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
+
+            // Simulate gyroscope data (rad/s)
+            imu_msg.angular_velocity.x = 0 + gyro_noise_(*gen_);
+            imu_msg.angular_velocity.y = 0 + gyro_noise_(*gen_);
+            imu_msg.angular_velocity.z = -0.5 + gyro_noise_(*gen_);
+            // imu_msg.angular_velocity.z = 0 + gyro_noise_(*gen_);
+        }
+        
 
         // Orientation (for visualization)
         tf2::Quaternion q;

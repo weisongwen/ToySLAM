@@ -3,13 +3,20 @@
 #include <geometry_msgs/PointStamped.h>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Path.h>
 
 class ESKFFusionNode {
 public:
     ESKFFusionNode() : nh_("~") {
         // Subscribers
-        imu_sub_ = nh_.subscribe("/sensor_simulator/imu_data", 100, &ESKFFusionNode::imuCallback, this);
-        uwb_sub_ = nh_.subscribe("/sensor_simulator/UWBPoistionPS", 10, &ESKFFusionNode::uwbCallback, this);
+        // imu_sub_ = nh_.subscribe("/sensor_simulator/imu_data", 100, &ESKFFusionNode::imuCallback, this);
+        // uwb_sub_ = nh_.subscribe("/sensor_simulator/UWBPoistionPS", 10, &ESKFFusionNode::uwbCallback, this);
+
+        imu_sub_ = nh_.subscribe("/imu/data", 100, &ESKFFusionNode::imuCallback, this);
+        uwb_sub_ = nh_.subscribe("/vins_estimator/UWBPoistionPS", 10, &ESKFFusionNode::uwbCallback, this);
+
+        user_path_pub_ = nh_.advertise<nav_msgs::Path>("user_path", 10);
         
         // Publisher
         fused_pose_pub_ = nh_.advertise<geometry_msgs::PointStamped>("/fusedPos", 10);
@@ -22,7 +29,8 @@ public:
         gyro_noise_ = 0.005;
         acc_bias_noise_ = 0.0001;
         gyro_bias_noise_ = 0.0001;
-        uwb_noise_ = 0.000001;
+        
+        uwb_noise_ = 0.5; // 0.1
 
         last_imu_time_ = ros::Time::now();
     }
@@ -72,7 +80,7 @@ public:
         publishFusedPose(msg->header.stamp);
 
         Eigen::Vector3d p = x_.segment<3>(0);
-        // std::cout<<"p->  "<< p<<"\n";
+        std::cout<<"p->  "<< p<<"\n";
     }
 
 private:
@@ -232,11 +240,28 @@ private:
         pose_msg.point.y = x_(1);
         pose_msg.point.z = x_(2);
         fused_pose_pub_.publish(pose_msg);
+
+        // Add to path
+        geometry_msgs::PoseStamped pose;
+        pose.header.stamp = stamp;
+        pose.header.frame_id = "map";
+
+        path_user_position.header.stamp = stamp;
+        path_user_position.header.frame_id = "map";
+
+        pose.pose.position.x = x_(0);
+        pose.pose.position.y = x_(1);
+        pose.pose.position.z = x_(2);
+        path_user_position.poses.push_back(pose);
+        user_path_pub_.publish(path_user_position);
+
     }
 
     ros::NodeHandle nh_;
     ros::Subscriber imu_sub_, uwb_sub_;
     ros::Publisher fused_pose_pub_;
+    ros::Publisher user_path_pub_;
+    nav_msgs::Path path_user_position;
     
     Eigen::VectorXd x_;      // 16D state vector
     Eigen::MatrixXd P_;      // 15x15 covariance matrix
