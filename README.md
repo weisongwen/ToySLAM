@@ -1,4 +1,4 @@
-# ToySLAM: A ROS Package for 3D Point Cloud Registration using NDT PolyU course AAE4011
+# ToySLAM: A ROS Package for 3D Point Cloud Registration using NDT for PolyU course AAE4011
 
 ## Overview
 **ToySLAM** is a lightweight ROS package for 3D point cloud registration using the Normal Distributions Transform (NDT) algorithm. Designed for educational purposes and experimentation, this package provides a modular pipeline to process, align, and visualize point clouds in real-time. It serves as a foundational framework for SLAM (Simultaneous Localization and Mapping) applications and can be extended for robotics or autonomous systems.
