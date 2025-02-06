@@ -62,3 +62,4 @@
 4. ```uwb_imu_EKF_node.cpp```
     - UWB/IMU fusion with EKF. The simulated IMU data is not correct, please use the dataset ```2025-02-06-16-30-08.bag```
     - ```rosrun ToySLAM uwb_imu_EKF_node ```
+    - ```rosbag play 2025-02-06-16-30-08.bag ```
