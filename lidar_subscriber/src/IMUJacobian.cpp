@@ -1,128 +1,155 @@
-void propagateCovariance(const Vector3d& accel, const Vector3d& gyro, double delta_t) {
-    Matrix9d F = Matrix9d::Zero();
-    Matrix9d G = Matrix9d::Zero();
-    
-    Matrix3d R = dR;
-    Vector3d a = R * accel;
-    Vector3d w = gyro;
+#include <ros/ros.h>
+#include <sensor_msgs/Imu.h>
+#include <geometry_msgs/PointStamped.h>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <random>
 
-    // State transition matrix
-    F.block<3,3>(0,0) = Matrix3d::Identity();
-    F.block<3,3>(0,3) = -delta_t * R;
-    F.block<3,3>(3,3) = Matrix3d::Identity();
-    F.block<3,3>(3,6) = -R * delta_t;
-    F.block<3,3>(6,6) = Matrix3d::Identity();
+class DataSimulator {
+public:
+    DataSimulator() : nh_("~"), gen_(rd_()) {
+        // Publishers
+        imu_pub_ = nh_.advertise<sensor_msgs::Imu>("/imu/data", 10);
+        uwb_pub_ = nh_.advertise<geometry_msgs::PointStamped>("/uwb/position", 10);
 
-    // Noise covariance matrix
-    G.block<3,3>(0,0) = 0.5 * delta_t * delta_t * R;
-    G.block<3,3>(3,3) = delta_t * R;
-    G.block<3,3>(6,6) = Matrix3d::Identity() * delta_t;
+        // Parameters
+        nh_.param("radius", radius_, 1.0);
+        nh_.param("angular_velocity", omega_, 1.0);
+        nh_.param("sim_frequency", sim_freq_, 100.0);
+        nh_.param("uwb_noise_std", uwb_noise_std_, 0.01);
+        nh_.param("accel_noise_std", accel_noise_std_, 0.01);
+        nh_.param("gyro_noise_std", gyro_noise_std_, 0.001);
 
-    covariance = F * covariance * F.transpose() + 
-                G * (ACCEL_NOISE_SIGMA * ACCEL_NOISE_SIGMA * Matrix9d::Identity()) * G.transpose();
-}
+        // Initialize simulation time
+        sim_time_ = 0.0;
+        dt_ = 1.0 / sim_freq_;
 
-struct IMUFactor : public ceres::SizedCostFunction<9, 7, 9, 7, 9> {
-    IMUFactor(const IMUPreintegrator& preint) : preint_(preint) {}
+        // Initialize random number generators
+        accel_noise_ = std::normal_distribution<double>(0.0, accel_noise_std_);
+        gyro_noise_ = std::normal_distribution<double>(0.0, gyro_noise_std_);
+        uwb_noise_ = std::normal_distribution<double>(0.0, uwb_noise_std_);
 
-    virtual bool Evaluate(double const* const* parameters, 
-                         double* residuals, 
-                         double** jacobians) const {
-        // [Previous parameter unpacking and residual calculation remains the same]
-
-        // Jacobian calculations
-        if (jacobians) {
-            Matrix3d Ri = qi.toRotationMatrix();
-            Matrix3d Rj = qj.toRotationMatrix();
-            
-            // Pre-compute common terms
-            Matrix3d DR = preint_.dR.transpose();
-            Matrix3d RiT = Ri.transpose();
-            Matrix3d RiT_Rj = RiT * Rj;
-            Matrix3d Jr = RotationJacobian((DR * RiT_Rj).log());
-
-            // Jacobian w.r.t. pose_i (position)
-            if (jacobians[0]) {
-                Eigen::Map<Eigen::Matrix<double, 9, 7, Eigen::RowMajor>> J(jacobians[0]);
-                J.setZero();
-                
-                // Position residual derivatives
-                J.block<3,3>(0,0) = -RiT;
-                
-                // Velocity residual derivatives
-                J.block<3,3>(3,0) = Matrix3d::Zero();
-                
-                // Orientation residual derivatives
-                J.block<3,3>(6,0) = Matrix3d::Zero();
-                
-                // Quaternion derivatives (using right perturbation)
-                Matrix3d dq_dtheta = 0.5 * RiT;
-                J.block<3,3>(0,3) = RiT * skewSymmetric(vi * preint_.dt - (pj - pi));
-                J.block<3,3>(3,3) = RiT * skewSymmetric(vi);
-                J.block<3,3>(6,3) = -Jr * RiT_Rj.transpose();
-            }
-
-            // Jacobian w.r.t. speed_bias_i
-            if (jacobians[1]) {
-                Eigen::Map<Eigen::Matrix<double, 9, 9, Eigen::RowMajor>> J(jacobians[1]);
-                J.setZero();
-                
-                // Velocity residual derivatives
-                J.block<3,3>(3,0) = -RiT;
-                
-                // Position residual derivatives
-                J.block<3,3>(0,0) = -RiT * preint_.dt;
-                
-                // Accelerometer bias derivatives
-                J.block<3,3>(0,3) = -preint_.dP_dba;
-                J.block<3,3>(3,3) = -preint_.dV_dba;
-                
-                // Gyroscope bias derivatives
-                J.block<3,3>(6,6) = -preint_.dR_dbg;
-            }
-
-            // Jacobian w.r.t. pose_j
-            if (jacobians[2]) {
-                Eigen::Map<Eigen::Matrix<double, 9, 7, Eigen::RowMajor>> J(jacobians[2]);
-                J.setZero();
-                
-                // Position residual derivatives
-                J.block<3,3>(0,0) = RiT;
-                
-                // Orientation residual derivatives
-                J.block<3,3>(6,3) = Jr;
-            }
-
-            // Jacobian w.r.t. speed_bias_j
-            if (jacobians[3]) {
-                Eigen::Map<Eigen::Matrix<double, 9, 9, Eigen::RowMajor>> J(jacobians[3]);
-                J.setZero();
-                
-                // Velocity residual derivatives
-                J.block<3,3>(3,0) = RiT;
-            }
-        }
-        return true;
+        // Start simulation timer
+        timer_ = nh_.createTimer(ros::Duration(dt_), &DataSimulator::simulateData, this);
     }
 
 private:
-    Matrix3d skewSymmetric(const Vector3d& v) const {
-        Matrix3d S;
-        S <<  0, -v.z(),  v.y(),
-            v.z(),   0, -v.x(),
-            -v.y(), v.x(),   0;
-        return S;
+    void simulateData(const ros::TimerEvent& event) {
+        // Calculate current angle
+        double theta = omega_ * sim_time_;
+        
+        // Calculate trajectory
+        Eigen::Vector3d position(
+            radius_ * cos(theta),
+            radius_ * sin(theta),
+            0.0
+        );
+        
+        // Calculate velocity
+        Eigen::Vector3d velocity(
+            -radius_ * omega_ * sin(theta),
+            radius_ * omega_ * cos(theta),
+            0.0
+        );
+        
+        // Calculate centripetal acceleration
+        Eigen::Vector3d acceleration(
+            -radius_ * omega_ * omega_ * cos(theta),
+            -radius_ * omega_ * omega_ * sin(theta),
+            0.0
+        );
+
+        // Calculate orientation (yaw)
+        double yaw = theta + M_PI/2; // Tangent to circle
+        Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+
+        // IMU simulation
+        // -------------------------------
+        // Calculate proper acceleration (world frame)
+        Eigen::Vector3d gravity(0.0, 0.0, 9.81);
+        Eigen::Vector3d acc_world = acceleration + gravity;
+
+        // Rotate to body frame
+        Eigen::Vector3d acc_body = q.conjugate() * acc_world;
+
+        // Add noise
+        acc_body.x() += accel_noise_(gen_);
+        acc_body.y() += accel_noise_(gen_);
+        acc_body.z() += accel_noise_(gen_);
+
+        // Angular velocity (body frame)
+        Eigen::Vector3d gyro(0.0, 0.0, omega_);
+        gyro.x() += gyro_noise_(gen_);
+        gyro.y() += gyro_noise_(gen_);
+        gyro.z() += gyro_noise_(gen_);
+
+        // Create IMU message
+        sensor_msgs::Imu imu_msg;
+        imu_msg.header.stamp = ros::Time::now();
+        imu_msg.header.frame_id = "imu";
+
+        // Set orientation (ground truth for reference)
+        imu_msg.orientation.w = q.w();
+        imu_msg.orientation.x = q.x();
+        imu_msg.orientation.y = q.y();
+        imu_msg.orientation.z = q.z();
+
+        // Set angular velocity
+        imu_msg.angular_velocity.x = gyro.x();
+        imu_msg.angular_velocity.y = gyro.y();
+        imu_msg.angular_velocity.z = gyro.z();
+
+        // Set linear acceleration
+        imu_msg.linear_acceleration.x = acc_body.x();
+        imu_msg.linear_acceleration.y = acc_body.y();
+        imu_msg.linear_acceleration.z = acc_body.z();
+
+        // UWB simulation
+        // -------------------------------
+        geometry_msgs::PointStamped uwb_msg;
+        uwb_msg.header.stamp = imu_msg.header.stamp;
+        uwb_msg.header.frame_id = "world";
+        
+        // Add noise to position
+        uwb_msg.point.x = position.x() + uwb_noise_(gen_);
+        uwb_msg.point.y = position.y() + uwb_noise_(gen_);
+        uwb_msg.point.z = position.z() + uwb_noise_(gen_);
+
+        // Publish messages
+        imu_pub_.publish(imu_msg);
+        uwb_pub_.publish(uwb_msg);
+
+        // Increment simulation time
+        sim_time_ += dt_;
     }
 
-    Matrix3d RotationJacobian(const Vector3d& phi) const {
-        double theta = phi.norm();
-        Matrix3d J = Matrix3d::Identity();
-        if (theta > 1e-6) {
-            Matrix3d phi_hat = skewSymmetric(phi);
-            J = Matrix3d::Identity() 
-                + (1 - cos(theta)) / (theta * theta) * phi_hat
-                + (theta - sin(theta)) / (theta * theta * theta) * phi_hat * phi_hat;
-        }
-        return J;
-    }
+    ros::NodeHandle nh_;
+    ros::Publisher imu_pub_, uwb_pub_;
+    ros::Timer timer_;
+
+    // Simulation parameters
+    double radius_;
+    double omega_;
+    double sim_freq_;
+    double sim_time_;
+    double dt_;
+
+    // Noise parameters
+    double uwb_noise_std_;
+    double accel_noise_std_;
+    double gyro_noise_std_;
+
+    // Random number generation
+    std::random_device rd_;
+    std::mt19937 gen_;
+    std::normal_distribution<double> accel_noise_;
+    std::normal_distribution<double> gyro_noise_;
+    std::normal_distribution<double> uwb_noise_;
 };
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "data_simulator");
+    DataSimulator simulator;
+    ros::spin();
+    return 0;
+}

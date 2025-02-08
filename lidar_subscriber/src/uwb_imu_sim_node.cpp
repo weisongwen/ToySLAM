@@ -41,6 +41,12 @@ public:
             {0.0, 0.0, 3.0}
         };
 
+        sim_freq_ = 200;
+        sim_time_ = 0.0;
+        dt_ = 1.0 / sim_freq_;
+        omega_ = 0.1; // 0.5
+        radius_ = 3.0;
+
         // Initialize random generators
         std::random_device rd;
         gen_.reset(new std::mt19937(rd()));
@@ -49,8 +55,8 @@ public:
         uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
 
         // Setup timers
-        imu_timer_ = nh_.createTimer(ros::Duration(1.0/200.0), &SensorSimulator::publishImu, this);
-        uwb_timer_ = nh_.createTimer(ros::Duration(1.0/10.0), &SensorSimulator::publishUwb, this);
+        imu_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_), &SensorSimulator::publishImu, this);
+        uwb_timer_ = nh_.createTimer(ros::Duration(1.0/(sim_freq_*0.1)), &SensorSimulator::publishUwb, this);
         vis_timer_ = nh_.createTimer(ros::Duration(0.1), &SensorSimulator::publishVisualization, this);
     }
 
@@ -81,6 +87,7 @@ private:
         imu_msg.header.frame_id = "map";
 
         const double t = ros::Time::now().toSec();
+        // std::cout<<"t-> " << t <<std::endl;
         if(0) // default version
         {
             // Simulate accelerometer data (m/s²)
@@ -93,29 +100,65 @@ private:
             imu_msg.angular_velocity.y = 0.05 * std::cos(0.2 * t) + gyro_noise_(*gen_);
             imu_msg.angular_velocity.z = 0.2 * std::sin(0.1 * t) + gyro_noise_(*gen_);
         }
-        else  // revised version
+        else   // revised version
         {
-            // Simulate accelerometer data (m/s²)
-            
-            imu_msg.linear_acceleration.x = 3 * -0.5*0.5 * std::sin(t) + accel_noise_(*gen_);
-            imu_msg.linear_acceleration.y = 3 * -1*0.5*0.5* std::cos(0.5 * t) + accel_noise_(*gen_);
-            imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
 
-            // Simulate gyroscope data (rad/s)
-            imu_msg.angular_velocity.x = 0 + gyro_noise_(*gen_);
-            imu_msg.angular_velocity.y = 0 + gyro_noise_(*gen_);
-            imu_msg.angular_velocity.z = -0.5 + gyro_noise_(*gen_);
-            // imu_msg.angular_velocity.z = 0 + gyro_noise_(*gen_);
+            double theta = omega_ * t;
+
+            // Calculate velocity
+            Eigen::Vector3d velocity(
+                -radius_ * omega_ * sin(theta),
+                radius_ * omega_ * cos(theta),
+                0.0
+            );
+
+            // Calculate centripetal acceleration
+            Eigen::Vector3d acceleration(
+                -radius_ * omega_ * omega_ * cos(theta),
+                -radius_ * omega_ * omega_ * sin(theta),
+                0.0
+            );
+
+            // Calculate orientation (yaw)
+            double yaw = theta + M_PI/2; // Tangent to circle
+            Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+
+            // IMU simulation
+            // -------------------------------
+            // Calculate proper acceleration (world frame)
+            Eigen::Vector3d gravity(0.0, 0.0, 9.81);
+            Eigen::Vector3d acc_world = acceleration + gravity;
+
+            // Rotate to body frame
+            Eigen::Vector3d acc_body = q.conjugate() * acc_world;
+
+            // Add noise
+            acc_body.x() += accel_noise_(*gen_);
+            acc_body.y() += accel_noise_(*gen_);
+            acc_body.z() += accel_noise_(*gen_);
+
+            // Angular velocity (body frame)
+            Eigen::Vector3d gyro(0.0, 0.0, omega_);
+            gyro.x() += gyro_noise_(*gen_);
+            gyro.y() += gyro_noise_(*gen_);
+            gyro.z() += gyro_noise_(*gen_);
+
+            // Set orientation (ground truth for reference)
+            imu_msg.orientation.w = q.w();
+            imu_msg.orientation.x = q.x();
+            imu_msg.orientation.y = q.y();
+            imu_msg.orientation.z = q.z();
+
+            // Set angular velocity
+            imu_msg.angular_velocity.x = gyro.x();
+            imu_msg.angular_velocity.y = gyro.y();
+            imu_msg.angular_velocity.z = gyro.z();
+
+            imu_msg.linear_acceleration.x = acc_body.x();
+            imu_msg.linear_acceleration.y = acc_body.y();
+            imu_msg.linear_acceleration.z = acc_body.z();
+
         }
-        
-
-        // Orientation (for visualization)
-        tf2::Quaternion q;
-        q.setRPY(0, 0, t);
-        imu_msg.orientation.x = q.x();
-        imu_msg.orientation.y = q.y();
-        imu_msg.orientation.z = q.z();
-        imu_msg.orientation.w = q.w();
 
         imu_pub_.publish(imu_msg);
 
@@ -125,8 +168,8 @@ private:
 
     void updateReceiverPath(double t) {
         // Simulate receiver trajectory (circular motion)
-        current_position_.x = 3.0 * std::cos(t * 0.5);
-        current_position_.y = 3.0 * std::sin(t * 0.5);
+        current_position_.x = radius_ * std::cos(t * omega_);
+        current_position_.y = radius_ * std::sin(t * omega_);
         current_position_.z = 1.0;
 
         // Add to path
@@ -346,6 +389,13 @@ private:
     bool use_huber_loss_;
     double huber_loss_threshold_;
     Eigen::Vector3d user_pos;
+
+    // paras for IMU data simulation: Simulation parameters
+    double radius_; // radius of circle 
+    double omega_; // angular velocity of the circle
+    double sim_freq_; // sim frequecny 
+    double sim_time_;
+    double dt_; // dt of the timer
 };
 
 int main(int argc, char** argv) {

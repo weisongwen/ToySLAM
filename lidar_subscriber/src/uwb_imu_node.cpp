@@ -439,18 +439,18 @@ public:
         // Add IMU factors
         for (size_t i = 1; i < states_.size(); ++i) {
             ceres::CostFunction* factor = new ImuFactor(preint.result);
-            problem.AddResidualBlock(factor, nullptr, 
+            problem.AddResidualBlock(factor, NULL, 
                                    parameter_blocks[2*(i-1)], 
                                    parameter_blocks[2*(i-1)+1],
                                    parameter_blocks[2*i],
                                    parameter_blocks[2*i+1]);
         }
 
-        // Add UWB factors
+        // Add UWB factors (tightly coupled integration)
         for (size_t i = 0; i < states_.size(); ++i) {
             for (const auto& anchor : anchors_) {
                 ceres::CostFunction* factor = new UWBFactor(anchor, uwb_msg.point.x);
-                problem.AddResidualBlock(factor, nullptr, parameter_blocks[2*i]);
+                problem.AddResidualBlock(factor, NULL, parameter_blocks[2*i]);
             }
         }
 

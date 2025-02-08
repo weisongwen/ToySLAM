@@ -30,7 +30,7 @@ public:
         acc_bias_noise_ = 0.0001;
         gyro_bias_noise_ = 0.0001;
         
-        uwb_noise_ = 0.5; // 0.1
+        uwb_noise_ = 0.001; // 0.1
 
         last_imu_time_ = ros::Time::now();
     }
