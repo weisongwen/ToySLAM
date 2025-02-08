@@ -52,6 +52,7 @@ public:
         gen_.reset(new std::mt19937(rd()));
         accel_noise_ = std::normal_distribution<double>(0.0, 0.01);
         gyro_noise_ = std::normal_distribution<double>(0.0, 0.005);
+        // uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
         uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
 
         // Setup timers
@@ -268,11 +269,11 @@ private:
         options.trust_region_strategy_type = ceres::TrustRegionStrategyType::DOGLEG;
         options.dogleg_type = ceres::DoglegType::SUBSPACE_DOGLEG;
         options.num_threads = 8;
-        options.max_num_iterations = 258;
+        options.max_num_iterations = 20;
 
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        ceres::Solve(options, &problem, &summary);
+        // ceres::Solve(options, &problem, &summary);
 
         ROS_DEBUG_COND(summary.termination_type != ceres::CONVERGENCE,
                       "Optimization failed to converge: %s", 
