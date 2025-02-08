@@ -60,6 +60,7 @@ public:
 
             // Perform registration
             Eigen::Matrix4f transform = perform_registration(prev_cloud, filtered);
+            pres_transform = transform;
             pose = pose * transform;
 
             // Update tracking
@@ -85,7 +86,9 @@ private:
         nh_.param<int>("ndt_max_iterations", ndt_max_iterations_, 64);
         nh_.param<int>("ndt_threads", ndt_threads_, 40);
         nh_.param<double>("voxel_leaf", voxel_leaf_, 0.3); // 0.5 is unstable, 0.1 is too slow, 0.3 seems good
-        nh_.param<double>("map_voxel", map_voxel_, 0.6); 
+        nh_.param<double>("map_voxel", map_voxel_, 0.5); 
+
+        pres_transform = Eigen::Matrix4f::Identity();
     }
 
     void initialize_publishers() {
@@ -123,7 +126,8 @@ private:
 
         auto t1 = ros::WallTime::now();
         pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>);
-        ndt_omp_.align(*aligned);
+        // ndt_omp_.align(*aligned);
+        ndt_omp_.align(*aligned, pres_transform);
         auto t2 = ros::WallTime::now();
         std::cout << "single (t2-t1) : " << (t2 - t1).toSec() * 1000 << "[msec]" << std::endl;
         std::cout << "fitness (t2-t1): " << ndt_omp_.getFitnessScore() << std::endl << std::endl;
@@ -201,6 +205,8 @@ private:
     double ndt_resolution_, ndt_step_size_, ndt_epsilon_;
     double voxel_leaf_, map_voxel_;
     int ndt_max_iterations_, ndt_threads_;
+
+    Eigen::Matrix4f pres_transform;
 };
 
 int main(int argc, char** argv) {
