@@ -1,174 +1,171 @@
 #include <ros/ros.h>
-#include <visualization_msgs/Marker.h>
-#include <Eigen/Dense>
-#include <vector>
+#include <eigen3/Eigen/Dense>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <sensor_msgs/Range.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <signal_reflection/SignalPath.h>
+#include <random>
 
-class GPSRayTracer {
-private:
-    ros::NodeHandle nh;
-    ros::Publisher marker_pub;
-    
-    struct Building {
-        Eigen::Vector3d position;
-        Eigen::Vector3d size;
-        Eigen::Matrix3d rotation;
-    };
-    
-    std::vector<Building> buildings;
-    std::vector<Eigen::Vector3d> transmitters;
-
+class SignalReflectionNode {
 public:
-    GPSRayTracer() {
-        marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 10);
-        initializeSimulation();
+    SignalReflectionNode() {
+        // Initialize parameters
+        nh_.param("/simulation/frequency", sim_freq_, 10.0);
+        nh_.param("/simulation/noise_stddev", noise_stddev_, 0.05);
+        nh_.param("/simulation/epsilon", epsilon_, 0.1);
+
+        // Initialize beacon positions (world coordinates)
+        beacons_ = {
+            {1, Eigen::Vector3d(2.0, 1.0, 0.5)},
+            {2, Eigen::Vector3d(-1.0, 2.0, 0.5)},
+            {3, Eigen::Vector3d(-2.0, -1.0, 0.5)},
+            {4, Eigen::Vector3d(1.0, -2.0, 0.5)},
+            {5, Eigen::Vector3d(0.0, 0.0, 0.5)}
+        };
+
+        // Setup publishers
+        beacon_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("/beacons", 1);
+        range_pub_ = nh_.advertise<sensor_msgs::Range>("/range_measurements", 10);
+        path_pub_ = nh_.advertise<signal_reflection::SignalPath>("/signal_paths", 10);
+
+        // Setup simulation timer
+        sim_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_), 
+                                   &SignalReflectionNode::simulationLoop, this);
+
+        // Publish static beacons once
+        publishBeacons();
     }
 
-    void initializeSimulation() {
-        // Create sample buildings
-        buildings.push_back({
-            Eigen::Vector3d(0, 0, 15), 
-            Eigen::Vector3d(20, 30, 30),
-            Eigen::Matrix3d::Identity()
-        });
+private:
+    ros::NodeHandle nh_;
+    ros::Timer sim_timer_;
+    ros::Publisher beacon_pub_, range_pub_, path_pub_;
+    tf2_ros::TransformBroadcaster tf_broadcaster_;
+    
+    std::map<int, Eigen::Vector3d> beacons_;
+    double sim_time_ = 0.0;
+    double sim_freq_;
+    double noise_stddev_;
+    double epsilon_;
 
-        // Create sample GPS transmitters (satellites)
-        transmitters.push_back(Eigen::Vector3d(-100, 50, 200));
-        transmitters.push_back(Eigen::Vector3d(150, -80, 180));
-        transmitters.push_back(Eigen::Vector3d(80, 120, 190));
+    void publishBeacons() {
+        visualization_msgs::MarkerArray markers;
+        int id = 0;
+        for (const auto& [bid, pos] : beacons_) {
+            visualization_msgs::Marker marker;
+            marker.header.frame_id = "world";
+            marker.header.stamp = ros::Time::now();
+            marker.ns = "beacons";
+            marker.id = id++;
+            marker.type = visualization_msgs::Marker::SPHERE;
+            marker.action = visualization_msgs::Marker::ADD;
+            marker.pose.position.x = pos.x();
+            marker.pose.position.y = pos.y();
+            marker.pose.position.z = pos.z();
+            marker.scale.x = marker.scale.y = marker.scale.z = 0.3;
+            marker.color.r = 1.0;
+            marker.color.a = 1.0;
+            markers.markers.push_back(marker);
+        }
+        beacon_pub_.publish(markers);
     }
 
-    bool rayBuildingIntersection(const Eigen::Vector3d& origin, const Eigen::Vector3d& dir,
-                                 const Building& building, Eigen::Vector3d& intersection) {
-        // Simplified AABB intersection test
-        Eigen::Vector3d min = building.position - building.size/2;
-        Eigen::Vector3d max = building.position + building.size/2;
-        
-        double tmin = (min.x() - origin.x()) / dir.x(); 
-        double tmax = (max.x() - origin.x()) / dir.x(); 
-        if (tmin > tmax) std::swap(tmin, tmax); 
-
-        double tymin = (min.y() - origin.y()) / dir.y(); 
-        double tymax = (max.y() - origin.y()) / dir.y(); 
-        if (tymin > tymax) std::swap(tymin, tymax); 
-
-        if ((tmin > tymax) || (tymin > tmax)) 
-            return false; 
-
-        if (tymin > tmin) tmin = tymin; 
-        if (tymax < tmax) tmax = tymax; 
-
-        double tzmin = (min.z() - origin.z()) / dir.z(); 
-        double tzmax = (max.z() - origin.z()) / dir.z(); 
-        if (tzmin > tzmax) std::swap(tzmin, tzmax); 
-
-        if ((tmin > tzmax) || (tzmin > tmax)) 
-            return false; 
-
-        if (tzmin > tmin) tmin = tzmin; 
-        if (tzmax < tmax) tmax = tzmax; 
-
-        if (tmax < 0) return false;
-
-        intersection = origin + dir * tmin;
-        return true;
+    Eigen::Vector3d generateTrajectory(double t) {
+        // Circular trajectory with 2m radius, constant altitude
+        return Eigen::Vector3d(2.0 * cos(t), 2.0 * sin(t), 0.5);
     }
 
-    void visualize() {
-        visualization_msgs::Marker building_marker, ray_marker;
-        
-        // Building visualization
-        building_marker.header.frame_id = "map";
-        building_marker.header.stamp = ros::Time::now();
-        building_marker.ns = "buildings";
-        building_marker.action = visualization_msgs::Marker::ADD;
-        building_marker.type = visualization_msgs::Marker::CUBE_LIST;
-        building_marker.scale.x = 1.0;
-        building_marker.scale.y = 1.0;
-        building_marker.scale.z = 1.0;
-        building_marker.color.a = 0.7;
-        building_marker.color.r = 0.5;
-        building_marker.color.g = 0.5;
-        building_marker.color.b = 0.5;
+    void publishUserTransform(const Eigen::Vector3d& position) {
+        geometry_msgs::TransformStamped transform;
+        transform.header.stamp = ros::Time::now();
+        transform.header.frame_id = "world";
+        transform.child_frame_id = "user_base";
+        transform.transform.translation.x = position.x();
+        transform.transform.translation.y = position.y();
+        transform.transform.translation.z = position.z();
+        transform.transform.rotation.w = 1.0;
+        tf_broadcaster_.sendTransform(transform);
+    }
 
-        // Ray visualization
-        ray_marker = building_marker;
-        ray_marker.ns = "rays";
-        ray_marker.type = visualization_msgs::Marker::LINE_LIST;
-        ray_marker.scale.x = 0.1;
-        ray_marker.color.a = 1.0;
-        ray_marker.color.r = 1.0;
-        ray_marker.points.clear();
+    void processRangeMeasurement(int beacon_id, 
+                               const Eigen::Vector3d& user_pos,
+                               const Eigen::Vector3d& beacon_pos,
+                               double measured_range) {
+        signal_reflection::SignalPath path_msg;
+        path_msg.header.stamp = ros::Time::now();
+        path_msg.beacon_id = beacon_id;
+        path_msg.measured_range = measured_range;
 
-        // Add buildings to marker
-        for (const auto& b : buildings) {
-            geometry_msgs::Point p;
-            p.x = b.position.x();
-            p.y = b.position.y();
-            p.z = b.position.z();
-            building_marker.points.push_back(p);
-            building_marker.scale.x = b.size.x();
-            building_marker.scale.y = b.size.y();
-            building_marker.scale.z = b.size.z();
+        // Calculate theoretical distances
+        const double direct_dist = (beacon_pos - user_pos).norm();
+        const Eigen::Vector3d virtual_beacon(beacon_pos.x(), beacon_pos.y(), -beacon_pos.z());
+        const double reflected_dist = (virtual_beacon - user_pos).norm();
+
+        // Determine path type
+        if (std::abs(measured_range - direct_dist) < epsilon_) {
+            path_msg.path_type = signal_reflection::SignalPath::DIRECT;
+        }
+        else if (std::abs(measured_range - reflected_dist) < epsilon_) {
+            path_msg.path_type = signal_reflection::SignalPath::REFLECTED;
+            
+            // Calculate reflection point (intersection with ground plane z=0)
+            const double t = user_pos.z() / (user_pos.z() + beacon_pos.z());
+            const Eigen::Vector3d refl_point = user_pos + t * (virtual_beacon - user_pos);
+            path_msg.reflection_point.x = refl_point.x();
+            path_msg.reflection_point.y = refl_point.y();
+            path_msg.reflection_point.z = 0.0;
+        }
+        else {
+            ROS_WARN("Measurement from beacon %d doesn't match any known path (Measured: %.2f, Direct: %.2f, Reflected: %.2f)", 
+                    beacon_id, measured_range, direct_dist, reflected_dist);
+            return;
         }
 
-        // Process rays
-        Eigen::Vector3d receiver(0, 0, 0); // Ground receiver
-        for (const auto& tx : transmitters) {
-            Eigen::Vector3d direction = (receiver - tx).normalized();
-            Eigen::Vector3d intersection;
-            
-            // Direct path
-            bool blocked = false;
-            for (const auto& b : buildings) {
-                if (rayBuildingIntersection(tx, direction, b, intersection)) {
-                    blocked = true;
-                    break;
-                }
-            }
-            
-            if (!blocked) {
-                geometry_msgs::Point p1, p2;
-                p1.x = tx.x(); p1.y = tx.y(); p1.z = tx.z();
-                p2.x = receiver.x(); p2.y = receiver.y(); p2.z = receiver.z();
-                ray_marker.points.push_back(p1);
-                ray_marker.points.push_back(p2);
-            }
-
-            // Reflected paths
-            for (const auto& b : buildings) {
-                if (rayBuildingIntersection(tx, direction, b, intersection)) {
-                    Eigen::Vector3d normal = (intersection - b.position).normalized();
-                    Eigen::Vector3d reflect_dir = direction - 2 * direction.dot(normal) * normal;
-                    
-                    geometry_msgs::Point p1, p2, p3;
-                    p1.x = tx.x(); p1.y = tx.y(); p1.z = tx.z();
-                    p2.x = intersection.x(); p2.y = intersection.y(); p2.z = intersection.z();
-                    p3.x = receiver.x(); p3.y = receiver.y(); p3.z = receiver.z();
-                    
-                    ray_marker.points.push_back(p1);
-                    ray_marker.points.push_back(p2);
-                    ray_marker.points.push_back(p2);
-                    ray_marker.points.push_back(p3);
-                }
-            }
-        }
-
-        marker_pub.publish(building_marker);
-        marker_pub.publish(ray_marker);
+        path_pub_.publish(path_msg);
     }
 
-    void run() {
-        ros::Rate rate(1);
-        while (ros::ok()) {
-            visualize();
-            rate.sleep();
+    void simulationLoop(const ros::TimerEvent& event) {
+        // Update simulation time
+        sim_time_ += 1.0/sim_freq_;
+
+        // Generate and publish user trajectory
+        const Eigen::Vector3d user_pos = generateTrajectory(sim_time_);
+        publishUserTransform(user_pos);
+
+        // Generate simulated measurements for each beacon
+        std::default_random_engine generator(ros::Time::now().nsec);
+        std::normal_distribution<double> noise_dist(0.0, noise_stddev_);
+
+        for (const auto& [beacon_id, beacon_pos] : beacons_) {
+            // Randomly select path type for simulation
+            const bool use_reflected = (rand() % 2 == 0);
+            
+            // Calculate true distance
+            const double true_dist = use_reflected ? 
+                (Eigen::Vector3d(beacon_pos.x(), beacon_pos.y(), -beacon_pos.z()) - user_pos).norm() :
+                (beacon_pos - user_pos).norm();
+
+            // Create noisy measurement
+            sensor_msgs::Range range_msg;
+            range_msg.header.stamp = ros::Time::now();
+            range_msg.header.frame_id = "beacon" + std::to_string(beacon_id);
+            range_msg.radiation_type = sensor_msgs::Range::ULTRASOUND;
+            range_msg.field_of_view = 0.1;
+            range_msg.min_range = 0.1;
+            range_msg.max_range = 10.0;
+            range_msg.range = std::max(0.1, true_dist + noise_dist(generator));
+
+            // Publish and process the measurement
+            range_pub_.publish(range_msg);
+            processRangeMeasurement(beacon_id, user_pos, beacon_pos, range_msg.range);
         }
     }
 };
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "gps_ray_tracer");
-    GPSRayTracer tracer;
-    tracer.run();
+    ros::init(argc, argv, "signal_reflection_node");
+    SignalReflectionNode node;
+    ros::spin();
     return 0;
 }
