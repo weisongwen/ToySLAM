@@ -222,21 +222,24 @@
         Eigen::Matrix<T, 3, 1> dp = preintegration_.delta_p.cast<T>();
         Eigen::Matrix<T, 3, 1> dv = preintegration_.delta_v.cast<T>();
         Eigen::Quaternion<T> dq = preintegration_.delta_q.cast<T>();
+        T dt_sum = T(preintegration_.dt_sum);
 
         // Compute residuals
-        Eigen::Map<Eigen::Matrix<T, 9, 1>> residual(residuals);
+        Eigen::Map<Eigen::Matrix<T, 9, 1>> r(residuals);
         
         // Position residual
-        residual.segment<3>(0) = p2 - (p1 + v1 * T(preintegration_.dt_sum) +  // Use dt_sum
-                              T(0.5) * GRAVITY_VECTOR.cast<T>() * T(preintegration_.dt_sum * preintegration_.dt_sum) +
-                              q1 * dp);
+        Eigen::Matrix<T, 3, 1> gravity = GRAVITY_VECTOR.cast<T>();
+        Eigen::Matrix<T, 3, 1> p_residual = p2 - (p1 + v1 * dt_sum + 
+            T(0.5) * gravity * dt_sum * dt_sum + q1 * dp);
+        r.template segment<3>(0) = p_residual;
 
         // Velocity residual
-        residual.segment<3>(3) = v2 - (v1 + GRAVITY_VECTOR.cast<T>() * T(preintegration_.dt_sum) +  // Use dt_sum
-                              q1 * dv);
+        Eigen::Matrix<T, 3, 1> v_residual = v2 - (v1 + gravity * dt_sum + q1 * dv);
+        r.template segment<3>(3) = v_residual;
 
         // Rotation residual
-        residual.segment<3>(6) = T(2.0) * ((dq * q1.conjugate() * q2).vec());
+        Eigen::Quaternion<T> q_residual = dq * q1.conjugate() * q2;
+        r.template segment<3>(6) = T(2.0) * q_residual.vec();
 
         return true;
     }
@@ -257,6 +260,7 @@
  
          residual = position - measurement_.cast<T>();
          residual = information_.cast<T>() * residual;
+        //  std::cout<<"residuals of the UWB-> " << residual[0] <<"\n";
  
          return true;
      }
@@ -286,8 +290,8 @@ class UwbImuFusion {
             initializeParameters();
             
             // ROS subscribers and publishers
-            imu_sub_ = nh_.subscribe("/imu", 1000, &UwbImuFusion::imuCallback, this);
-            uwb_sub_ = nh_.subscribe("/uwb", 1000, &UwbImuFusion::uwbCallback, this);
+            imu_sub_ = nh_.subscribe("/imu/data", 1000, &UwbImuFusion::imuCallback, this);
+            uwb_sub_ = nh_.subscribe("/vins_estimator/UWBPoistionPS", 1000, &UwbImuFusion::uwbCallback, this);
             pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/optimized_pose", 100);
     
             // Initialize IMU preintegration
@@ -300,16 +304,16 @@ class UwbImuFusion {
     private:
         void initializeParameters() {
             // System parameters
-            window_size_ = 10;  // Number of states in sliding window
-            min_uwb_measurements_ = 3;  // Minimum UWB measurements before optimization
-    
-            // Noise parameters
-            imu_acc_noise_ = 0.01;        // m/s^2
-            imu_gyro_noise_ = 0.01;       // rad/s
-            imu_acc_bias_noise_ = 0.0001; // m/s^3
-            imu_gyro_bias_noise_ = 0.0001;// rad/s^2
-            uwb_noise_ = 0.1;             // m
-    
+            window_size_ = 10;
+            min_uwb_measurements_ = 3;
+
+            // Noise parameters - adjusted for real sensor characteristics
+            imu_acc_noise_ = 0.1;            // Increased for stability
+            imu_gyro_noise_ = 0.01;
+            imu_acc_bias_noise_ = 0.0001;
+            imu_gyro_bias_noise_ = 0.0001;
+            uwb_noise_ = 0.1;
+
             // Initialize current state
             current_state_.timestamp = 0.0;
             current_state_.position.setZero();
@@ -317,9 +321,14 @@ class UwbImuFusion {
             current_state_.orientation.setIdentity();
             current_state_.acc_bias.setZero();
             current_state_.gyro_bias.setZero();
-    
+
             initialized_ = false;
             last_imu_time_ = 0.0;
+            
+            // Add these parameters
+            max_imu_queue_size_ = 1000;  // About 2.5s of IMU data at 400Hz
+            max_uwb_queue_size_ = 30;    // About 3s of UWB data at 10Hz
+            min_imu_between_uwb_ = 20;   // Minimum IMU measurements between UWB updates
         }
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
@@ -351,34 +360,51 @@ class UwbImuFusion {
                 last_imu_time_ = imu_data.timestamp;
                 return;
             }
-    
+        
             double dt = imu_data.timestamp - last_imu_time_;
-            if (dt <= 0) return;
-    
+            if (dt <= 0 || dt > 0.1) {  // Add maximum dt check
+                ROS_WARN("Invalid IMU timestamp or large dt: %f", dt);
+                last_imu_time_ = imu_data.timestamp;
+                return;
+            }
+        
+            // Scale IMU measurements if necessary (if raw values aren't in m/s^2 and rad/s)
+            ImuMeasurement scaled_imu = imu_data;
+            // scaled_imu.acc *= 9.81;  // Uncomment if acc is in g's
+        
             // Propagate state
-            propagateState(imu_data, dt);
-    
+            propagateState(scaled_imu, dt);
+        
             // Add to buffer
-            imu_buffer_.push_back(imu_data);
-    
-            // Remove old IMU data
-            while (imu_buffer_.size() > window_size_ * 100) {  // Assume 100Hz IMU data
+            imu_buffer_.push_back(scaled_imu);
+        
+            // Limit buffer size
+            while (imu_buffer_.size() > max_imu_queue_size_) {
                 imu_buffer_.pop_front();
             }
-    
+        
             last_imu_time_ = imu_data.timestamp;
         }
     
         void processUwbData(const UwbMeasurement& uwb_data) {
-            if (!initialized_) return;
-    
+            if (!initialized_ || imu_buffer_.size() < min_imu_between_uwb_) {
+                return;
+            }
+        
+            // Check if UWB position is within reasonable bounds
+            const double MAX_POSITION = 100000.0;  // meters
+            if (uwb_data.position.norm() > MAX_POSITION) {
+                ROS_WARN("UWB position too large, ignoring measurement");
+                return;
+            }
+        
             uwb_buffer_.push_back(uwb_data);
-    
-            // Remove old UWB data
-            while (uwb_buffer_.size() > window_size_ * 10) {  // Assume 10Hz UWB data
+        
+            // Limit buffer size
+            while (uwb_buffer_.size() > max_uwb_queue_size_) {
                 uwb_buffer_.pop_front();
             }
-    
+        
             // Trigger optimization when enough measurements are collected
             if (uwb_buffer_.size() >= min_uwb_measurements_) {
                 optimize();
@@ -389,77 +415,100 @@ class UwbImuFusion {
             // Remove bias and integrate IMU data
             Eigen::Vector3d acc_unbias = imu_data.acc - current_state_.acc_bias;
             Eigen::Vector3d gyro_unbias = imu_data.gyro - current_state_.gyro_bias;
-    
-            // Position integration
-            current_state_.position += current_state_.velocity * dt +
-                0.5 * (current_state_.orientation * acc_unbias + GRAVITY_VECTOR) * dt * dt;
-    
-            // Velocity integration
-            current_state_.velocity += (current_state_.orientation * acc_unbias + GRAVITY_VECTOR) * dt;
-    
-            // Orientation integration
+
+            // Add acceleration limits
+            const double MAX_ACC = 100.0;  // m/s^2
+            acc_unbias = acc_unbias.array().min(MAX_ACC).max(-MAX_ACC);
+
+            // Position integration using midpoint rule
+            Eigen::Vector3d acc_world = current_state_.orientation * acc_unbias + GRAVITY_VECTOR;
+            Eigen::Vector3d next_velocity = current_state_.velocity + acc_world * dt;
+            current_state_.position += (current_state_.velocity + next_velocity) * (dt * 0.5);
+            current_state_.velocity = next_velocity;
+
+            // Orientation integration using quaternion
             Eigen::Vector3d angle_axis = gyro_unbias * dt;
             if (angle_axis.norm() > 1e-12) {
                 current_state_.orientation *= Eigen::Quaterniond(
                     Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
             }
-    
-            // Normalize quaternion
             current_state_.orientation.normalize();
-    
+
             // Update timestamp
             current_state_.timestamp = imu_data.timestamp;
-    
+
             // Integrate IMU preintegration
             imu_preintegration_->integrate(imu_data.acc, imu_data.gyro, dt);
         }
     
         void optimize() {
-            if (imu_buffer_.empty() || uwb_buffer_.empty()) return;
-    
+            if (imu_buffer_.empty() || uwb_buffer_.size() < min_uwb_measurements_) {
+                return;
+            }
+        
             // Setup optimization problem
             ceres::Problem problem;
             std::vector<State> state_window;
             std::vector<double*> parameter_blocks;
-    
+        
             // Initialize state window
             initializeStateWindow(state_window, parameter_blocks);
-    
-            // Add IMU factors
+        
+            // Add IMU factors with proper weighting
+            double imu_weight = 1.0;
             for (size_t i = 0; i < state_window.size() - 1; ++i) {
-                addImuFactor(problem, parameter_blocks[i], parameter_blocks[i + 1]);
+                auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+                ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<ImuFactor, 9, 16, 16>(imu_factor),
+                    loss_function,
+                    parameter_blocks[i],
+                    parameter_blocks[i + 1]
+                );
             }
-    
-            // Add UWB factors
+        
+            // Add UWB factors with proper weighting
+            double uwb_weight = 10.0;  // Increased UWB weight relative to IMU
             for (const auto& uwb_data : uwb_buffer_) {
-                addUwbFactor(problem, parameter_blocks, uwb_data);
+                Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity() / uwb_weight;
+                auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
+                ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
+                    loss_function,
+                    parameter_blocks[0]  // Constrain the first state
+                );
             }
-    
+        
             // Set solver options
             ceres::Solver::Options options;
             options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
             options.minimizer_progress_to_stdout = false;
-            options.max_num_iterations = 50;
-            options.num_threads = 4;
-    
+            options.max_num_iterations = 20;
+            options.function_tolerance = 1e-3;
+            options.gradient_tolerance = 1e-3;
+            options.parameter_tolerance = 1e-4;
+        
             // Solve
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
-    
-            // Update states
-            updateStates(state_window, parameter_blocks);
-    
+        
+            if (summary.termination_type == ceres::CONVERGENCE) {
+                // Update states only if optimization converged
+                updateStates(state_window, parameter_blocks);
+            } else {
+                ROS_WARN("Optimization failed to converge");
+            }
+        
             // Cleanup
             for (auto ptr : parameter_blocks) {
                 delete[] ptr;
             }
-    
-            // Reset IMU preintegration
+        
+            // Reset IMU preintegration and clear UWB buffer
             imu_preintegration_->reset();
-            
-            // Clear UWB buffer
             uwb_buffer_.clear();
-    
+        
             // Publish results
             publishResults();
         }
@@ -520,7 +569,7 @@ class UwbImuFusion {
             auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<ImuFactor, 9, 16, 16>(imu_factor),
-                new ceres::HubberdLossFunction(1.0),
+                new ceres::HuberLoss(1.0),
                 state_i,
                 state_j
             );
@@ -546,9 +595,10 @@ class UwbImuFusion {
             auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                new ceres::HubberdLossFunction(1.0),
+                new ceres::HuberLoss(10.0),
                 parameter_blocks[closest_idx]
             );
+            std::cout<<"add the UWB factors \n";
         }
     
         void updateStates(const std::vector<State>& state_window,
@@ -560,7 +610,7 @@ class UwbImuFusion {
         void publishResults() {
             nav_msgs::Odometry odom_msg;
             odom_msg.header.stamp = ros::Time(current_state_.timestamp);
-            odom_msg.header.frame_id = "world";
+            odom_msg.header.frame_id = "map";
             
             // Position
             odom_msg.pose.pose.position.x = current_state_.position.x();
@@ -605,6 +655,12 @@ class UwbImuFusion {
         
         bool initialized_;
         double last_imu_time_;
+    
+    // Add these members to the class
+    private:
+        size_t max_imu_queue_size_;
+        size_t max_uwb_queue_size_;
+        size_t min_imu_between_uwb_;
     };
  
  } // namespace uwb_imu_fusion
