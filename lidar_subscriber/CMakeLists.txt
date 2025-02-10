@@ -24,6 +24,9 @@ find_package(catkin REQUIRED COMPONENTS
   nav_msgs
   pcl_ros
   tf2_ros
+
+  geometry_msgs
+  sensor_msgs
 )
 
 find_package(PCL 1.8 REQUIRED COMPONENTS common io filters kdtree)
@@ -131,6 +134,14 @@ target_link_libraries(uwb_imu_sim_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
 
 add_executable(uwb_imu_EKF_node src/uwb_imu_EKF_node.cpp)
 target_link_libraries(uwb_imu_EKF_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
+
+add_executable(uwb_imu_batch_node src/uwb_imu_batch_node.cpp)
+target_link_libraries(uwb_imu_batch_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
   # pclomp

@@ -12,6 +12,10 @@
  #include <ceres/ceres.h>
  #include <deque>
  #include <memory>
+
+ #include <nav_msgs/Path.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Pose.h>
  
  namespace uwb_imu_fusion {
  
@@ -388,7 +392,58 @@ class UwbImuFusion {
         }
     
     private:
+        // Add these members
+
+        struct BatchState {
+
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+            
+            double timestamp;
+            
+            bool fixed; // Whether this state is fixed in optimization
+            
+            Eigen::Vector3d position;
+            
+            Eigen::Vector3d velocity;
+            
+            Eigen::Quaterniond orientation;
+            
+            Eigen::Vector3d acc_bias;
+            
+            Eigen::Vector3d gyro_bias;
+            
+        };
+        std::vector<BatchState> trajectory_states_;
+        ros::Publisher path_pub_;
+        ros::Publisher batch_pose_pub_;
+        
+        // Add these members
+        std::vector<State> batch_states_;
+        bool batch_initialized_;
+        double batch_start_time_;
+        double batch_duration_;
+        size_t batch_size_;
+
+        // Batch parameters
+        double state_dt_;           // Time between states in batch
+        size_t num_states_batch_;   // Number of states in each batch
+
         void initializeParameters() {
+
+            // Batch processing parameters
+            batch_duration_ = 5.0;     // Process 5 seconds of data at a time
+            state_dt_ = 0.1;          // State every 0.1 seconds
+            num_states_batch_ = static_cast<size_t>(batch_duration_ / state_dt_);
+            batch_initialized_ = false;
+            // Add batch parameters
+            batch_size_ = 100;  // Number of states in batch
+            
+            // Publishers
+            path_pub_ = nh_.advertise<nav_msgs::Path>("/uwb_imu_fusion/trajectory", 1);
+            batch_pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/batch_pose", 1);
+            pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/pose", 1);
+
+
             // System parameters
             window_size_ = 50;  // Reduced from 10 5
             min_uwb_measurements_ = 2;  // Reduced from 3
@@ -416,6 +471,8 @@ class UwbImuFusion {
             max_imu_queue_size_ = 1000;  // About 2.5s of IMU data at 400Hz
             max_uwb_queue_size_ = 30;    // About 3s of UWB data at 10Hz
             min_imu_between_uwb_ = 20;   // Minimum IMU measurements between UWB updates
+
+            
         }
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
@@ -445,32 +502,33 @@ class UwbImuFusion {
             if (!initialized_) {
                 initialized_ = true;
                 last_imu_time_ = imu_data.timestamp;
+                
+                if (!batch_initialized_) {
+                    batch_start_time_ = imu_data.timestamp;
+                    batch_initialized_ = true;
+                    batch_states_.clear();
+                    
+                    // Initialize first state
+                    State initial_state;
+                    initial_state.timestamp = imu_data.timestamp;
+                    initial_state.position.setZero();
+                    initial_state.velocity.setZero();
+                    initial_state.orientation.setIdentity();
+                    initial_state.acc_bias.setZero();
+                    initial_state.gyro_bias.setZero();
+                    
+                    batch_states_.push_back(initial_state);
+                }
                 return;
             }
         
-            double dt = imu_data.timestamp - last_imu_time_;
-            if (dt <= 0 || dt > 0.1) {  // Add maximum dt check
-                ROS_WARN("Invalid IMU timestamp or large dt: %f", dt);
-                last_imu_time_ = imu_data.timestamp;
-                return;
+            // Store IMU measurements
+            imu_buffer_.push_back(imu_data);
+            
+            // Check if batch duration is reached
+            if (imu_data.timestamp - batch_start_time_ >= batch_duration_) {
+                performBatchOptimization();
             }
-        
-            // Scale IMU measurements if necessary (if raw values aren't in m/s^2 and rad/s)
-            ImuMeasurement scaled_imu = imu_data;
-            // scaled_imu.acc *= 9.81;  // Uncomment if acc is in g's
-        
-            // Propagate state
-            propagateState(scaled_imu, dt);
-        
-            // Add to buffer
-            imu_buffer_.push_back(scaled_imu);
-        
-            // Limit buffer size
-            while (imu_buffer_.size() > max_imu_queue_size_) {
-                imu_buffer_.pop_front();
-            }
-        
-            last_imu_time_ = imu_data.timestamp;
         }
     
         void processUwbData(const UwbMeasurement& uwb_data) {
@@ -549,6 +607,257 @@ class UwbImuFusion {
                 state_i,
                 state_j
             );
+        }
+
+        void performBatchOptimization() {
+            if (imu_buffer_.empty() || uwb_buffer_.empty()) {
+                return;
+            }
+        
+            // Initialize batch states if needed
+            std::vector<BatchState> batch_states;
+            initializeBatchStates(batch_states);
+        
+            // Setup optimization problem
+            ceres::Problem problem;
+            std::vector<double*> parameter_blocks;
+        
+            // Create parameter blocks for all states
+            for (size_t i = 0; i < batch_states.size(); ++i) {
+                double* state_ptr = new double[16];
+                batchStateToArray(batch_states[i], state_ptr);
+                parameter_blocks.push_back(state_ptr);
+                
+                // Fix states that are marked as fixed
+                if (batch_states[i].fixed) {
+                    problem.SetParameterBlockConstant(state_ptr);
+                }
+            }
+        
+            // Add IMU factors
+            for (size_t i = 0; i < batch_states.size() - 1; ++i) {
+                double t1 = batch_states[i].timestamp;
+                double t2 = batch_states[i + 1].timestamp;
+                
+                imu_preintegration_->reset();
+                
+                // Integrate IMU measurements between consecutive states
+                for (const auto& imu : imu_buffer_) {
+                    if (imu.timestamp >= t1 && imu.timestamp < t2) {
+                        double dt = imu.timestamp - t1;
+                        imu_preintegration_->integrate(imu.acc, imu.gyro, dt);
+                        t1 = imu.timestamp;
+                    }
+                }
+                
+                // Add IMU factor
+                auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
+                    new ceres::HuberLoss(1.0),
+                    parameter_blocks[i],
+                    parameter_blocks[i + 1]
+                );
+            }
+        
+            // Add UWB factors
+            for (const auto& uwb : uwb_buffer_) {
+                size_t closest_idx = findClosestStateIndex(uwb.timestamp, batch_states);
+                
+                Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
+                auto* uwb_factor = new UwbFactor(uwb.position, uwb_cov);
+                
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
+                    new ceres::CauchyLoss(0.1),
+                    parameter_blocks[closest_idx]
+                );
+            }
+        
+            // Solve optimization problem
+            ceres::Solver::Options options;
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+            options.minimizer_progress_to_stdout = true;
+            options.max_num_iterations = 50;
+            options.function_tolerance = 1e-4;
+            options.gradient_tolerance = 1e-4;
+            options.parameter_tolerance = 1e-8;
+        
+            ceres::Solver::Summary summary;
+            ceres::Solve(options, &problem, &summary);
+        
+            if (summary.termination_type == ceres::CONVERGENCE) {
+                // Update batch states with optimization results
+                for (size_t i = 0; i < batch_states.size(); ++i) {
+                    arrayToBatchState(parameter_blocks[i], batch_states[i]);
+                }
+                
+                // Update trajectory and publish
+                updateTrajectory(batch_states);
+                publishTrajectory();
+            }
+        
+            // Cleanup
+            for (auto ptr : parameter_blocks) {
+                delete[] ptr;
+            }
+        
+            // Prepare for next batch
+            prepareNextBatch(batch_states);
+        }
+
+        void initializeBatchStates(std::vector<BatchState>& batch_states) {
+            batch_states.clear();
+            
+            double current_time = batch_start_time_;
+            for (size_t i = 0; i < num_states_batch_; ++i) {
+                BatchState state;
+                state.timestamp = current_time;
+                state.fixed = (i == 0 && !trajectory_states_.empty());
+                
+                if (i == 0 && !trajectory_states_.empty()) {
+                    // Initialize from last state of previous batch
+                    state = trajectory_states_.back();
+                } else {
+                    // Initialize from measurements
+                    state.position = interpolatePosition(current_time);
+                    state.velocity.setZero();
+                    state.orientation.setIdentity();
+                    state.acc_bias.setZero();
+                    state.gyro_bias.setZero();
+                }
+                
+                batch_states.push_back(state);
+                current_time += state_dt_;
+            }
+        }
+
+        void updateTrajectory(const std::vector<BatchState>& batch_states) {
+            // Remove overlap with previous batch (keep one state for continuity)
+            if (!trajectory_states_.empty()) {
+                trajectory_states_.pop_back();
+            }
+            
+            // Append new batch states
+            trajectory_states_.insert(trajectory_states_.end(), 
+                                    batch_states.begin(), batch_states.end());
+        }
+        
+        void publishTrajectory() {
+            nav_msgs::Path path_msg;
+            path_msg.header.stamp = ros::Time::now();
+            path_msg.header.frame_id = "map";
+            
+            for (const auto& state : trajectory_states_) {
+                geometry_msgs::PoseStamped pose;
+                pose.header.stamp = ros::Time(state.timestamp);
+                pose.header.frame_id = "map";
+                
+                pose.pose.position.x = state.position.x();
+                pose.pose.position.y = state.position.y();
+                pose.pose.position.z = state.position.z();
+                
+                pose.pose.orientation.w = state.orientation.w();
+                pose.pose.orientation.x = state.orientation.x();
+                pose.pose.orientation.y = state.orientation.y();
+                pose.pose.orientation.z = state.orientation.z();
+                
+                path_msg.poses.push_back(pose);
+            }
+            
+            path_pub_.publish(path_msg);
+            
+            // Also publish the latest state
+            if (!trajectory_states_.empty()) {
+                publishBatchState(trajectory_states_.back());
+            }
+        }
+        
+        void publishBatchState(const BatchState& state) {
+            nav_msgs::Odometry odom_msg;
+            odom_msg.header.stamp = ros::Time(state.timestamp);
+            odom_msg.header.frame_id = "map";
+            
+            odom_msg.pose.pose.position.x = state.position.x();
+            odom_msg.pose.pose.position.y = state.position.y();
+            odom_msg.pose.pose.position.z = state.position.z();
+            
+            odom_msg.pose.pose.orientation.w = state.orientation.w();
+            odom_msg.pose.pose.orientation.x = state.orientation.x();
+            odom_msg.pose.pose.orientation.y = state.orientation.y();
+            odom_msg.pose.pose.orientation.z = state.orientation.z();
+            
+            odom_msg.twist.twist.linear.x = state.velocity.x();
+            odom_msg.twist.twist.linear.y = state.velocity.y();
+            odom_msg.twist.twist.linear.z = state.velocity.z();
+            
+            batch_pose_pub_.publish(odom_msg);
+        }
+
+
+        void prepareNextBatch(const std::vector<BatchState>& current_batch) {
+            batch_start_time_ = current_batch.back().timestamp;
+            imu_buffer_.clear();
+            uwb_buffer_.clear();
+        }
+        
+        Eigen::Vector3d interpolatePosition(double timestamp) {
+            if (uwb_buffer_.empty()) {
+                return Eigen::Vector3d::Zero();
+            }
+            
+            // Find surrounding UWB measurements
+            size_t i = 0;
+            while (i < uwb_buffer_.size() - 1 && uwb_buffer_[i + 1].timestamp < timestamp) {
+                i++;
+            }
+            
+            if (i >= uwb_buffer_.size() - 1) {
+                return uwb_buffer_.back().position;
+            }
+            
+            // Linear interpolation
+            double t0 = uwb_buffer_[i].timestamp;
+            double t1 = uwb_buffer_[i + 1].timestamp;
+            double alpha = (timestamp - t0) / (t1 - t0);
+            
+            return (1 - alpha) * uwb_buffer_[i].position + alpha * uwb_buffer_[i + 1].position;
+        }
+        
+        size_t findClosestState(double timestamp) {
+            size_t closest_idx = 0;
+            double min_dt = std::numeric_limits<double>::max();
+            
+            for (size_t i = 0; i < batch_states_.size(); ++i) {
+                double dt = std::abs(timestamp - batch_states_[i].timestamp);
+                if (dt < min_dt) {
+                    min_dt = dt;
+                    closest_idx = i;
+                }
+            }
+            
+            return closest_idx;
+        }
+        
+        void publishState(const State& state) {
+            nav_msgs::Odometry odom_msg;
+            odom_msg.header.stamp = ros::Time(state.timestamp);
+            odom_msg.header.frame_id = "map";
+            
+            odom_msg.pose.pose.position.x = state.position.x();
+            odom_msg.pose.pose.position.y = state.position.y();
+            odom_msg.pose.pose.position.z = state.position.z();
+            
+            odom_msg.pose.pose.orientation.w = state.orientation.w();
+            odom_msg.pose.pose.orientation.x = state.orientation.x();
+            odom_msg.pose.pose.orientation.y = state.orientation.y();
+            odom_msg.pose.pose.orientation.z = state.orientation.z();
+            
+            odom_msg.twist.twist.linear.x = state.velocity.x();
+            odom_msg.twist.twist.linear.y = state.velocity.y();
+            odom_msg.twist.twist.linear.z = state.velocity.z();
+            
+            pose_pub_.publish(odom_msg);
         }
     
         void optimize() {
@@ -656,6 +965,49 @@ class UwbImuFusion {
                 stateToArray(state_window[i], state_ptr);
                 parameter_blocks.push_back(state_ptr);
             }
+        }
+
+        void batchStateToArray(const BatchState& state, double* arr) {
+            Eigen::Map<Eigen::Vector3d> p(arr);
+            Eigen::Map<Eigen::Vector3d> v(arr + 3);
+            Eigen::Map<Eigen::Quaterniond> q(arr + 6);
+            Eigen::Map<Eigen::Vector3d> ba(arr + 10);
+            Eigen::Map<Eigen::Vector3d> bg(arr + 13);
+        
+            p = state.position;
+            v = state.velocity;
+            q = state.orientation;
+            ba = state.acc_bias;
+            bg = state.gyro_bias;
+        }
+        
+        void arrayToBatchState(const double* arr, BatchState& state) {
+            Eigen::Map<const Eigen::Vector3d> p(arr);
+            Eigen::Map<const Eigen::Vector3d> v(arr + 3);
+            Eigen::Map<const Eigen::Quaterniond> q(arr + 6);
+            Eigen::Map<const Eigen::Vector3d> ba(arr + 10);
+            Eigen::Map<const Eigen::Vector3d> bg(arr + 13);
+        
+            state.position = p;
+            state.velocity = v;
+            state.orientation = q;
+            state.acc_bias = ba;
+            state.gyro_bias = bg;
+        }
+
+        size_t findClosestStateIndex(double timestamp, const std::vector<BatchState>& states) {
+            size_t closest_idx = 0;
+            double min_dt = std::numeric_limits<double>::max();
+            
+            for (size_t i = 0; i < states.size(); ++i) {
+                double dt = std::abs(timestamp - states[i].timestamp);
+                if (dt < min_dt) {
+                    min_dt = dt;
+                    closest_idx = i;
+                }
+            }
+            
+            return closest_idx;
         }
     
         void stateToArray(const State& state, double* arr) {
