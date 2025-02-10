@@ -398,7 +398,7 @@ class UwbImuFusion {
             imu_gyro_noise_ = 0.001;  // Reduced
             imu_acc_bias_noise_ = 0.0001;
             imu_gyro_bias_noise_ = 0.0001;
-            uwb_noise_ = 0.01;  // Increased for stronger position constraint
+            uwb_noise_ = 0.0001;  // Increased for stronger position constraint
 
             // Initialize current state
             // Initialize current state
