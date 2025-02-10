@@ -380,8 +380,13 @@ class UwbImuFusion {
             initializeParameters();
             
             // ROS subscribers and publishers
-            imu_sub_ = nh_.subscribe("/imu/data", 1000, &UwbImuFusion::imuCallback, this);
-            uwb_sub_ = nh_.subscribe("/vins_estimator/UWBPoistionPS", 1000, &UwbImuFusion::uwbCallback, this);
+            // imu_sub_ = nh_.subscribe("/imu/data", 1000, &UwbImuFusion::imuCallback, this);
+            // uwb_sub_ = nh_.subscribe("/vins_estimator/UWBPoistionPS", 1000, &UwbImuFusion::uwbCallback, this);
+
+            imu_sub_ = nh_.subscribe("/sensor_simulator/imu_data", 1000, &UwbImuFusion::imuCallback, this);
+            uwb_sub_ = nh_.subscribe("/sensor_simulator/UWBPoistionPS", 1000, &UwbImuFusion::uwbCallback, this);
+
+
             pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/optimized_pose", 100);
     
             // Initialize IMU preintegration
@@ -431,8 +436,8 @@ class UwbImuFusion {
         void initializeParameters() {
 
             // Batch processing parameters
-            batch_duration_ = 5.0;     // Process 5 seconds of data at a time
-            state_dt_ = 0.1;          // State every 0.1 seconds
+            batch_duration_ = 1.0;     // Process 5 seconds of data at a time
+            state_dt_ = 0.1;          // State every 0.1 seconds, 0.1
             num_states_batch_ = static_cast<size_t>(batch_duration_ / state_dt_);
             batch_initialized_ = false;
             // Add batch parameters
@@ -453,7 +458,7 @@ class UwbImuFusion {
             imu_gyro_noise_ = 0.001;  // Reduced
             imu_acc_bias_noise_ = 0.0001;
             imu_gyro_bias_noise_ = 0.0001;
-            uwb_noise_ = 0.0001;  // Increased for stronger position constraint
+            uwb_noise_ = 0.1;  // Increased for stronger position constraint
 
             // Initialize current state
             // Initialize current state
@@ -676,12 +681,12 @@ class UwbImuFusion {
         
             // Solve optimization problem
             ceres::Solver::Options options;
-            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
             options.minimizer_progress_to_stdout = true;
+
+            options.linear_solver_type = ceres::DENSE_SCHUR;
+            //options.num_threads = 2;
+            options.trust_region_strategy_type = ceres::DOGLEG;
             options.max_num_iterations = 50;
-            options.function_tolerance = 1e-4;
-            options.gradient_tolerance = 1e-4;
-            options.parameter_tolerance = 1e-8;
         
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);

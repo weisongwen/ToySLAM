@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Status1
         - /PointStamped1
+        - /Path4
       Splitter Ratio: 0.5
     Tree Height: 668
   - Class: rviz/Selection
@@ -89,7 +90,7 @@ Visualization Manager:
       Buffer Length: 1
       Class: rviz/Path
       Color: 255; 0; 0
-      Enabled: true
+      Enabled: false
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
@@ -108,7 +109,7 @@ Visualization Manager:
       Shaft Length: 0.10000000149011612
       Topic: /sensor_simulator/user_path
       Unreliable: false
-      Value: true
+      Value: false
     - Alpha: 1
       Class: rviz/PointStamped
       Color: 204; 41; 204
@@ -142,6 +143,30 @@ Visualization Manager:
       Shaft Diameter: 0.10000000149011612
       Shaft Length: 0.10000000149011612
       Topic: /eskf_fusion_node/user_path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 255; 85; 255
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uwb_imu_fusion/trajectory
       Unreliable: false
       Value: true
   Enabled: true
@@ -181,10 +206,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 49.51873779296875
+      Scale: 51.95388412475586
       Target Frame: <Fixed Frame>
-      X: -0.6433060169219971
-      Y: 0.35253992676734924
+      X: 0.9886358380317688
+      Y: -0.04203389585018158
     Saved: ~
 Window Geometry:
   Displays:
@@ -202,5 +227,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 1548
-  X: 0
-  Y: 0
+  X: -32
+  Y: -32
