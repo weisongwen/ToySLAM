@@ -37,24 +37,33 @@
  class ImuPreintegration {
  public:
      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
- 
-    //  struct PreintegrationResult {
-    //      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    //      Eigen::Vector3d delta_p;
-    //      Eigen::Vector3d delta_v;
-    //      Eigen::Quaterniond delta_q;
-    //      Eigen::Matrix<double, 9, 6> jacobian_bias;
-    //      Eigen::Matrix<double, 15, 15> covariance;
-    //  };
 
      struct PreintegrationResult {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        Eigen::Vector3d delta_p;
-        Eigen::Vector3d delta_v;
-        Eigen::Quaterniond delta_q;
-        Eigen::Matrix<double, 9, 6> jacobian_bias;
-        Eigen::Matrix<double, 15, 15> covariance;
-        double dt_sum;  // Add integration time sum
+    
+        double dt_sum;
+        Eigen::Vector3d delta_p;    // Preintegrated position
+        Eigen::Vector3d delta_v;    // Preintegrated velocity
+        Eigen::Quaterniond delta_q; // Preintegrated rotation
+        
+        // Jacobians w.r.t. bias
+        Eigen::Matrix<double, 3, 3> jacobian_p_ba;  // Position w.r.t. acc bias
+        Eigen::Matrix<double, 3, 3> jacobian_p_bg;  // Position w.r.t. gyro bias
+        Eigen::Matrix<double, 3, 3> jacobian_v_ba;  // Velocity w.r.t. acc bias
+        Eigen::Matrix<double, 3, 3> jacobian_v_bg;  // Velocity w.r.t. gyro bias
+        Eigen::Matrix<double, 3, 3> jacobian_q_bg;  // Rotation w.r.t. gyro bias
+    
+        PreintegrationResult() {
+            dt_sum = 0.0;
+            delta_p.setZero();
+            delta_v.setZero();
+            delta_q.setIdentity();
+            jacobian_p_ba.setZero();
+            jacobian_p_bg.setZero();
+            jacobian_v_ba.setZero();
+            jacobian_v_bg.setZero();
+            jacobian_q_bg.setZero();
+        }
     };
  
      ImuPreintegration(const Eigen::Vector3d& acc_bias, const Eigen::Vector3d& gyro_bias)
@@ -72,6 +81,13 @@
          delta_q_.setIdentity();
          jacobian_bias_.setZero();
          covariance_.setZero();
+
+         jacobian_p_ba_.setZero();
+        jacobian_p_bg_.setZero();
+        jacobian_v_ba_.setZero();
+        jacobian_v_bg_.setZero();
+        jacobian_q_bg_.setZero();
+
          dt_sum_ = 0;
  
          Eigen::Matrix<double, 15, 15> noise_cov = Eigen::Matrix<double, 15, 15>::Zero();
@@ -111,25 +127,18 @@
          delta_q_ = delta_q_k;
          dt_sum_ += dt;
      }
- 
-    //  PreintegrationResult getResult() const {
-    //      PreintegrationResult result;
-    //      result.delta_p = delta_p_;
-    //      result.delta_v = delta_v_;
-    //      result.delta_q = delta_q_;
-    //      result.jacobian_bias = jacobian_bias_;
-    //      result.covariance = covariance_;
-    //      return result;
-    //  }
 
      PreintegrationResult getResult() const {
         PreintegrationResult result;
+        result.dt_sum = dt_sum_;
         result.delta_p = delta_p_;
         result.delta_v = delta_v_;
         result.delta_q = delta_q_;
-        result.jacobian_bias = jacobian_bias_;
-        result.covariance = covariance_;
-        result.dt_sum = dt_sum_;  // Add dt_sum to result
+        result.jacobian_p_ba = jacobian_p_ba_;
+        result.jacobian_p_bg = jacobian_p_bg_;
+        result.jacobian_v_ba = jacobian_v_ba_;
+        result.jacobian_v_bg = jacobian_v_bg_;
+        result.jacobian_q_bg = jacobian_q_bg_;
         return result;
     }
  
@@ -196,6 +205,12 @@
      double gyro_noise_;
      double acc_bias_noise_;
      double gyro_bias_noise_;
+
+     Eigen::Matrix<double, 3, 3> jacobian_p_ba_;
+     Eigen::Matrix<double, 3, 3> jacobian_p_bg_;
+     Eigen::Matrix<double, 3, 3> jacobian_v_ba_;
+     Eigen::Matrix<double, 3, 3> jacobian_v_bg_;
+     Eigen::Matrix<double, 3, 3> jacobian_q_bg_;
  };
  
  // Factor classes for optimization
@@ -203,48 +218,94 @@
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     explicit ImuFactor(const ImuPreintegration::PreintegrationResult& preintegration)
-        : preintegration_(preintegration) {}
+        : preintegration_(preintegration) {
+        sqrt_information_ = Eigen::Matrix<double, 15, 15>::Identity();
+        sqrt_information_.block<3,3>(0,0) *= 1.0 / 0.1;   // position weight
+        sqrt_information_.block<3,3>(3,3) *= 1.0 / 0.2;   // velocity weight
+        sqrt_information_.block<3,3>(6,6) *= 1.0 / 0.1;   // rotation weight
+        sqrt_information_.block<3,3>(9,9) *= 1.0 / 0.01;  // acc bias weight
+        sqrt_information_.block<3,3>(12,12) *= 1.0 / 0.01;// gyro bias weight
+    }
 
     template <typename T>
     bool operator()(const T* const state1, const T* const state2, T* residuals) const {
-        // Extract states
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p1(state1);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v1(state1 + 3);
-        Eigen::Map<const Eigen::Quaternion<T>> q1(state1 + 6);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba1(state1 + 10);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg1(state1 + 13);
+        // Extract states at time i
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_i(state1);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_i(state1 + 3);
+        Eigen::Map<const Eigen::Quaternion<T>> q_i(state1 + 6);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_i(state1 + 10);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_i(state1 + 13);
 
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p2(state2);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v2(state2 + 3);
-        Eigen::Map<const Eigen::Quaternion<T>> q2(state2 + 6);
+        // Extract states at time j
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_j(state2);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_j(state2 + 3);
+        Eigen::Map<const Eigen::Quaternion<T>> q_j(state2 + 6);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_j(state2 + 10);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_j(state2 + 13);
 
-        // Convert preintegration measurements to T type
-        Eigen::Matrix<T, 3, 1> dp = preintegration_.delta_p.cast<T>();
-        Eigen::Matrix<T, 3, 1> dv = preintegration_.delta_v.cast<T>();
-        Eigen::Quaternion<T> dq = preintegration_.delta_q.cast<T>();
-        T dt_sum = T(preintegration_.dt_sum);
+        // Get preintegrated measurements
+        const Eigen::Matrix<T, 3, 1> alpha = preintegration_.delta_p.cast<T>();
+        const Eigen::Matrix<T, 3, 1> beta = preintegration_.delta_v.cast<T>();
+        const Eigen::Quaternion<T> gamma = preintegration_.delta_q.cast<T>();
+        const T delta_t = T(preintegration_.dt_sum);
 
-        // Compute residuals
-        Eigen::Map<Eigen::Matrix<T, 9, 1>> r(residuals);
+        // Get bias Jacobians
+        const Eigen::Matrix<T, 3, 3> J_p_ba = preintegration_.jacobian_p_ba.cast<T>();
+        const Eigen::Matrix<T, 3, 3> J_p_bg = preintegration_.jacobian_p_bg.cast<T>();
+        const Eigen::Matrix<T, 3, 3> J_v_ba = preintegration_.jacobian_v_ba.cast<T>();
+        const Eigen::Matrix<T, 3, 3> J_v_bg = preintegration_.jacobian_v_bg.cast<T>();
+        const Eigen::Matrix<T, 3, 3> J_q_bg = preintegration_.jacobian_q_bg.cast<T>();
+
+        // Bias corrections
+        const Eigen::Matrix<T, 3, 1> dba = ba_j - ba_i;
+        const Eigen::Matrix<T, 3, 1> dbg = bg_j - bg_i;
+
+        // Corrected measurements
+        const Eigen::Matrix<T, 3, 1> alpha_corrected = alpha + J_p_ba * dba + J_p_bg * dbg;
+        const Eigen::Matrix<T, 3, 1> beta_corrected = beta + J_v_ba * dba + J_v_bg * dbg;
         
-        // Position residual
-        Eigen::Matrix<T, 3, 1> gravity = GRAVITY_VECTOR.cast<T>();
-        Eigen::Matrix<T, 3, 1> p_residual = p2 - (p1 + v1 * dt_sum + 
-            T(0.5) * gravity * dt_sum * dt_sum + q1 * dp);
-        r.template segment<3>(0) = p_residual;
+        // Compute rotation correction
+        Eigen::Quaternion<T> gamma_corrected = gamma;
+        Eigen::Matrix<T, 3, 1> theta_correction = J_q_bg * dbg;
+        if (theta_correction.norm() > T(1e-12)) {
+            gamma_corrected = gamma * Eigen::Quaternion<T>(
+                Eigen::AngleAxis<T>(theta_correction.norm(), theta_correction.normalized()));
+        }
 
-        // Velocity residual
-        Eigen::Matrix<T, 3, 1> v_residual = v2 - (v1 + gravity * dt_sum + q1 * dv);
-        r.template segment<3>(3) = v_residual;
+        // Gravity vector
+        const Eigen::Matrix<T, 3, 1> g(T(0), T(0), T(-9.81));
 
-        // Rotation residual
-        Eigen::Quaternion<T> q_residual = dq * q1.conjugate() * q2;
-        r.template segment<3>(6) = T(2.0) * q_residual.vec();
+        Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
+
+        // Position residual (simplified)
+        residual.template segment<3>(0) = p_j - (p_i + v_i * delta_t + 
+            T(0.5) * g * delta_t * delta_t + q_i * alpha_corrected);
+
+        // Velocity residual (simplified)
+        residual.template segment<3>(3) = v_j - (v_i + g * delta_t + 
+            q_i * beta_corrected);
+
+        // Rotation residual (corrected)
+        Eigen::Quaternion<T> q_error = (q_i * gamma_corrected).conjugate() * q_j;
+        residual.template segment<3>(6) = T(2.0) * q_error.vec();
+
+        // Scale residuals
+        const T pos_scale = T(1.0);
+        const T vel_scale = T(0.1);
+        const T rot_scale = T(1.0);
+        
+        residual.template segment<3>(0) *= pos_scale;
+        residual.template segment<3>(3) *= vel_scale;
+        residual.template segment<3>(6) *= rot_scale;
+
+        // Apply information matrix
+        residual = sqrt_information_.cast<T>() * residual;
 
         return true;
     }
 
     ImuPreintegration::PreintegrationResult preintegration_;
+    Eigen::Matrix<double, 15, 15> sqrt_information_;
 };
  
  struct UwbFactor {
@@ -268,6 +329,31 @@
      Eigen::Vector3d measurement_;
      Eigen::Matrix3d information_;
  };
+
+ struct PositionDriftFactor {
+    explicit PositionDriftFactor(double max_drift) : max_drift_(max_drift) {}
+
+    template <typename T>
+    bool operator()(const T* const state1, const T* const state2, T* residuals) const {
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p1(state1);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p2(state2);
+        
+        Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residuals);
+        
+        Eigen::Matrix<T, 3, 1> drift = p2 - p1;
+        T drift_norm = drift.norm();
+        
+        if (drift_norm > T(max_drift_)) {
+            residual = drift * (T(1.0) - T(max_drift_) / drift_norm);
+        } else {
+            residual.setZero();
+        }
+        
+        return true;
+    }
+
+    double max_drift_;
+};
  
  // Main fusion class
 // Add this to the previous code, replacing the incomplete UwbImuFusion class
@@ -304,16 +390,17 @@ class UwbImuFusion {
     private:
         void initializeParameters() {
             // System parameters
-            window_size_ = 10;
-            min_uwb_measurements_ = 3;
+            window_size_ = 5;  // Reduced from 10
+            min_uwb_measurements_ = 2;  // Reduced from 3
 
-            // Noise parameters - adjusted for real sensor characteristics
-            imu_acc_noise_ = 0.1;            // Increased for stability
-            imu_gyro_noise_ = 0.01;
+            // Adjusted noise parameters
+            imu_acc_noise_ = 0.01;    // Reduced
+            imu_gyro_noise_ = 0.001;  // Reduced
             imu_acc_bias_noise_ = 0.0001;
             imu_gyro_bias_noise_ = 0.0001;
-            uwb_noise_ = 0.1;
+            uwb_noise_ = 0.01;  // Increased for stronger position constraint
 
+            // Initialize current state
             // Initialize current state
             current_state_.timestamp = 0.0;
             current_state_.position.setZero();
@@ -415,30 +502,53 @@ class UwbImuFusion {
             // Remove bias and integrate IMU data
             Eigen::Vector3d acc_unbias = imu_data.acc - current_state_.acc_bias;
             Eigen::Vector3d gyro_unbias = imu_data.gyro - current_state_.gyro_bias;
-
-            // Add acceleration limits
-            const double MAX_ACC = 100.0;  // m/s^2
+        
+            // Add strict limits
+            const double MAX_ACC = 20.0;  // Reduced from 50.0 m/s^2
+            const double MAX_GYRO = 5.0;  // rad/s
             acc_unbias = acc_unbias.array().min(MAX_ACC).max(-MAX_ACC);
-
-            // Position integration using midpoint rule
-            Eigen::Vector3d acc_world = current_state_.orientation * acc_unbias + GRAVITY_VECTOR;
-            Eigen::Vector3d next_velocity = current_state_.velocity + acc_world * dt;
-            current_state_.position += (current_state_.velocity + next_velocity) * (dt * 0.5);
-            current_state_.velocity = next_velocity;
-
-            // Orientation integration using quaternion
+            gyro_unbias = gyro_unbias.array().min(MAX_GYRO).max(-MAX_GYRO);
+        
+            // First update orientation
             Eigen::Vector3d angle_axis = gyro_unbias * dt;
-            if (angle_axis.norm() > 1e-12) {
-                current_state_.orientation *= Eigen::Quaterniond(
-                    Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
+            if (angle_axis.norm() > 1e-8) {  // Changed from 1e-12
+                current_state_.orientation = current_state_.orientation * 
+                    Eigen::Quaterniond(Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
             }
-            current_state_.orientation.normalize();
-
+            current_state_.orientation.normalize();  // Important!
+        
+            // Then update position and velocity in world frame
+            Eigen::Vector3d acc_world = current_state_.orientation * acc_unbias + GRAVITY_VECTOR;
+            
+            // Stricter velocity limits
+            const double MAX_VELOCITY = 5.0;  // Reduced from 10.0 m/s
+            
+            // Integration with velocity limiting
+            Eigen::Vector3d delta_v = acc_world * dt;
+            delta_v = delta_v.array().min(MAX_VELOCITY * dt).max(-MAX_VELOCITY * dt);
+            
+            Eigen::Vector3d next_velocity = current_state_.velocity + delta_v;
+            next_velocity = next_velocity.array().min(MAX_VELOCITY).max(-MAX_VELOCITY);
+            
+            // Position update with smaller time step
+            current_state_.position += current_state_.velocity * dt + 0.5 * delta_v * dt;
+            current_state_.velocity = next_velocity;
+        
             // Update timestamp
             current_state_.timestamp = imu_data.timestamp;
-
+        
             // Integrate IMU preintegration
             imu_preintegration_->integrate(imu_data.acc, imu_data.gyro, dt);
+        }
+
+        void addImuFactor(ceres::Problem& problem, double* state_i, double* state_j) {
+            auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor), // Changed from 9 to 15
+                new ceres::HuberLoss(1.0),
+                state_i,
+                state_j
+            );
         }
     
         void optimize() {
@@ -456,27 +566,38 @@ class UwbImuFusion {
         
             // Add IMU factors with proper weighting
             double imu_weight = 1.0;
+            // Update IMU factor dimensions from 9 to 15
             for (size_t i = 0; i < state_window.size() - 1; ++i) {
                 auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
                 ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
                 problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<ImuFactor, 9, 16, 16>(imu_factor),
+                    new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor), // Changed from 9 to 15
                     loss_function,
                     parameter_blocks[i],
                     parameter_blocks[i + 1]
                 );
             }
         
-            // Add UWB factors with proper weighting
-            double uwb_weight = 10.0;  // Increased UWB weight relative to IMU
+            // Increase UWB weight significantly
+            double uwb_weight = 100.0;  // Increased from 10.0
             for (const auto& uwb_data : uwb_buffer_) {
                 Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity() / uwb_weight;
                 auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                    loss_function,
-                    parameter_blocks[0]  // Constrain the first state
+                    new ceres::CauchyLoss(0.1),  // Changed loss function
+                    parameter_blocks[0]
+                );
+            }
+
+            // Add position drift constraint
+            for (size_t i = 1; i < parameter_blocks.size(); ++i) {
+                auto* drift_factor = new PositionDriftFactor(5.0);  // 5.0 meters max drift
+                problem.AddResidualBlock(
+                    new ceres::AutoDiffCostFunction<PositionDriftFactor, 3, 16, 16>(drift_factor),
+                    new ceres::CauchyLoss(1.0),
+                    parameter_blocks[0],
+                    parameter_blocks[i]
                 );
             }
         
@@ -563,16 +684,6 @@ class UwbImuFusion {
             state.orientation = q;
             state.acc_bias = ba;
             state.gyro_bias = bg;
-        }
-    
-        void addImuFactor(ceres::Problem& problem, double* state_i, double* state_j) {
-            auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<ImuFactor, 9, 16, 16>(imu_factor),
-                new ceres::HuberLoss(1.0),
-                state_i,
-                state_j
-            );
         }
     
         void addUwbFactor(ceres::Problem& problem, 
