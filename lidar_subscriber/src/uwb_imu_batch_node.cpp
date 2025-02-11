@@ -427,7 +427,7 @@ class UwbImuFusion {
         bool batch_initialized_;
         double batch_start_time_;
         double batch_duration_;
-        size_t batch_size_;
+        // size_t batch_size_;
 
         // Batch parameters
         double state_dt_;           // Time between states in batch
@@ -441,7 +441,7 @@ class UwbImuFusion {
             num_states_batch_ = static_cast<size_t>(batch_duration_ / state_dt_);
             batch_initialized_ = false;
             // Add batch parameters
-            batch_size_ = 100;  // Number of states in batch
+            // batch_size_ = 100;  // Number of states in batch
             
             // Publishers
             path_pub_ = nh_.advertise<nav_msgs::Path>("/uwb_imu_fusion/trajectory", 1);
@@ -681,13 +681,14 @@ class UwbImuFusion {
         
             // Solve optimization problem
             ceres::Solver::Options options;
-            options.minimizer_progress_to_stdout = true;
+            options.minimizer_progress_to_stdout = false;
 
             options.linear_solver_type = ceres::DENSE_SCHUR;
             //options.num_threads = 2;
             options.trust_region_strategy_type = ceres::DOGLEG;
             options.max_num_iterations = 50;
-        
+            
+            auto t1 = ros::WallTime::now();
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
         
@@ -701,6 +702,9 @@ class UwbImuFusion {
                 updateTrajectory(batch_states);
                 publishTrajectory();
             }
+            auto t2 = ros::WallTime::now();
+            std::cout << "Optimization time : " << (t2 - t1).toSec() * 1000 << "[msec]" << std::endl;
+            std::cout << "Window size : " << parameter_blocks.size() << std::endl;
         
             // Cleanup
             for (auto ptr : parameter_blocks) {
@@ -1063,7 +1067,7 @@ class UwbImuFusion {
             auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
             problem.AddResidualBlock(
                 new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                new ceres::HuberLoss(10.0),
+                new ceres::HuberLoss(1.0),
                 parameter_blocks[closest_idx]
             );
             std::cout<<"add the UWB factors \n";
