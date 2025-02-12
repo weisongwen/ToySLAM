@@ -363,6 +363,7 @@
 // Add this to the previous code, replacing the incomplete UwbImuFusion class
 
 class UwbImuFusion {
+    
     public:
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     
@@ -375,6 +376,8 @@ class UwbImuFusion {
             Eigen::Vector3d acc_bias;
             Eigen::Vector3d gyro_bias;
         };
+
+        
     
         UwbImuFusion() {
             initializeParameters();
@@ -408,13 +411,9 @@ class UwbImuFusion {
             bool fixed; // Whether this state is fixed in optimization
             
             Eigen::Vector3d position;
-            
             Eigen::Vector3d velocity;
-            
             Eigen::Quaterniond orientation;
-            
             Eigen::Vector3d acc_bias;
-            
             Eigen::Vector3d gyro_bias;
             
         };
@@ -432,6 +431,10 @@ class UwbImuFusion {
         // Batch parameters
         double state_dt_;           // Time between states in batch
         size_t num_states_batch_;   // Number of states in each batch
+
+        // Add mutex protection for shared data
+        std::mutex state_mutex_;
+        std::mutex buffer_mutex_;
 
         void initializeParameters() {
 
@@ -562,6 +565,20 @@ class UwbImuFusion {
         }
     
         void propagateState(const ImuMeasurement& imu_data, double dt) {
+            // Add numerical stability checks
+            if (std::isnan(dt) || std::isinf(dt)) {
+                ROS_ERROR("Invalid dt in propagateState");
+                return;
+            }
+
+            // Check for NaN in state
+            if (current_state_.position.hasNaN() || 
+            current_state_.velocity.hasNaN() ||
+            current_state_.orientation.coeffs().hasNaN()) {
+                ROS_ERROR("NaN detected in state");
+                return;
+            }
+
             // Remove bias and integrate IMU data
             Eigen::Vector3d acc_unbias = imu_data.acc - current_state_.acc_bias;
             Eigen::Vector3d gyro_unbias = imu_data.gyro - current_state_.gyro_bias;
