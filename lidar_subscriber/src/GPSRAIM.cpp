@@ -1,207 +1,453 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <algorithm>
+#include <ros/ros.h>
+#include <sensor_msgs/NavSatFix.h>
 #include <Eigen/Dense>
 #include <ceres/ceres.h>
+#include <random>
+#include <vector>
+#include <cmath>
 
-#include <ros/ros.h>
-
-#include <string>
-
-using namespace Eigen;
-using namespace std;
-
-const double TARGET_RISK = 1e-7; // Integrity risk requirement
-const double FAULT_PROB_BASE = 1e-5; // Base satellite fault probability
-
-struct Satellite {
-    Vector3d pos_ecef;    // ECEF position (m)
-    double pseudorange;   // Measured pseudorange (m)
-    double variance;      // Measurement variance (m²)
-    double fault_prob;    // Prior fault probability
-};
-
-class ARAIM {
-public:
-    ARAIM(const vector<Satellite>& sats) : satellites(sats) {}
+// Add this function before the GPSRaimNode class definition
+double erfinv(double x) {
+    // Approximation of inverse error function
+    // Accurate to about 7 decimal places
     
-    void calculateIntegrity() {
-        // Full-set solution
-        Vector4d full_pos;
-        Matrix4d full_cov;
-        if (!solvePosition(satellites, full_pos, full_cov)) {
-            cerr << "Full solution failed!" << endl;
-            return;
-        }
+    // Handle edge cases
+    if (x >= 1.0) return std::numeric_limits<double>::infinity();
+    if (x <= -1.0) return -std::numeric_limits<double>::infinity();
+    if (x == 0) return 0;
 
-        // Calculate all single-fault hypotheses
-        vector<Hypothesis> hypotheses;
-        for (size_t i = 0; i < satellites.size(); ++i) {
-            Hypothesis h;
-            h.excluded_sat = i;
-            h.fault_prob = satellites[i].fault_prob;
-            
-            // Create subset without the excluded satellite
-            vector<Satellite> subset = satellites;
-            subset.erase(subset.begin() + i);
-            
-            if (solvePosition(subset, h.position, h.covariance)) {
-                h.separation = (full_pos.head<3>() - h.position.head<3>());
-                hypotheses.push_back(h);
-            }
-        }
+    const double pi = 3.141592653589793238462643383279502884;
 
-        // Calculate protection levels
-        calculateProtectionLevels(full_pos, full_cov, hypotheses);
+    // Coefficients for approximation
+    const double a[4] = {
+        0.886226899, -1.645349621, 0.914624893, -0.140543331
+    };
+    const double b[4] = {
+        -2.118377725, 1.442710462, -0.329097515, 0.012229801
+    };
+    const double c[4] = {
+        -1.970840454, -1.624906493, 3.429567803, 1.641345311
+    };
+    const double d[2] = {
+        3.543889200, 1.637067800
+    };
+
+    double y = x;
+    double result;
+
+    if (abs(y) <= 0.7) {
+        double z = y * y;
+        double num = ((a[3] * z + a[2]) * z + a[1]) * z + a[0];
+        double den = ((b[3] * z + b[2]) * z + b[1]) * z + b[0];
+        result = y * num / den;
+    }
+    else {
+        double z = sqrt(-log((1.0 - abs(y)) / 2.0));
+        double num = ((c[3] * z + c[2]) * z + c[1]) * z + c[0];
+        double den = (d[1] * z + d[0]) * z + 1.0;
+        result = (y > 0 ? 1 : -1) * num / den;
+    }
+
+    // One iteration of Newton's method to refine result
+    result = result - (erf(result) - x) / (2.0/sqrt(pi) * exp(-result * result));
+
+    return result;
+}
+
+
+class GPSRaimNode {
+private:
+    ros::NodeHandle nh_;
+    ros::Publisher position_pub_;
+    ros::Publisher raim_pub_;
+    
+    // Constants
+    const double SPEED_OF_LIGHT = 299792458.0;  // m/s
+    const int NUM_SATELLITES = 8;
+    const double ALPHA = 0.05;  // False alarm probability
+    const double BETA = 0.05;   // Missed detection probability
+    const double T_ALPHA = 12.592; // Chi-square threshold for alpha (dof=6)
+    
+    // RAIM parameters
+    const double PHMI = 1e-7;  // Integrity risk requirement
+    const double PFA = 1e-5;   // False alert probability requirement
+    const double PMD = 1e-3;   // Missed detection probability requirement
+    const double HAL = 40.0;   // Horizontal Alert Limit (meters)
+    const double VAL = 50.0;   // Vertical Alert Limit (meters)
+    
+    struct Satellite {
+        Eigen::Vector3d position;
+        double pseudorange;
+        double elevation;
+        double azimuth;
+        double weight;         // Measurement weight based on elevation
+        double variance;       // Measurement variance
+    };
+    
+    std::vector<Satellite> satellites_;
+    Eigen::Vector4d receiver_state_;  // [x, y, z, clock_bias]
+    std::random_device rd_;
+    std::default_random_engine gen_;
+    std::normal_distribution<double> noise_dist_;
+    ros::Timer timer;
+
+public:
+    GPSRaimNode() : 
+        gen_(rd_()),
+        noise_dist_(0.0, 3.0)
+    {
+        position_pub_ = nh_.advertise<sensor_msgs::NavSatFix>("/gps/position", 1);
+        raim_pub_ = nh_.advertise<sensor_msgs::NavSatFix>("/gps/raim", 1);
+        
+        receiver_state_ = Eigen::Vector4d(0, 0, 0, 0);
+        
+        initializeSatellites();
+        
+        timer = nh_.createTimer(ros::Duration(1.0), 
+                                         &GPSRaimNode::processCallback, this);
     }
 
 private:
-    struct Hypothesis {
-        Vector4d position;
-        Matrix4d covariance;
-        Vector3d separation;
-        size_t excluded_sat;
-        double fault_prob;
-    };
 
-    vector<Satellite> satellites;
+struct PseudorangeCostFunctor {
+    PseudorangeCostFunctor(const Eigen::Vector3d& sat_pos, 
+                          const double measured_range,
+                          const double weight)
+        : sat_pos_(sat_pos), measured_range_(measured_range), weight_(weight) {}
 
-    bool solvePosition(const vector<Satellite>& sats, Vector4d& result, Matrix4d& cov) {
-        ceres::Problem problem;
-        result << 0, 0, 0, 0;
-
-        for (const auto& sat : sats) {
-            ceres::CostFunction* cf = 
-                new ceres::AutoDiffCostFunction<PseudorangeResidual, 1, 4>(
-                    new PseudorangeResidual(sat));
-            auto ID = problem.AddResidualBlock(cf, nullptr, result.data());
-        }
-
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-
-        // get the residuals
-
-
-        std::cout<< "result-> " << std::setprecision (10)<<result <<"\n";
-
-        if (!summary.IsSolutionUsable()) return false;
-
-        // Calculate covariance matrix
-        MatrixXd H(sats.size(), 4);
-        VectorXd W(sats.size());
-        for (size_t i = 0; i < sats.size(); ++i) {
-            Vector3d sat_pos = sats[i].pos_ecef;
-            double dx = sat_pos[0] - result[0];
-            double dy = sat_pos[1] - result[1];
-            double dz = sat_pos[2] - result[2];
-            double range = sqrt(dx*dx + dy*dy + dz*dz);
-            
-            H(i, 0) = dx / range;
-            H(i, 1) = dy / range;
-            H(i, 2) = dz / range;
-            H(i, 3) = 1.0;
-            W[i] = 1.0 / sats[i].variance;
-        }
-
-        cov = (H.transpose() * W.asDiagonal() * H).inverse();
+    template <typename T>
+    bool operator()(const T* const receiver_state, T* residual) const {
+        Eigen::Matrix<T,3,1> receiver_pos(receiver_state[0], 
+                                        receiver_state[1], 
+                                        receiver_state[2]);
+        Eigen::Matrix<T,3,1> sat_pos_t = sat_pos_.cast<T>();
+        
+        // Compute predicted range
+        T predicted_range = (sat_pos_t - receiver_pos).norm();
+        
+        // Add clock bias
+        predicted_range += receiver_state[3];
+        
+        // Compute weighted residual
+        residual[0] = T(weight_) * (predicted_range - T(measured_range_));
+        
         return true;
     }
 
-    void calculateProtectionLevels(const Vector4d& full_pos, const Matrix4d& full_cov,
-                                  const vector<Hypothesis>& hypotheses) {
-        // Calculate protection levels using MHSS method
-        double hpl = 0.0, vpl = 0.0;
-        double total_risk_h = 0.0, total_risk_v = 0.0;
-
-        for (const auto& h : hypotheses) {
-            // Calculate combined uncertainties
-            Vector3d full_std = full_cov.diagonal().head<3>().cwiseSqrt();
-            Vector3d h_std = h.covariance.diagonal().head<3>().cwiseSqrt();
-            Vector3d combined_std = (full_std.array().square() + h_std.array().square()).sqrt();
-
-            // Calculate K-factor based on allocated risk
-            double allocated_risk = TARGET_RISK * h.fault_prob;
-            double K = inverseQFunction(allocated_risk);
-
-            // Horizontal components
-            double h_sep = h.separation.head<2>().norm();
-            double h_pl = h_sep + K * combined_std.head<2>().norm();
-            hpl = max(hpl, h_pl);
-
-            // Vertical component
-            double v_sep = abs(h.separation[2]);
-            double v_pl = v_sep + K * combined_std[2];
-            vpl = max(vpl, v_pl);
-
-            // Calculate actual risk contributions (for verification)
-            total_risk_h += h.fault_prob * QFunction((hpl - h_sep)/combined_std.head<2>().norm());
-            total_risk_v += h.fault_prob * QFunction((vpl - v_sep)/combined_std[2]);
-        }
-
-        cout << "Calculated Protection Levels:" << endl;
-        cout << "HPL: " << hpl << " meters" << endl;
-        cout << "VPL: " << vpl << " meters" << endl;
-        cout << "Achieved Horizontal Risk: " << total_risk_h << endl;
-        cout << "Achieved Vertical Risk: " << total_risk_v << endl;
-    }
-
-    static double QFunction(double x) {
-        return 0.5 * erfc(x / sqrt(2.0));
-    }
-
-    static double inverseQFunction(double p) {
-        // Approximation of inverse Q function for small p
-        if (p <= 0) return numeric_limits<double>::infinity();
-        if (p >= 0.5) return 0.0;
-        
-        double t = sqrt(-2.0 * log(p));
-        return t - (2.515517 + 0.802853*t + 0.010328*t*t) /
-                   (1.0 + 1.432788*t + 0.189269*t*t + 0.001308*t*t*t);
-    }
-
-    struct PseudorangeResidual {
-        Satellite sat;
-        PseudorangeResidual(Satellite s) : sat(s) {}
-        
-        template <typename T>
-        bool operator()(const T* const pos, T* residual) const {
-            T dx = T(sat.pos_ecef[0]) - pos[0];
-            T dy = T(sat.pos_ecef[1]) - pos[1];
-            T dz = T(sat.pos_ecef[2]) - pos[2];
-            T range = sqrt(dx*dx + dy*dy + dz*dz);
-            residual[0] = (T(sat.pseudorange) - (range + pos[3])) / T(sqrt(sat.variance));
-            return true;
-        }
-    };
+    const Eigen::Vector3d sat_pos_;
+    const double measured_range_;
+    const double weight_;
 };
 
-int main(int argc, char** argv)
-{
-    ros::init(argc, argv, "GPS_RAIM_node");
+    // Add these member variables to the class
+    double last_pdop_;
+    double last_hdop_;
+    double last_vdop_;
+    double last_tdop_;
 
-    // vector<Satellite> sats = {
-    //     {Vector3d(-1.6e7, 1.7e7, 2.0e7), 2.1e7, 25.0, FAULT_PROB_BASE},
-    //     {Vector3d(1.8e7, -1.3e7, 2.1e7), 2.2e7, 25.0, FAULT_PROB_BASE},
-    //     {Vector3d(-2.0e7, -1.4e7, 1.9e7), 2.3e7, 25.0, FAULT_PROB_BASE},
-    //     {Vector3d(1.7e7, 1.6e7, 2.2e7), 2.0e7, 25.0, FAULT_PROB_BASE},
-    //     {Vector3d(-1.5e7, -1.8e7, 2.1e7), 2.1e7, 25.0, FAULT_PROB_BASE}
-    // };
-
-    vector<Satellite> sats = {
-        {Vector3d(-10816000, 24273000, 0), 20841005, 25.0, FAULT_PROB_BASE},
-        {Vector3d(-4000000, 22630000, 13280000), 20380003, 25.0, FAULT_PROB_BASE},
-        {Vector3d(-16820000, 20040000, -4610000), 21707006, 25.0, FAULT_PROB_BASE},
-        {Vector3d(3262000, 18490000, 18790000), 21723004, 25.0, FAULT_PROB_BASE},
-        {Vector3d(-23000000, 13280000, 0), 22160005, 25.0, FAULT_PROB_BASE}
+void singlePointPosition() {
+    // Initial guess is current receiver state
+    double receiver_state_array[4] = {
+        receiver_state_(0),
+        receiver_state_(1),
+        receiver_state_(2),
+        receiver_state_(3)
     };
 
-    ARAIM araim(sats);
-    araim.calculateIntegrity();
+    // Build the problem using Ceres
+    ceres::Problem problem;
+    
+    for (const auto& sat : satellites_) {
+        ceres::CostFunction* cost_function =
+            new ceres::AutoDiffCostFunction<PseudorangeCostFunctor, 1, 4>(
+                new PseudorangeCostFunctor(sat.position, 
+                                         sat.pseudorange,
+                                         sqrt(sat.weight)));
+        
+        problem.AddResidualBlock(cost_function, nullptr, receiver_state_array);
+    }
 
+    // Set solver options
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::DENSE_QR;
+    options.minimizer_progress_to_stdout = false;
+    options.max_num_iterations = 50;
+    options.function_tolerance = 1e-12;
+    options.gradient_tolerance = 1e-12;
+    options.parameter_tolerance = 1e-12;
+
+    // Solve
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+
+    // Check if optimization succeeded
+    if (summary.termination_type == ceres::CONVERGENCE) {
+        // Update receiver state
+        for (int i = 0; i < 4; ++i) {
+            receiver_state_(i) = receiver_state_array[i];
+        }
+        std::cout<<"receiver state -> "<< receiver_state_<<"\n";
+    } else {
+        ROS_WARN("GPS position estimation did not converge!");
+    }
+
+    // Optional: Compute DOP values
+    Eigen::MatrixXd G = computeGeometryMatrix();
+    Eigen::MatrixXd GTG = G.transpose() * G;
+    Eigen::MatrixXd P = GTG.inverse();
+
+    double PDOP = sqrt(P(0,0) + P(1,1) + P(2,2));
+    double HDOP = sqrt(P(0,0) + P(1,1));
+    double VDOP = sqrt(P(2,2));
+    double TDOP = sqrt(P(3,3));
+
+    // Store DOP values if needed
+    last_pdop_ = PDOP;
+    last_hdop_ = HDOP;
+    last_vdop_ = VDOP;
+    last_tdop_ = TDOP;
+    }
+
+    double computeElevationWeight(double elevation_rad) {
+        // Elevation-dependent weighting model
+        const double a = 0.13;
+        const double b = 0.53;
+        double elevation_deg = elevation_rad * 180.0 / M_PI;
+        return pow(a + b * sin(elevation_rad), 2);
+    }
+
+    void initializeSatellites() {
+        // Similar to previous implementation but with additional parameters
+        double orbit_radius = 26600000.0;
+        // double orbit_radius = 26600000.0;
+        satellites_.clear();
+        
+        for (int i = 0; i < NUM_SATELLITES; ++i) {
+            Satellite sat;
+            double angle = 2.0 * M_PI * i / NUM_SATELLITES;
+            double elevation = M_PI/4.0 + 0.2 * noise_dist_(gen_); // Add some variation
+            // double elevation = M_PI/4.0; // Add some variation
+            
+            sat.position = Eigen::Vector3d(
+                orbit_radius * cos(angle) * cos(elevation),
+                orbit_radius * sin(angle) * cos(elevation),
+                orbit_radius * sin(elevation)
+            );
+            
+            Eigen::Vector3d receiver_pos = receiver_state_.head<3>();
+            Eigen::Vector3d sat_vector = sat.position - receiver_pos;
+            double true_range = sat_vector.norm();
+            
+            // Calculate elevation and azimuth
+            sat.elevation = asin(sat_vector(2) / sat_vector.norm());
+            sat.azimuth = atan2(sat_vector(1), sat_vector(0));
+            
+            // Compute elevation-dependent weighting
+            sat.weight = computeElevationWeight(sat.elevation);
+            
+            // Compute measurement variance based on elevation-dependent model
+            double sigma_ura = 3.0; // Base URA value
+            sat.variance = pow(sigma_ura / sin(sat.elevation), 2);
+            
+            // Generate pseudorange with elevation-dependent noise
+            double noise_scale = 1.0 / sin(sat.elevation);
+            sat.pseudorange = true_range + 
+                            receiver_state_(3) + 
+                            noise_dist_(gen_) * noise_scale;
+            
+            satellites_.push_back(sat);
+        }
+    }
+
+    Eigen::MatrixXd computeWeightMatrix() {
+        Eigen::MatrixXd W = Eigen::MatrixXd::Zero(NUM_SATELLITES, NUM_SATELLITES);
+        for (int i = 0; i < NUM_SATELLITES; ++i) {
+            W(i,i) = satellites_[i].weight;
+        }
+        return W;
+    }
+
+    Eigen::MatrixXd computeGeometryMatrix() {
+        Eigen::MatrixXd G(NUM_SATELLITES, 4);
+        Eigen::Vector3d receiver_pos = receiver_state_.head<3>();
+        
+        for (int i = 0; i < NUM_SATELLITES; ++i) {
+            Eigen::Vector3d sat_vector = satellites_[i].position - receiver_pos;
+            double range = sat_vector.norm();
+            G.block<1,3>(i,0) = -sat_vector.transpose() / range;
+            G(i,3) = 1.0;
+        }
+        return G;
+    }
+
+    void computeProtectionLevels(const Eigen::MatrixXd& G, 
+                               const Eigen::MatrixXd& W,
+                               double& HPL,
+                               double& VPL) {
+        // Compute weighted least squares solution matrix
+        Eigen::MatrixXd GT_W = G.transpose() * W;
+        Eigen::MatrixXd H = (GT_W * G).inverse() * GT_W;
+        
+        // Compute fault-free covariance matrix
+        Eigen::MatrixXd P = H * W.inverse() * H.transpose();
+        
+        // Transform to local East-North-Up (ENU) frame
+        double lat = 0.0; // Assuming receiver position is known
+        double lon = 0.0;
+        
+        // Rotation matrix from ECEF to ENU
+        Eigen::Matrix3d R_ECEF_ENU;
+        R_ECEF_ENU << -sin(lon), cos(lon), 0,
+                     -sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat),
+                      cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat);
+        
+        // Extract position components of the covariance matrix
+        Eigen::Matrix3d P_pos = P.block<3,3>(0,0);
+        Eigen::Matrix3d P_ENU = R_ECEF_ENU * P_pos * R_ECEF_ENU.transpose();
+        
+        // Compute horizontal position variance
+        double var_E = P_ENU(0,0);
+        double var_N = P_ENU(1,1);
+        double cov_EN = P_ENU(0,1);
+        
+        // Compute semi-major axis of horizontal error ellipse
+        double d_major = 0.5 * (var_E + var_N + 
+                       sqrt(pow(var_E - var_N, 2) + 4*pow(cov_EN, 2)));
+        
+        // Compute vertical position variance
+        double var_U = P_ENU(2,2);
+        
+        // Slope parameters for each satellite
+        std::vector<double> slopes(NUM_SATELLITES);
+        for (int i = 0; i < NUM_SATELLITES; ++i) {
+            Eigen::VectorXd e_i = Eigen::VectorXd::Zero(NUM_SATELLITES);
+            e_i(i) = 1.0;
+            
+            // Compute slope for each satellite
+            Eigen::VectorXd p_i = H * e_i;
+            Eigen::Vector3d p_i_ENU = R_ECEF_ENU * p_i.head<3>();
+            double horizontal_comp = sqrt(pow(p_i_ENU(0), 2) + pow(p_i_ENU(1), 2));
+            double vertical_comp = abs(p_i_ENU(2));
+            
+            slopes[i] = sqrt(pow(horizontal_comp, 2) + pow(vertical_comp, 2));
+        }
+        
+        // Find maximum slope
+        double max_slope = *std::max_element(slopes.begin(), slopes.end());
+        
+        // Compute bias amplification factors
+        double H_bias = sqrt(d_major);
+        double V_bias = sqrt(var_U);
+        
+        // Non-centrality parameter based on PMD
+        double lambda = computeNoncentralityParameter();
+        
+        // Compute protection levels
+        HPL = max_slope * H_bias * sqrt(lambda);
+        VPL = max_slope * V_bias * sqrt(lambda);
+    }
+
+    double computeNoncentralityParameter() {
+        // Compute non-centrality parameter based on PMD and PFA
+        // Using inverse chi-square distribution
+        double dof = NUM_SATELLITES - 4; // Degrees of freedom
+        double Q_md = sqrt(2) * erfinv(1 - 2*PMD);
+        double Q_fa = sqrt(2) * erfinv(1 - 2*PFA);
+        
+        return pow(Q_md + Q_fa, 2);
+    }
+
+    void performRAIMCheck(const Eigen::VectorXd& residuals,
+                         const Eigen::MatrixXd& G,
+                         const Eigen::MatrixXd& W,
+                         bool& raim_available,
+                         int& faulty_satellite) {
+        // Compute test statistic
+        Eigen::MatrixXd S = Eigen::MatrixXd::Identity(NUM_SATELLITES, NUM_SATELLITES) - 
+                           G * (G.transpose() * W * G).inverse() * G.transpose() * W;
+        double test_statistic = residuals.transpose() * W * S * W * residuals;
+        
+        // Check global test
+        raim_available = (test_statistic < T_ALPHA);
+        
+        // Local test for fault detection
+        faulty_satellite = -1;
+        if (!raim_available) {
+            std::vector<double> normalized_residuals(NUM_SATELLITES);
+            for (int i = 0; i < NUM_SATELLITES; ++i) {
+                double w_i = sqrt(W(i,i));
+                normalized_residuals[i] = abs(w_i * residuals(i)) / sqrt(S(i,i));
+            }
+            
+            // Find satellite with maximum normalized residual
+            auto max_it = std::max_element(normalized_residuals.begin(), 
+                                         normalized_residuals.end());
+            faulty_satellite = std::distance(normalized_residuals.begin(), max_it);
+        }
+    }
+
+    void processCallback(const ros::TimerEvent& event) {
+        // Update satellite positions and measurements
+        initializeSatellites();
+        
+        // Perform single point positioning (using previous implementation)
+        singlePointPosition();
+        
+        // Compute geometry and weight matrices
+        Eigen::MatrixXd G = computeGeometryMatrix();
+        Eigen::MatrixXd W = computeWeightMatrix();
+        
+        // Compute residuals
+        Eigen::VectorXd residuals(NUM_SATELLITES);
+        for (int i = 0; i < NUM_SATELLITES; ++i) {
+            Eigen::Vector3d receiver_pos = receiver_state_.head<3>();
+            double predicted_range = (satellites_[i].position - receiver_pos).norm() + 
+                                   receiver_state_(3);
+            residuals(i) = satellites_[i].pseudorange - predicted_range;
+        }
+        
+        // Perform RAIM check
+        bool raim_available;
+        int faulty_satellite;
+        performRAIMCheck(residuals, G, W, raim_available, faulty_satellite);
+        
+        // Compute protection levels
+        double HPL, VPL;
+        computeProtectionLevels(G, W, HPL, VPL);
+        
+        // Publish RAIM results
+        sensor_msgs::NavSatFix raim_msg;
+        raim_msg.header.stamp = ros::Time::now();
+        raim_msg.header.frame_id = "gps";
+        raim_msg.position_covariance[0] = HPL;
+        raim_msg.position_covariance[4] = HPL;
+        raim_msg.position_covariance[8] = VPL;
+        raim_msg.status.status = raim_available ? 0 : -1;
+        raim_msg.status.service = faulty_satellite + 1; // 0 means no fault
+        
+        raim_pub_.publish(raim_msg);
+        
+        // Publish position (using previous implementation)
+        publishPosition();
+    }
+
+    void publishPosition() {
+        sensor_msgs::NavSatFix pos_msg;
+        pos_msg.header.stamp = ros::Time::now();
+        pos_msg.header.frame_id = "gps";
+        pos_msg.latitude = receiver_state_(0);
+        pos_msg.longitude = receiver_state_(1);
+        pos_msg.altitude = receiver_state_(2);
+        
+        position_pub_.publish(pos_msg);
+    }
+
+    // ... (keep the previous singlePointPosition implementation)
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "gps_raim_node");
+    GPSRaimNode raim_node;
     ros::spin();
     return 0;
 }
