@@ -380,6 +380,9 @@ class UwbImuFusion {
         
     
         UwbImuFusion() {
+
+            trajectory_start_time_ = 0.0;
+            state_interval_ = 0.1;  // 10Hz state estimation
             initializeParameters();
             
             // ROS subscribers and publishers
@@ -403,21 +406,37 @@ class UwbImuFusion {
         // Add these members
 
         struct BatchState {
-
             EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-            
             double timestamp;
-            
-            bool fixed; // Whether this state is fixed in optimization
-            
+            bool fixed;
             Eigen::Vector3d position;
             Eigen::Vector3d velocity;
             Eigen::Quaterniond orientation;
             Eigen::Vector3d acc_bias;
             Eigen::Vector3d gyro_bias;
             
+            // Add constructor for easy initialization
+            BatchState() {
+                timestamp = 0.0;
+                fixed = false;
+                position.setZero();
+                velocity.setZero();
+                orientation.setIdentity();
+                acc_bias.setZero();
+                gyro_bias.setZero();
+            }
         };
+        
         std::vector<BatchState> trajectory_states_;
+
+        // new variables defined
+        std::vector<BatchState> full_trajectory_;
+        double trajectory_start_time_;
+        double state_interval_;  // Time interval between states
+        std::deque<ImuMeasurement> full_imu_buffer_;
+        std::deque<UwbMeasurement> full_uwb_buffer_;
+
+
         ros::Publisher path_pub_;
         ros::Publisher batch_pose_pub_;
         
@@ -441,6 +460,7 @@ class UwbImuFusion {
             // Batch processing parameters
             batch_duration_ = 1.0;     // Process 5 seconds of data at a time
             state_dt_ = 0.1;          // State every 0.1 seconds, 0.1
+            state_interval_  = 0.1; // 
             num_states_batch_ = static_cast<size_t>(batch_duration_ / state_dt_);
             batch_initialized_ = false;
             // Add batch parameters
@@ -540,85 +560,198 @@ class UwbImuFusion {
         }
     
         void processUwbData(const UwbMeasurement& uwb_data) {
-            if (!initialized_ || imu_buffer_.size() < min_imu_between_uwb_) {
-                return;
+            if (!initialized_) {
+                if (imu_buffer_.size() < min_imu_between_uwb_) {
+                    return;
+                }
+                initialized_ = true;
+                trajectory_start_time_ = imu_buffer_.front().timestamp;
             }
         
-            // Check if UWB position is within reasonable bounds
-            const double MAX_POSITION = 100000.0;  // meters
-            if (uwb_data.position.norm() > MAX_POSITION) {
-                ROS_WARN("UWB position too large, ignoring measurement");
-                return;
+            // Store UWB measurement
+            full_uwb_buffer_.push_back(uwb_data);
+            
+            // Perform batch optimization
+            performFullBatchOptimization(uwb_data.timestamp);
+        }
+
+        void performFullBatchOptimization(double current_time) {
+            // Calculate number of states needed
+            double trajectory_duration = current_time - trajectory_start_time_;
+            size_t num_states = static_cast<size_t>(trajectory_duration / state_interval_) + 1;
+            
+            // Initialize or extend trajectory
+            if (full_trajectory_.empty()) {
+                initializeFullTrajectory(num_states);
+            } else {
+                extendTrajectory(num_states);
             }
         
-            uwb_buffer_.push_back(uwb_data);
-        
-            // Limit buffer size
-            while (uwb_buffer_.size() > max_uwb_queue_size_) {
-                uwb_buffer_.pop_front();
+            // Setup optimization problem
+            ceres::Problem problem;
+            std::vector<double*> parameter_blocks;
+            
+            // Create parameter blocks
+            for (size_t i = 0; i < full_trajectory_.size(); ++i) {
+                double* state_ptr = new double[16];
+                batchStateToArray(full_trajectory_[i], state_ptr);
+                parameter_blocks.push_back(state_ptr);
+                
+                if (i == 0) {
+                    // Fix the first state
+                    problem.SetParameterBlockConstant(state_ptr);
+                }
             }
         
-            // Trigger optimization when enough measurements are collected
-            if (uwb_buffer_.size() >= min_uwb_measurements_) {
-                optimize();
+            // Add IMU factors
+            for (size_t i = 0; i < full_trajectory_.size() - 1; ++i) {
+                addImuFactorBetweenStates(problem, i, i + 1, parameter_blocks);
+            }
+        
+            // Add UWB factors
+            for (const auto& uwb : full_uwb_buffer_) {
+                size_t closest_idx = findClosestStateIndex(uwb.timestamp, full_trajectory_);
+                addUwbFactor(problem, parameter_blocks[closest_idx], uwb);
+            }
+        
+            // Solve optimization problem
+            ceres::Solver::Options options;
+            options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.max_num_iterations = 100;
+            options.minimizer_progress_to_stdout = true;
+        
+            ceres::Solver::Summary summary;
+            ceres::Solve(options, &problem, &summary);
+        
+            // Update trajectory if optimization succeeded
+            if (summary.termination_type == ceres::CONVERGENCE) {
+                for (size_t i = 0; i < full_trajectory_.size(); ++i) {
+                    arrayToBatchState(parameter_blocks[i], full_trajectory_[i]);
+                }
+                publishTrajectory();
+            }
+        
+            // Cleanup
+            for (auto ptr : parameter_blocks) {
+                delete[] ptr;
             }
         }
+
+
+        void initializeFullTrajectory(size_t num_states) {
+            full_trajectory_.clear();
+            
+            for (size_t i = 0; i < num_states; ++i) {
+                BatchState state;
+                state.timestamp = trajectory_start_time_ + i * state_interval_;
+                
+                // Initialize state using IMU propagation and UWB measurements
+                if (i == 0) {
+                    state.position = full_uwb_buffer_.front().position;
+                } else {
+                    // Propagate from previous state using IMU
+                    propagateState(state, full_trajectory_.back(), state_interval_);
+                }
+                
+                full_trajectory_.push_back(state);
+            }
+        }
+        
+        void extendTrajectory(size_t new_size) {
+            if (new_size <= full_trajectory_.size()) {
+                return;
+            }
+            
+            size_t current_size = full_trajectory_.size();
+            for (size_t i = current_size; i < new_size; ++i) {
+                BatchState state;
+                state.timestamp = trajectory_start_time_ + i * state_interval_;
+                propagateState(state, full_trajectory_.back(), state_interval_);
+                full_trajectory_.push_back(state);
+            }
+        }
+        
+        void addImuFactorBetweenStates(ceres::Problem& problem, 
+                                      size_t idx1, 
+                                      size_t idx2,
+                                      const std::vector<double*>& parameter_blocks) {
+            double t1 = full_trajectory_[idx1].timestamp;
+            double t2 = full_trajectory_[idx2].timestamp;
+            
+            imu_preintegration_->reset();
+            
+            // Integrate IMU measurements between states
+            for (const auto& imu : full_imu_buffer_) {
+                if (imu.timestamp >= t1 && imu.timestamp < t2) {
+                    double dt = imu.timestamp - t1;
+                    imu_preintegration_->integrate(imu.acc, imu.gyro, dt);
+                    t1 = imu.timestamp;
+                }
+            }
+            
+            auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+            problem.AddResidualBlock(
+                new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
+                new ceres::HuberLoss(1.0),
+                parameter_blocks[idx1],
+                parameter_blocks[idx2]
+            );
+        }
     
-        void propagateState(const ImuMeasurement& imu_data, double dt) {
-            // Add numerical stability checks
+        void propagateState(BatchState& next_state, const BatchState& current_state, double dt) {
+            // Check for numerical stability
             if (std::isnan(dt) || std::isinf(dt)) {
                 ROS_ERROR("Invalid dt in propagateState");
                 return;
             }
-
-            // Check for NaN in state
-            if (current_state_.position.hasNaN() || 
-            current_state_.velocity.hasNaN() ||
-            current_state_.orientation.coeffs().hasNaN()) {
-                ROS_ERROR("NaN detected in state");
+        
+            // Find relevant IMU measurements
+            std::vector<ImuMeasurement> imu_measurements;
+            for (const auto& imu : full_imu_buffer_) {
+                if (imu.timestamp >= current_state.timestamp && 
+                    imu.timestamp < current_state.timestamp + dt) {
+                    imu_measurements.push_back(imu);
+                }
+            }
+        
+            // If no IMU measurements, do simple linear propagation
+            if (imu_measurements.empty()) {
+                next_state.position = current_state.position + current_state.velocity * dt;
+                next_state.velocity = current_state.velocity;
+                next_state.orientation = current_state.orientation;
+                next_state.acc_bias = current_state.acc_bias;
+                next_state.gyro_bias = current_state.gyro_bias;
                 return;
             }
-
-            // Remove bias and integrate IMU data
-            Eigen::Vector3d acc_unbias = imu_data.acc - current_state_.acc_bias;
-            Eigen::Vector3d gyro_unbias = imu_data.gyro - current_state_.gyro_bias;
         
-            // Add strict limits
-            const double MAX_ACC = 20.0;  // Reduced from 50.0 m/s^2
-            const double MAX_GYRO = 50.0;  // rad/s
-            acc_unbias = acc_unbias.array().min(MAX_ACC).max(-MAX_ACC);
-            gyro_unbias = gyro_unbias.array().min(MAX_GYRO).max(-MAX_GYRO);
+            // Initialize next state
+            next_state = current_state;
         
-            // First update orientation
-            Eigen::Vector3d angle_axis = gyro_unbias * dt;
-            if (angle_axis.norm() > 1e-8) {  // Changed from 1e-12
-                current_state_.orientation = current_state_.orientation * 
-                    Eigen::Quaterniond(Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
+            // Integrate IMU measurements
+            for (size_t i = 0; i < imu_measurements.size(); ++i) {
+                const auto& imu = imu_measurements[i];
+                double delta_t = (i == imu_measurements.size() - 1) ? 
+                    (current_state.timestamp + dt - imu.timestamp) :
+                    (imu_measurements[i + 1].timestamp - imu.timestamp);
+        
+                // Remove bias
+                Eigen::Vector3d acc_unbias = imu.acc - current_state.acc_bias;
+                Eigen::Vector3d gyro_unbias = imu.gyro - current_state.gyro_bias;
+        
+                // Update orientation
+                Eigen::Vector3d angle_axis = gyro_unbias * delta_t;
+                if (angle_axis.norm() > 1e-8) {
+                    next_state.orientation = next_state.orientation * 
+                        Eigen::Quaterniond(Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
+                }
+                next_state.orientation.normalize();
+        
+                // Update position and velocity
+                Eigen::Vector3d acc_world = next_state.orientation * acc_unbias + GRAVITY_VECTOR;
+                next_state.velocity += acc_world * delta_t;
+                next_state.position += next_state.velocity * delta_t + 
+                                     0.5 * acc_world * delta_t * delta_t;
             }
-            current_state_.orientation.normalize();  // Important!
-        
-            // Then update position and velocity in world frame
-            Eigen::Vector3d acc_world = current_state_.orientation * acc_unbias + GRAVITY_VECTOR;
-            
-            // Stricter velocity limits
-            const double MAX_VELOCITY = 50.0;  // Reduced from 10.0 m/s
-            
-            // Integration with velocity limiting
-            Eigen::Vector3d delta_v = acc_world * dt;
-            delta_v = delta_v.array().min(MAX_VELOCITY * dt).max(-MAX_VELOCITY * dt);
-            
-            Eigen::Vector3d next_velocity = current_state_.velocity + delta_v;
-            next_velocity = next_velocity.array().min(MAX_VELOCITY).max(-MAX_VELOCITY);
-            
-            // Position update with smaller time step
-            current_state_.position += current_state_.velocity * dt + 0.5 * delta_v * dt;
-            current_state_.velocity = next_velocity;
-        
-            // Update timestamp
-            current_state_.timestamp = imu_data.timestamp;
-        
-            // Integrate IMU preintegration
-            imu_preintegration_->integrate(imu_data.acc, imu_data.gyro, dt);
         }
 
         void addImuFactor(ceres::Problem& problem, double* state_i, double* state_j) {
@@ -1064,31 +1197,16 @@ class UwbImuFusion {
             state.gyro_bias = bg;
         }
     
-        void addUwbFactor(ceres::Problem& problem, 
-                         const std::vector<double*>& parameter_blocks,
-                         const UwbMeasurement& uwb_data) {
-            // Find closest state
-            size_t closest_idx = 0;
-            double min_dt = std::numeric_limits<double>::max();
-            
-            for (size_t i = 0; i < parameter_blocks.size(); ++i) {
-                double dt = std::abs(uwb_data.timestamp - 
-                                   (last_imu_time_ - (parameter_blocks.size() - 1 - i) * 0.01));
-                if (dt < min_dt) {
-                    min_dt = dt;
-                    closest_idx = i;
-                }
-            }
-    
+        void addUwbFactor(ceres::Problem& problem, double* state_ptr, 
+            const UwbMeasurement& uwb_data) {
             Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
             auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
             problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                new ceres::HuberLoss(1.0),
-                parameter_blocks[closest_idx]
+            new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
+            new ceres::HuberLoss(1.0),
+            state_ptr
             );
-            std::cout<<"add the UWB factors \n";
-        }
+            }
     
         void updateStates(const std::vector<State>& state_window,
                          const std::vector<double*>& parameter_blocks) {
