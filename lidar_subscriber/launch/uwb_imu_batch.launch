@@ -1,0 +1,10 @@
+<!-- Save as uwb_imu_fusion.launch -->
+<launch>
+    <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen">
+        <param name="use_sim_time" value="true"/>
+    </node>
+    
+    <!-- Add rostopic echo for debugging -->
+    <!-- <node name="imu_echo" pkg="rostopic" type="rostopic" args="echo /sensor_simulator/imu_data" output="screen"/>
+    <node name="uwb_echo" pkg="rostopic" type="rostopic" args="echo /sensor_simulator/UWBPoistionPS" output="screen"/> -->
+</launch>
