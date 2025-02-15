@@ -765,6 +765,8 @@ class UwbImuFusion {
             max_uwb_queue_size_ = 30;    // About 3s of UWB data at 10Hz
             min_imu_between_uwb_ = 20;   // Minimum IMU measurements between UWB updates
 
+            // Initialize pose history
+            pose_history_.clear();
             
         }
     
@@ -916,6 +918,17 @@ class UwbImuFusion {
             );
         }
 
+        void clearOldTrajectoryData() {
+            double current_time = ros::Time::now().toSec();
+            while (!pose_history_.empty()) {
+                if (current_time - pose_history_.front().header.stamp.toSec() > 60.0) {  // Remove poses older than 60 seconds
+                    pose_history_.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
         void performBatchOptimization() {
             if (imu_buffer_.empty() || uwb_buffer_.empty()) {
                 return;
@@ -998,7 +1011,7 @@ class UwbImuFusion {
                 
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                    new ceres::CauchyLoss(0.1),
+                    new ceres::HuberLoss(0.1),
                     parameter_blocks[closest_idx]
                 );
             }
@@ -1034,6 +1047,7 @@ class UwbImuFusion {
                 
                 // Update trajectory and publish
                 updateTrajectory(batch_states);
+                clearOldTrajectoryData();  // Clear old trajectory data
                 publishTrajectory();
             }
         
@@ -1092,33 +1106,57 @@ class UwbImuFusion {
         }
         
         void publishTrajectory() {
+            if (trajectory_states_.empty()) {
+                return;
+            }
+        
+            // Get the latest state
+            const BatchState& latest_state = trajectory_states_.back();
+            
+            // Create pose stamped message for the latest state
+            geometry_msgs::PoseStamped pose;
+            pose.header.stamp = ros::Time(latest_state.timestamp);
+            pose.header.frame_id = "map";
+            
+            pose.pose.position.x = latest_state.position.x();
+            pose.pose.position.y = latest_state.position.y();
+            pose.pose.position.z = latest_state.position.z();
+            
+            pose.pose.orientation.w = latest_state.orientation.w();
+            pose.pose.orientation.x = latest_state.orientation.x();
+            pose.pose.orientation.y = latest_state.orientation.y();
+            pose.pose.orientation.z = latest_state.orientation.z();
+        
+            // Add to pose history
+            pose_history_.push_back(pose);
+        
+            // Maintain maximum size of pose history
+            while (pose_history_.size() > max_pose_history_size_) {
+                pose_history_.pop_front();
+            }
+        
+            // Create and publish path message
             nav_msgs::Path path_msg;
             path_msg.header.stamp = ros::Time::now();
             path_msg.header.frame_id = "map";
-            
-            for (const auto& state : trajectory_states_) {
-                geometry_msgs::PoseStamped pose;
-                pose.header.stamp = ros::Time(state.timestamp);
-                pose.header.frame_id = "map";
-                
-                pose.pose.position.x = state.position.x();
-                pose.pose.position.y = state.position.y();
-                pose.pose.position.z = state.position.z();
-                
-                pose.pose.orientation.w = state.orientation.w();
-                pose.pose.orientation.x = state.orientation.x();
-                pose.pose.orientation.y = state.orientation.y();
-                pose.pose.orientation.z = state.orientation.z();
-                
-                path_msg.poses.push_back(pose);
-            }
+            path_msg.poses.insert(path_msg.poses.end(), 
+                                 pose_history_.begin(), 
+                                 pose_history_.end());
             
             path_pub_.publish(path_msg);
             
             // Also publish the latest state
-            if (!trajectory_states_.empty()) {
-                publishBatchState(trajectory_states_.back());
-            }
+            publishBatchState(latest_state);
+        
+            // Publish latest state as current pose
+            nav_msgs::Odometry current_pose_msg;
+            current_pose_msg.header = pose.header;
+            current_pose_msg.pose.pose = pose.pose;
+            current_pose_msg.twist.twist.linear.x = latest_state.velocity.x();
+            current_pose_msg.twist.twist.linear.y = latest_state.velocity.y();
+            current_pose_msg.twist.twist.linear.z = latest_state.velocity.z();
+            
+            pose_pub_.publish(current_pose_msg);
         }
         
         void publishBatchState(const BatchState& state) {
@@ -1472,6 +1510,10 @@ class UwbImuFusion {
         size_t max_imu_queue_size_;
         size_t max_uwb_queue_size_;
         size_t min_imu_between_uwb_;
+
+        // Add this to the private member variables
+        std::deque<geometry_msgs::PoseStamped> pose_history_;
+        size_t max_pose_history_size_ = 1000;  // Store last 1000 poses
     };
  
  } // namespace uwb_imu_fusion
