@@ -36,6 +36,291 @@
      Eigen::Vector3d position;
      double timestamp;
  };
+
+ class MarginalizationInfo {
+    public:
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+        MarginalizationInfo() {
+            valid_ = false;
+            linearized_ = false;
+            parameter_block_size_ = 16;  // State size
+            residual_size_ = 15;         // Residual size
+            
+            // Initialize matrices with proper sizes
+            linearized_jacobian_.resize(residual_size_, parameter_block_size_);
+            linearized_residual_.resize(residual_size_);
+            linearized_jacobian_.setZero();
+            linearized_residual_.setZero();
+        }
+
+        int getParameterBlockSize() const {
+            return parameter_block_size_;
+        }
+
+        int getResidualSize() const {
+            return residual_size_;
+        }
+
+        // Modified to work with mapped types
+        void computeResidual(const double* parameters, double* residuals) const {
+            if (!valid_ || !linearized_) {
+                std::fill(residuals, residuals + residual_size_, 0.0);
+                return;
+            }
+        
+            try {
+                Eigen::Map<const Eigen::Matrix<double, 16, 1>> param_vec(parameters);
+                Eigen::Map<Eigen::Matrix<double, 15, 1>> residual_vec(residuals);
+        
+                residual_vec.setZero();
+        
+                if (linearized_jacobian_.rows() > 0 && linearized_residual_.size() > 0) {
+                    int actual_rows = std::min(15, static_cast<int>(linearized_jacobian_.rows()));
+                    residual_vec.head(actual_rows) = 
+                        linearized_jacobian_.topRows(actual_rows) * param_vec + 
+                        linearized_residual_.head(actual_rows);
+                }
+            } catch (const std::exception& e) {
+                ROS_ERROR_STREAM("Exception in computeResidual: " << e.what());
+                std::fill(residuals, residuals + residual_size_, 0.0);
+            }
+        }
+
+        void addResidualBlock(ceres::CostFunction* cost_function,
+                            ceres::LossFunction* loss_function,
+                            const std::vector<double*>& parameter_blocks,
+                            std::vector<int> drop_set) {
+            ResidualBlockInfo* residual_block_info = new ResidualBlockInfo(
+                cost_function, loss_function, parameter_blocks, drop_set);
+            residual_block_infos_.push_back(residual_block_info);
+        }
+    
+        void marginalize() {
+            if (valid_) return;
+    
+            // Construct linear system
+            constructLinearSystem();
+    
+            // Perform Schur complement marginalization
+            performSchurComplement();
+    
+            valid_ = true;
+        }
+
+        const Eigen::MatrixXd& getLinearizedJacobian() const {
+            return linearized_jacobian_;
+        }    
+    
+    private:
+        struct ResidualBlockInfo {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+            ResidualBlockInfo(ceres::CostFunction* _cost_function,
+                             ceres::LossFunction* _loss_function,
+                             std::vector<double*> _parameter_blocks,
+                             std::vector<int> _drop_set)
+                : cost_function(_cost_function),
+                  loss_function(_loss_function),
+                  parameter_blocks(_parameter_blocks),
+                  drop_set(_drop_set) {}
+    
+            ceres::CostFunction* cost_function;
+            ceres::LossFunction* loss_function;
+            std::vector<double*> parameter_blocks;
+            std::vector<int> drop_set;
+        };
+    
+        void constructLinearSystem() {
+            if (linearized_) return;
+        
+            // Pre-calculate total residual size
+            int total_residual_size = 0;
+            for (const auto& info : residual_block_infos_) {
+                if (info && info->cost_function) {
+                    total_residual_size += info->cost_function->num_residuals();
+                }
+            }
+        
+            if (total_residual_size == 0) {
+                ROS_WARN("No residuals to construct linear system");
+                linearized_ = true;
+                return;
+            }
+        
+            // Create temporary matrices with proper sizes
+            Eigen::MatrixXd H_temp(total_residual_size, parameter_block_size_);
+            Eigen::VectorXd b_temp(total_residual_size);
+            H_temp.setZero();
+            b_temp.setZero();
+        
+            int current_row = 0;
+            for (const auto& info : residual_block_infos_) {
+                if (!info || !info->cost_function) continue;
+        
+                int residual_size = info->cost_function->num_residuals();
+                if (residual_size <= 0) continue;
+        
+                // Evaluate the residual
+                std::vector<double> residual(residual_size, 0.0);
+                std::vector<double*> jacobian_raw(info->parameter_blocks.size(), nullptr);
+                std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
+                    jacobian_matrices(info->parameter_blocks.size());
+        
+                // Prepare jacobian matrices
+                for (size_t i = 0; i < info->parameter_blocks.size(); ++i) {
+                    jacobian_matrices[i].resize(residual_size, parameter_block_size_);
+                    jacobian_matrices[i].setZero();
+                    jacobian_raw[i] = jacobian_matrices[i].data();
+                }
+        
+                // Evaluate residual block
+                if (!info->cost_function->Evaluate(
+                    info->parameter_blocks.data(),
+                    residual.data(),
+                    jacobian_raw.data())) {
+                    ROS_WARN("Residual block evaluation failed");
+                    continue;
+                }
+        
+                // Safely copy data to temporary matrices
+                if (current_row + residual_size <= total_residual_size) {
+                    b_temp.segment(current_row, residual_size) = 
+                        Eigen::Map<Eigen::VectorXd>(residual.data(), residual_size);
+        
+                    for (size_t i = 0; i < info->parameter_blocks.size(); ++i) {
+                        int col_offset = i * parameter_block_size_;
+                        if (col_offset + parameter_block_size_ <= H_temp.cols()) {
+                            H_temp.block(current_row, col_offset, residual_size, parameter_block_size_) = 
+                                jacobian_matrices[i];
+                        }
+                    }
+                    current_row += residual_size;
+                }
+            }
+        
+            // Resize final matrices to match the actual data
+            if (current_row > 0) {
+                linearized_jacobian_ = H_temp.topRows(current_row);
+                linearized_residual_ = b_temp.head(current_row);
+            } else {
+                linearized_jacobian_.resize(0, parameter_block_size_);
+                linearized_residual_.resize(0);
+            }
+            
+            linearized_ = true;
+        }
+
+
+
+        
+        void performSchurComplement() {
+            if (!linearized_) {
+                constructLinearSystem();
+            }
+        
+            // Ensure matrices are properly sized
+            if (linearized_jacobian_.rows() == 0 || linearized_jacobian_.cols() == 0) {
+                ROS_WARN("Empty matrices in Schur complement");
+                valid_ = true;
+                return;
+            }
+        
+            // Get marginalization size
+            int marg_size = std::min(parameter_block_size_, 
+                                    static_cast<int>(linearized_jacobian_.cols()));
+        
+            try {
+                // Compute Schur complement
+                Eigen::MatrixXd H_mm = linearized_jacobian_.leftCols(marg_size);
+                Eigen::VectorXd b_m;
+                
+                if (linearized_residual_.size() >= marg_size) {
+                    b_m = linearized_residual_.head(marg_size);
+                } else {
+                    b_m.resize(marg_size);
+                    b_m.setZero();
+                }
+        
+                // Add damping
+                double lambda = 1e-6;
+                H_mm.diagonal().array() += lambda;
+        
+                // Update matrices
+                linearized_jacobian_ = H_mm;
+                linearized_residual_ = b_m;
+        
+            } catch (const std::exception& e) {
+                ROS_ERROR_STREAM("Exception in performSchurComplement: " << e.what());
+                // Set to safe values
+                linearized_jacobian_.resize(residual_size_, parameter_block_size_);
+                linearized_residual_.resize(residual_size_);
+                linearized_jacobian_.setZero();
+                linearized_residual_.setZero();
+            }
+        
+            valid_ = true;
+        }
+    
+        std::vector<ResidualBlockInfo*> residual_block_infos_;
+        Eigen::MatrixXd linearized_jacobian_;
+        Eigen::VectorXd linearized_residual_;
+        bool valid_;
+        bool linearized_;
+        int parameter_block_size_;  // Add these member variables
+        int residual_size_;
+    };
+    
+    // Modify MarginalizationFactor to use dynamic sized residuals
+    // Modified MarginalizationFactor to use fixed sizes
+    class MarginalizationFactor : public ceres::SizedCostFunction<15, 16> {
+        public:
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        
+            explicit MarginalizationFactor(MarginalizationInfo* _marginalization_info)
+                : marginalization_info(_marginalization_info) {
+                CHECK(_marginalization_info != nullptr);
+            }
+        
+            virtual bool Evaluate(double const* const* parameters,
+                double* residuals,
+                double** jacobians) const override {
+                    if (!marginalization_info) {
+                    std::fill(residuals, residuals + 15, 0.0);
+                    if (jacobians && jacobians[0]) {
+                        std::fill(jacobians[0], jacobians[0] + 15 * 16, 0.0);
+                    }
+                    return false;
+                    }
+
+                    try {
+                    marginalization_info->computeResidual(parameters[0], residuals);
+
+                    if (jacobians && jacobians[0]) {
+                        const Eigen::MatrixXd& J = marginalization_info->getLinearizedJacobian();
+                        Eigen::Map<Eigen::Matrix<double, 15, 16, Eigen::RowMajor>> jacobian_mat(jacobians[0]);
+                        jacobian_mat.setZero();
+                        
+                        int actual_rows = std::min(15, static_cast<int>(J.rows()));
+                        if (actual_rows > 0) {
+                            jacobian_mat.topRows(actual_rows) = J.topRows(actual_rows);
+                        }
+                    }
+                    return true;
+                    } catch (const std::exception& e) {
+                    ROS_ERROR_STREAM("Exception in MarginalizationFactor::Evaluate: " << e.what());
+                    std::fill(residuals, residuals + 15, 0.0);
+                    if (jacobians && jacobians[0]) {
+                        std::fill(jacobians[0], jacobians[0] + 15 * 16, 0.0);
+                    }
+                    return false;
+                    }
+                    }
+        
+        private:
+            MarginalizationInfo* marginalization_info;
+        };
+ 
  
  // IMU Preintegration class
  class ImuPreintegration {
@@ -636,13 +921,14 @@ class UwbImuFusion {
                 return;
             }
         
-            // Initialize batch states if needed
+            // Initialize batch states
             std::vector<BatchState> batch_states;
             initializeBatchStates(batch_states);
         
             // Setup optimization problem
             ceres::Problem problem;
             std::vector<double*> parameter_blocks;
+            std::unique_ptr<MarginalizationInfo> marg_info;
         
             // Create parameter blocks for all states
             for (size_t i = 0; i < batch_states.size(); ++i) {
@@ -654,6 +940,27 @@ class UwbImuFusion {
                 if (batch_states[i].fixed) {
                     problem.SetParameterBlockConstant(state_ptr);
                 }
+            }
+        
+            // Create marginalization info before adding other factors
+            if (!trajectory_states_.empty()) {
+                marg_info = std::make_unique<MarginalizationInfo>();
+                
+                // Add previous factors to marginalization
+                double* state_ptr = new double[16];
+                batchStateToArray(trajectory_states_.back(), state_ptr);
+                
+                // Add marginalization factor
+                if (parameter_blocks.size() > 0) {
+                    marg_info->addResidualBlock(
+                        new MarginalizationFactor(marg_info.get()),
+                        nullptr,
+                        {state_ptr},
+                        {0}  // Drop this state
+                    );
+                }
+                
+                delete[] state_ptr;
             }
         
             // Add IMU factors
@@ -696,12 +1003,22 @@ class UwbImuFusion {
                 );
             }
         
+            // Add marginalization factor if available
+            if (marg_info) {
+                marg_info->marginalize();
+                if (parameter_blocks.size() > 0) {
+                    problem.AddResidualBlock(
+                        new MarginalizationFactor(marg_info.release()),
+                        nullptr,
+                        parameter_blocks[0]
+                    );
+                }
+            }
+        
             // Solve optimization problem
             ceres::Solver::Options options;
             options.minimizer_progress_to_stdout = false;
-
             options.linear_solver_type = ceres::DENSE_SCHUR;
-            //options.num_threads = 2;
             options.trust_region_strategy_type = ceres::DOGLEG;
             options.max_num_iterations = 50;
             
@@ -719,6 +1036,7 @@ class UwbImuFusion {
                 updateTrajectory(batch_states);
                 publishTrajectory();
             }
+        
             auto t2 = ros::WallTime::now();
             std::cout << "Optimization time : " << (t2 - t1).toSec() * 1000 << "[msec]" << std::endl;
             std::cout << "Window size : " << parameter_blocks.size() << std::endl;
@@ -759,9 +1077,13 @@ class UwbImuFusion {
         }
 
         void updateTrajectory(const std::vector<BatchState>& batch_states) {
-            // Remove overlap with previous batch (keep one state for continuity)
-            if (!trajectory_states_.empty()) {
-                trajectory_states_.pop_back();
+            // Keep a fixed number of previous states for marginalization
+            const size_t keep_states = 2;
+            
+            if (trajectory_states_.size() > keep_states) {
+                trajectory_states_.erase(
+                    trajectory_states_.begin(),
+                    trajectory_states_.end() - keep_states);
             }
             
             // Append new batch states
