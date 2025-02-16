@@ -54,6 +54,17 @@
             linearized_residual_.setZero();
         }
 
+        ~MarginalizationInfo() {
+            for (auto& info : residual_block_infos_) {
+                if (info) {
+                    delete info->cost_function;
+                    delete info->loss_function;
+                    delete info;
+                }
+            }
+            residual_block_infos_.clear();
+        }
+
         int getParameterBlockSize() const {
             return parameter_block_size_;
         }
@@ -64,10 +75,14 @@
 
         // Modified to work with mapped types
         void computeResidual(const double* parameters, double* residuals) const {
-            if (!valid_ || !linearized_) {
+            if (!valid_ || !linearized_ || !parameters || !residuals) {
                 std::fill(residuals, residuals + residual_size_, 0.0);
                 return;
             }
+            // if (!valid_ || !linearized_) {
+            //     std::fill(residuals, residuals + residual_size_, 0.0);
+            //     return;
+            // }
         
             try {
                 Eigen::Map<const Eigen::Matrix<double, 16, 1>> param_vec(parameters);
@@ -163,7 +178,7 @@
         
                 // Evaluate the residual
                 std::vector<double> residual(residual_size, 0.0);
-                std::vector<double*> jacobian_raw(info->parameter_blocks.size(), nullptr);
+                std::vector<double*> jacobian_raw(info->parameter_blocks.size(), NULL);
                 std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
                     jacobian_matrices(info->parameter_blocks.size());
         
@@ -270,52 +285,91 @@
     
     // Modify MarginalizationFactor to use dynamic sized residuals
     // Modified MarginalizationFactor to use fixed sizes
-    class MarginalizationFactor : public ceres::SizedCostFunction<15, 16> {
+    class MarginalizationFactor {
         public:
             EIGEN_MAKE_ALIGNED_OPERATOR_NEW
         
-            explicit MarginalizationFactor(MarginalizationInfo* _marginalization_info)
+            explicit MarginalizationFactor(const std::shared_ptr<MarginalizationInfo>& _marginalization_info)
                 : marginalization_info(_marginalization_info) {
-                CHECK(_marginalization_info != nullptr);
+                CHECK(_marginalization_info != NULL);
             }
         
-            virtual bool Evaluate(double const* const* parameters,
-                double* residuals,
-                double** jacobians) const override {
-                    if (!marginalization_info) {
-                    std::fill(residuals, residuals + 15, 0.0);
-                    if (jacobians && jacobians[0]) {
-                        std::fill(jacobians[0], jacobians[0] + 15 * 16, 0.0);
-                    }
-                    return false;
-                    }
-
-                    try {
-                    marginalization_info->computeResidual(parameters[0], residuals);
-
-                    if (jacobians && jacobians[0]) {
-                        const Eigen::MatrixXd& J = marginalization_info->getLinearizedJacobian();
-                        Eigen::Map<Eigen::Matrix<double, 15, 16, Eigen::RowMajor>> jacobian_mat(jacobians[0]);
-                        jacobian_mat.setZero();
-                        
-                        int actual_rows = std::min(15, static_cast<int>(J.rows()));
-                        if (actual_rows > 0) {
-                            jacobian_mat.topRows(actual_rows) = J.topRows(actual_rows);
-                        }
+            template <typename T>
+            bool operator()(const T* const parameters, T* residuals) const {
+                if (!marginalization_info) {
+                    // Fill residuals with zeros if no marginalization info
+                    for (int i = 0; i < 15; ++i) {
+                        residuals[i] = T(0);
                     }
                     return true;
-                    } catch (const std::exception& e) {
-                    ROS_ERROR_STREAM("Exception in MarginalizationFactor::Evaluate: " << e.what());
-                    std::fill(residuals, residuals + 15, 0.0);
-                    if (jacobians && jacobians[0]) {
-                        std::fill(jacobians[0], jacobians[0] + 15 * 16, 0.0);
-                    }
-                    return false;
-                    }
+                }
+        
+                try {
+                    std::vector<double> parameters_double(16);
+                    std::vector<double> residuals_double(15);
+        
+                    // Convert parameters to double
+                    for (int i = 0; i < 16; ++i) {
+                        parameters_double[i] = getValue(parameters[i]);
                     }
         
+                    // Compute residuals using double values
+                    marginalization_info->computeResidual(parameters_double.data(), residuals_double.data());
+        
+                    // Convert residuals back and apply jacobian
+                    const Eigen::MatrixXd& jac = marginalization_info->getLinearizedJacobian();
+                    Eigen::Map<const Eigen::Matrix<double, 15, 16, Eigen::RowMajor>> J(jac.data());
+        
+                    for (int i = 0; i < 15; ++i) {
+                        // Initialize with the base residual
+                        residuals[i] = T(residuals_double[i]);
+        
+                        // Add jacobian contributions
+                        for (int j = 0; j < 16; ++j) {
+                            T diff = parameters[j] - T(parameters_double[j]);
+                            residuals[i] += T(J(i, j)) * diff;
+                        }
+                    }
+        
+                    return true;
+                } catch (const std::exception& e) {
+                    // Handle any exceptions
+                    for (int i = 0; i < 15; ++i) {
+                        residuals[i] = T(0);
+                    }
+                    return false;
+                }
+            }
+        
         private:
-            MarginalizationInfo* marginalization_info;
+            // Helper function to get value from either Jet or double
+            template <typename T>
+            static double getValue(const T& x) {
+                return static_cast<double>(x);
+            }
+        
+            // Specialization for Jet types
+            template <typename T, int N>
+            static double getValue(const ceres::Jet<T, N>& x) {
+                return static_cast<double>(x.a);
+            }
+        
+            std::shared_ptr<MarginalizationInfo> marginalization_info;
+        };
+        
+        // Helper class to create the cost function
+        class MarginalizationFactorAutoDiff {
+        public:
+            explicit MarginalizationFactorAutoDiff(const std::shared_ptr<MarginalizationInfo>& info)
+                : factor_(info) {}
+        
+            static ceres::CostFunction* Create(const std::shared_ptr<MarginalizationInfo>& info) {
+                return new ceres::AutoDiffCostFunction<MarginalizationFactor, 15, 16>(
+                    new MarginalizationFactor(info));
+            }
+        
+        private:
+            MarginalizationFactor factor_;
         };
  
  
@@ -716,9 +770,19 @@ class UwbImuFusion {
     
             ROS_INFO("UWB-IMU Fusion node initialized.");
         }
+
+        ~UwbImuFusion() {
+            // Clean up marginalization resources
+            last_marginalization_info_.reset();
+            for (auto ptr : last_marginalization_parameter_blocks_) {
+                delete[] ptr;
+            }
+            last_marginalization_parameter_blocks_.clear();
+        }
     
     private:
         // Add these members
+        
 
         struct BatchState {
             EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -798,6 +862,20 @@ class UwbImuFusion {
             // Initialize pose history
             pose_history_.clear();
             
+        }
+
+        void cleanupMarginalizationInfo() {
+            for (auto ptr : last_marginalization_parameter_blocks_) {
+                delete[] ptr;
+            }
+            last_marginalization_parameter_blocks_.clear();
+            last_marginalization_info_.reset();
+        }
+    
+        double* copyParameterBlock(const double* source) {
+            double* dest = new double[16];
+            std::memcpy(dest, source, 16 * sizeof(double));
+            return dest;
         }
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
@@ -961,6 +1039,7 @@ class UwbImuFusion {
         }
 
         void performBatchOptimization() {
+            std::lock_guard<std::mutex> lock(marginalization_mutex_);
             if (imu_buffer_.empty() || uwb_buffer_.empty()) {
                 ROS_INFO("Empty buffers, skipping optimization");
                 return;
@@ -1002,13 +1081,25 @@ class UwbImuFusion {
                         // problem.SetParameterBlockConstant(parameter_blocks[i]);
                     }
                 }
+
+                // Add marginalization factor from last optimization if available
+                if (last_marginalization_info_ && !last_marginalization_parameter_blocks_.empty()) {
+                    ceres::CostFunction* marginalization_cost = 
+                        MarginalizationFactorAutoDiff::Create(last_marginalization_info_);
+                    
+                    problem.AddResidualBlock(
+                        marginalization_cost,
+                        NULL,
+                        parameter_blocks[0]  // Connect to first state
+                    );
+                }
         
                 // Add bias regularization factors
                 for (size_t i = 0; i < batch_states.size(); ++i) {
                     auto* bias_factor = new BiasRegularizationFactor(0.1, 0.1);
                     auto* cost_function = 
                         new ceres::AutoDiffCostFunction<BiasRegularizationFactor, 6, 16>(bias_factor);
-                    problem.AddResidualBlock(cost_function, nullptr, parameter_blocks[i]);
+                    problem.AddResidualBlock(cost_function, NULL, parameter_blocks[i]);
                 }
         
                 // Add IMU factors
@@ -1116,9 +1207,9 @@ class UwbImuFusion {
         
                 // Solve optimization problem
                 ceres::Solver::Options options;
-                options.minimizer_progress_to_stdout = true;
-                options.linear_solver_type = ceres::DENSE_SCHUR;
-                options.trust_region_strategy_type = ceres::DOGLEG;
+                options.minimizer_progress_to_stdout = false;
+                options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
                 options.max_num_iterations = 50;
                 
                 ceres::Solver::Summary summary;
@@ -1126,29 +1217,96 @@ class UwbImuFusion {
         
                 ROS_INFO_STREAM("Optimization report: " << summary.BriefReport());
         
+                // After optimization converges, prepare marginalization for next iteration
                 if (summary.termination_type == ceres::CONVERGENCE) {
+                    // Create new marginalization info
+                    auto new_marginalization_info = std::make_shared<MarginalizationInfo>();
+                    
+                    if (batch_states.size() > 1) {
+                        // Add factors to marginalization
+                        // IMU factor
+                        if (!imu_buffer_.empty()) {
+                            imu_preintegration_->reset();
+                            double t1 = batch_states[0].timestamp;
+                            double t2 = batch_states[1].timestamp;
+                            
+                            for (const auto& imu : imu_buffer_) {
+                                if (imu.timestamp >= t1 && imu.timestamp < t2) {
+                                    imu_preintegration_->integrate(imu.acc, imu.gyro, 
+                                                                 imu.timestamp - t1);
+                                    t1 = imu.timestamp;
+                                }
+                            }
+        
+                            auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+                            std::vector<double*> marg_parameter_blocks{
+                                parameter_blocks[0],
+                                parameter_blocks[1]
+                            };
+                            
+                            new_marginalization_info->addResidualBlock(
+                                new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
+                                NULL,
+                                marg_parameter_blocks,
+                                std::vector<int>{0}  // Marginalize first state
+                            );
+                        }
+        
+                        // UWB factors
+                        for (const auto& uwb : uwb_buffer_) {
+                            if (std::abs(uwb.timestamp - batch_states[0].timestamp) < state_dt_) {
+                                Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
+                                auto* uwb_factor = new UwbFactor(uwb.position, uwb_cov);
+                                
+                                std::vector<double*> marg_parameter_blocks{parameter_blocks[0]};
+                                
+                                new_marginalization_info->addResidualBlock(
+                                    new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
+                                    NULL,
+                                    marg_parameter_blocks,
+                                    std::vector<int>{0}
+                                );
+                            }
+                        }
+        
+                        // Perform marginalization
+                        new_marginalization_info->marginalize();
+        
+                        // Update marginalization info for next iteration
+                        last_marginalization_info_ = new_marginalization_info;
+                        last_marginalization_parameter_blocks_.clear();
+                        
+                        // Deep copy the parameter block for the next iteration
+                        double* next_state = new double[16];
+                        std::memcpy(next_state, parameter_blocks[1], 16 * sizeof(double));
+                        last_marginalization_parameter_blocks_.push_back(next_state);
+                    }
+        
+                    // Update states
                     for (size_t i = 0; i < batch_states.size(); ++i) {
                         arrayToBatchState(parameter_blocks[i], batch_states[i]);
                     }
+                    
                     updateTrajectory(batch_states);
                     clearOldTrajectoryData();
                     publishTrajectory();
                 }
         
+                // Cleanup parameter blocks
+                for (auto ptr : parameter_blocks) {
+                    delete[] ptr;
+                }
+                parameter_blocks.clear();
+        
             } catch (const std::exception& e) {
                 ROS_ERROR_STREAM("Exception in optimization: " << e.what());
+                // Cleanup on error
                 for (auto ptr : parameter_blocks) {
                     delete[] ptr;
                 }
                 throw;
             }
         
-            // Cleanup
-            for (auto ptr : parameter_blocks) {
-                delete[] ptr;
-            }
-        
-            // Prepare for next batch
             prepareNextBatch(batch_states);
         }
 
@@ -1289,6 +1447,12 @@ class UwbImuFusion {
 
 
         void prepareNextBatch(const std::vector<BatchState>& current_batch) {
+            // Clear old marginalization parameter blocks
+            for (auto ptr : last_marginalization_parameter_blocks_) {
+                delete[] ptr;
+            }
+            last_marginalization_parameter_blocks_.clear();
+        
             batch_start_time_ = current_batch.back().timestamp;
             imu_buffer_.clear();
             uwb_buffer_.clear();
@@ -1471,6 +1635,11 @@ class UwbImuFusion {
         // Add this to the private member variables
         std::deque<geometry_msgs::PoseStamped> pose_history_;
         size_t max_pose_history_size_ = 1000;  // Store last 1000 poses
+
+        std::shared_ptr<MarginalizationInfo> last_marginalization_info_;
+        std::vector<double*> last_marginalization_parameter_blocks_;
+
+        mutable std::mutex marginalization_mutex_;
     };
  
  } // namespace uwb_imu_fusion
