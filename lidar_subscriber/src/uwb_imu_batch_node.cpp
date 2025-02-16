@@ -388,34 +388,47 @@
      }
  
      void integrate(const Eigen::Vector3d& acc, const Eigen::Vector3d& gyro, double dt) {
-         const Eigen::Vector3d acc_unbiased = acc - acc_bias_;
-         const Eigen::Vector3d gyro_unbiased = gyro - gyro_bias_;
- 
-         Eigen::Matrix3d rot_k = delta_q_.toRotationMatrix();
- 
-         // Midpoint integration
-         Eigen::Vector3d delta_angle = gyro_unbiased * dt;
-         Eigen::Quaterniond dq;
-         if (delta_angle.norm() > 1e-12) {
-             dq = Eigen::Quaterniond(Eigen::AngleAxisd(delta_angle.norm(), delta_angle.normalized()));
-         } else {
-             dq = Eigen::Quaterniond::Identity();
-         }
- 
-         // Update delta measurements
-         Eigen::Vector3d delta_p_k = delta_v_ * dt + 0.5 * rot_k * acc_unbiased * dt * dt;
-         Eigen::Vector3d delta_v_k = rot_k * acc_unbiased * dt;
-         Eigen::Quaterniond delta_q_k = delta_q_ * dq;
- 
-         // Update Jacobian and covariance
-         updateJacobianAndCovariance(acc_unbiased, gyro_unbiased, dt, rot_k);
- 
-         // Update states
-         delta_p_ += delta_p_k;
-         delta_v_ += delta_v_k;
-         delta_q_ = delta_q_k;
-         dt_sum_ += dt;
-     }
+        if (dt <= 0) return;
+    
+        const Eigen::Vector3d acc_unbiased = acc - acc_bias_;
+        const Eigen::Vector3d gyro_unbiased = gyro - gyro_bias_;
+    
+        // Current rotation matrix
+        Eigen::Matrix3d rot_k = delta_q_.toRotationMatrix();
+    
+        // Midpoint integration for rotation
+        Eigen::Vector3d delta_angle = gyro_unbiased * dt;
+        Eigen::Quaterniond dq;
+        if (delta_angle.norm() > 1e-12) {
+            dq = Eigen::Quaterniond(Eigen::AngleAxisd(delta_angle.norm(), delta_angle.normalized()));
+        } else {
+            dq = Eigen::Quaterniond::Identity();
+        }
+    
+        // Update orientation first
+        Eigen::Quaterniond new_delta_q = delta_q_ * dq;
+        new_delta_q.normalize();
+    
+        // Compute average rotation over the interval
+        Eigen::Matrix3d rot_mid = rot_k * dq.toRotationMatrix();
+        rot_mid = (rot_k + rot_mid) * 0.5;
+    
+        // Update position and velocity using midpoint integration
+        Eigen::Vector3d acc_world = rot_mid * acc_unbiased;
+        Eigen::Vector3d delta_v = acc_world * dt;
+        Eigen::Vector3d delta_p = delta_v_ * dt + 0.5 * acc_world * dt * dt;
+    
+        // Update states
+        delta_p_ += delta_p;
+        delta_v_ += delta_v;
+        delta_q_ = new_delta_q;
+    
+        // Update timestamp
+        dt_sum_ += dt;
+    
+        // Update Jacobians
+        updateJacobianAndCovariance(acc_unbiased, gyro_unbiased, dt, rot_k);
+    }
 
      PreintegrationResult getResult() const {
         PreintegrationResult result;
@@ -847,7 +860,7 @@ class UwbImuFusion {
         
             // Trigger optimization when enough measurements are collected
             if (uwb_buffer_.size() >= min_uwb_measurements_) {
-                optimize();
+                // optimize();
             }
         }
     
@@ -983,23 +996,31 @@ class UwbImuFusion {
                 
                 imu_preintegration_->reset();
                 
+                // Count IMU measurements between states
+                int imu_count = 0;
+                
                 // Integrate IMU measurements between consecutive states
                 for (const auto& imu : imu_buffer_) {
                     if (imu.timestamp >= t1 && imu.timestamp < t2) {
                         double dt = imu.timestamp - t1;
                         imu_preintegration_->integrate(imu.acc, imu.gyro, dt);
                         t1 = imu.timestamp;
+                        imu_count++;
                     }
                 }
                 
-                // Add IMU factor
-                auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
-                    new ceres::HuberLoss(1.0),
-                    parameter_blocks[i],
-                    parameter_blocks[i + 1]
-                );
+                // Only add IMU factor if we have enough measurements
+                if (imu_count > 0) {
+                    auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+                    problem.AddResidualBlock(
+                        new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
+                        new ceres::HuberLoss(1.0),
+                        parameter_blocks[i],
+                        parameter_blocks[i + 1]
+                    );
+                    std::cout << "Added IMU factor between states " << i << " and " << i+1 
+                            << " with " << imu_count << " measurements" << std::endl;
+                }
             }
         
             // Add UWB factors
@@ -1038,6 +1059,13 @@ class UwbImuFusion {
             auto t1 = ros::WallTime::now();
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
+
+            std::cout << "Number of IMU measurements: " << imu_buffer_.size() << std::endl;
+            std::cout << "Number of UWB measurements: " << uwb_buffer_.size() << std::endl;
+            
+            // After solving
+            std::cout << "Optimization status: " << summary.BriefReport() << std::endl;
+            std::cout << "Number of residual blocks: " << problem.NumResidualBlocks() << std::endl;
         
             if (summary.termination_type == ceres::CONVERGENCE) {
                 // Update batch states with optimization results
@@ -1052,8 +1080,12 @@ class UwbImuFusion {
             }
         
             auto t2 = ros::WallTime::now();
-            std::cout << "Optimization time : " << (t2 - t1).toSec() * 1000 << "[msec]" << std::endl;
             std::cout << "Window size : " << parameter_blocks.size() << std::endl;
+            // Print detailed optimization results
+            std::cout << "Optimization took: " << (t2 - t1).toSec() * 1000 << " ms" << std::endl;
+            std::cout << "Initial cost: " << summary.initial_cost << std::endl;
+            std::cout << "Final cost: " << summary.final_cost << std::endl;
+            std::cout << "Number of iterations: " << summary.iterations.size() << std::endl<< std::endl;
         
             // Cleanup
             for (auto ptr : parameter_blocks) {
@@ -1280,7 +1312,7 @@ class UwbImuFusion {
                 auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
                 problem.AddResidualBlock(
                     new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                    new ceres::CauchyLoss(0.1),  // Changed loss function
+                    new ceres::HuberLoss(0.1),  // Changed loss function
                     parameter_blocks[0]
                 );
             }
@@ -1500,7 +1532,7 @@ class UwbImuFusion {
         double uwb_noise_;
         
         size_t window_size_;
-        size_t min_uwb_measurements_;
+        size_t min_uwb_measurements_; 
         
         bool initialized_;
         double last_imu_time_;
