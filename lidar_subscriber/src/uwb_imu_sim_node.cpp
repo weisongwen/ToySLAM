@@ -203,7 +203,7 @@ private:
         // pub_latest_odometry_ps.publish(est_msg);
 
         // Keep only last 100 poses
-        if(path_.poses.size() > 1200) {
+        if(path_.poses.size() > 7200) {
             path_.poses.erase(path_.poses.begin());
         }
         path_.header.stamp = ros::Time::now();
@@ -254,7 +254,7 @@ private:
                 loss_function = new ceres::HuberLoss(huber_loss_threshold_);
             }
 
-            problem.AddResidualBlock(cost_function, new ceres::HuberLoss(0.1), position.data());
+            // problem.AddResidualBlock(cost_function, new ceres::HuberLoss(0.1), position.data());
             problem.AddResidualBlock(cost_function, NULL, position.data());
             // problem.AddResidualBlock(cost_function, loss_function, positioN);
         }

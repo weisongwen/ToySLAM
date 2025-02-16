@@ -210,9 +210,6 @@
             
             linearized_ = true;
         }
-
-
-
         
         void performSchurComplement() {
             if (!linearized_) {
@@ -516,121 +513,144 @@
  };
  
  // Factor classes for optimization
- struct ImuFactor {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    struct ImuFactor {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    explicit ImuFactor(const ImuPreintegration::PreintegrationResult& preintegration)
-        : preintegration_(preintegration) {
-        sqrt_information_ = Eigen::Matrix<double, 15, 15>::Identity();
-        sqrt_information_.block<3,3>(0,0) *= 1.0 / 0.1;   // position weight
-        sqrt_information_.block<3,3>(3,3) *= 1.0 / 0.2;   // velocity weight
-        sqrt_information_.block<3,3>(6,6) *= 1.0 / 0.1;   // rotation weight
-        sqrt_information_.block<3,3>(9,9) *= 1.0 / 0.01;  // acc bias weight
-        sqrt_information_.block<3,3>(12,12) *= 1.0 / 0.01;// gyro bias weight
-    }
-
-    template <typename T>
-    bool operator()(const T* const state1, const T* const state2, T* residuals) const {
-        // Extract states at time i
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_i(state1);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_i(state1 + 3);
-        Eigen::Map<const Eigen::Quaternion<T>> q_i(state1 + 6);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_i(state1 + 10);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_i(state1 + 13);
-
-        // Extract states at time j
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_j(state2);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_j(state2 + 3);
-        Eigen::Map<const Eigen::Quaternion<T>> q_j(state2 + 6);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_j(state2 + 10);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_j(state2 + 13);
-
-        // Get preintegrated measurements
-        const Eigen::Matrix<T, 3, 1> alpha = preintegration_.delta_p.cast<T>();
-        const Eigen::Matrix<T, 3, 1> beta = preintegration_.delta_v.cast<T>();
-        const Eigen::Quaternion<T> gamma = preintegration_.delta_q.cast<T>();
-        const T delta_t = T(preintegration_.dt_sum);
-
-        // Get bias Jacobians
-        const Eigen::Matrix<T, 3, 3> J_p_ba = preintegration_.jacobian_p_ba.cast<T>();
-        const Eigen::Matrix<T, 3, 3> J_p_bg = preintegration_.jacobian_p_bg.cast<T>();
-        const Eigen::Matrix<T, 3, 3> J_v_ba = preintegration_.jacobian_v_ba.cast<T>();
-        const Eigen::Matrix<T, 3, 3> J_v_bg = preintegration_.jacobian_v_bg.cast<T>();
-        const Eigen::Matrix<T, 3, 3> J_q_bg = preintegration_.jacobian_q_bg.cast<T>();
-
-        // Bias corrections
-        const Eigen::Matrix<T, 3, 1> dba = ba_j - ba_i;
-        const Eigen::Matrix<T, 3, 1> dbg = bg_j - bg_i;
-
-        // Corrected measurements
-        const Eigen::Matrix<T, 3, 1> alpha_corrected = alpha + J_p_ba * dba + J_p_bg * dbg;
-        const Eigen::Matrix<T, 3, 1> beta_corrected = beta + J_v_ba * dba + J_v_bg * dbg;
-        
-        // Compute rotation correction
-        Eigen::Quaternion<T> gamma_corrected = gamma;
-        Eigen::Matrix<T, 3, 1> theta_correction = J_q_bg * dbg;
-        if (theta_correction.norm() > T(1e-12)) {
-            gamma_corrected = gamma * Eigen::Quaternion<T>(
-                Eigen::AngleAxis<T>(theta_correction.norm(), theta_correction.normalized()));
+        explicit ImuFactor(const ImuPreintegration::PreintegrationResult& preintegration)
+            : preintegration_(preintegration) {
+            sqrt_information_ = Eigen::Matrix<double, 15, 15>::Identity();
+            // sqrt_information_.block<3,3>(0,0) *= 10.0;    // position weight
+            // sqrt_information_.block<3,3>(3,3) *= 5.0;     // velocity weight
+            // sqrt_information_.block<3,3>(6,6) *= 8.0;     // rotation weight
+            // sqrt_information_.block<3,3>(9,9) *= 1.0;     // acc bias weight
+            // sqrt_information_.block<3,3>(12,12) *= 1.0;   // gyro bias weight
         }
 
-        // Gravity vector
-        const Eigen::Matrix<T, 3, 1> g(T(0), T(0), T(-9.81));
+        template <typename T>
+        bool operator()(const T* const state1, const T* const state2, T* residuals) const {
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p1(state1);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v1(state1 + 3);
+            Eigen::Map<const Eigen::Quaternion<T>> q1(state1 + 6);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba1(state1 + 10);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg1(state1 + 13);
 
-        Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p2(state2);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v2(state2 + 3);
+            Eigen::Map<const Eigen::Quaternion<T>> q2(state2 + 6);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba2(state2 + 10);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg2(state2 + 13);
 
-        // Position residual (simplified)
-        residual.template segment<3>(0) = p_j - (p_i + v_i * delta_t + 
-            T(0.5) * g * delta_t * delta_t + q_i * alpha_corrected);
+            // Create residual map
+            Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
 
-        // Velocity residual (simplified)
-        residual.template segment<3>(3) = v_j - (v_i + g * delta_t + 
-            q_i * beta_corrected);
+            // Normalized quaternions
+            Eigen::Quaternion<T> q1_normalized = q1.normalized();
+            Eigen::Quaternion<T> q2_normalized = q2.normalized();
 
-        // Rotation residual (corrected)
-        Eigen::Quaternion<T> q_error = (q_i * gamma_corrected).conjugate() * q_j;
-        residual.template segment<3>(6) = T(2.0) * q_error.vec();
+            // Get preintegrated measurements
+            const T delta_t = T(preintegration_.dt_sum);
+            const Eigen::Matrix<T, 3, 1> gravity(T(0), T(0), T(-9.81));
+            
+            // Apply bias corrections
+            Eigen::Matrix<T, 3, 1> delta_p = preintegration_.delta_p.cast<T>();
+            Eigen::Matrix<T, 3, 1> delta_v = preintegration_.delta_v.cast<T>();
+            Eigen::Quaternion<T> delta_q = preintegration_.delta_q.cast<T>();
 
-        // Scale residuals
-        const T pos_scale = T(1.0);
-        const T vel_scale = T(0.1);
-        const T rot_scale = T(1.0);
-        
-        residual.template segment<3>(0) *= pos_scale;
-        residual.template segment<3>(3) *= vel_scale;
-        residual.template segment<3>(6) *= rot_scale;
+            Eigen::Matrix<T, 3, 1> dba = ba2 - ba1;
+            Eigen::Matrix<T, 3, 1> dbg = bg2 - bg1;
 
-        // Apply information matrix
-        residual = sqrt_information_.cast<T>() * residual;
+            // Apply first-order corrections
+            delta_p = delta_p + 
+                    preintegration_.jacobian_p_ba.cast<T>() * dba + 
+                    preintegration_.jacobian_p_bg.cast<T>() * dbg;
+            
+            delta_v = delta_v + 
+                    preintegration_.jacobian_v_ba.cast<T>() * dba + 
+                    preintegration_.jacobian_v_bg.cast<T>() * dbg;
 
-        return true;
-    }
+            // Position residual (0-2)
+            residual.template block<3, 1>(0, 0) = p2 - (p1 + v1 * delta_t + 
+                T(0.5) * gravity * delta_t * delta_t + q1_normalized * delta_p);
 
-    ImuPreintegration::PreintegrationResult preintegration_;
-    Eigen::Matrix<double, 15, 15> sqrt_information_;
-};
- 
- struct UwbFactor {
-     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
- 
-     UwbFactor(const Eigen::Vector3d& measurement, const Eigen::Matrix3d& covariance)
-         : measurement_(measurement), information_(covariance.inverse()) {}
- 
-     template <typename T>
-     bool operator()(const T* const state, T* residuals) const {
-         Eigen::Map<const Eigen::Matrix<T, 3, 1>> position(state);
-         Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residuals);
- 
-         residual = position - measurement_.cast<T>();
-         residual = information_.cast<T>() * residual;
-        //  std::cout<<"residuals of the UWB-> " << residual[0] <<"\n";
- 
-         return true;
-     }
- 
-     Eigen::Vector3d measurement_;
-     Eigen::Matrix3d information_;
- };
+            // Velocity residual (3-5)
+            residual.template block<3, 1>(3, 0) = v2 - (v1 + gravity * delta_t + 
+                q1_normalized * delta_v);
+
+            // Rotation residual (6-8)
+            Eigen::Quaternion<T> q_error = (q1_normalized * delta_q).conjugate() * q2_normalized;
+            residual.template block<3, 1>(6, 0) = T(2.0) * q_error.vec();
+
+            // Bias residuals (9-14)
+            residual.template block<3, 1>(9, 0) = ba2 - ba1;
+            residual.template block<3, 1>(12, 0) = bg2 - bg1;
+
+            // Apply information matrix
+            residual = sqrt_information_.cast<T>() * residual;
+
+            return true;
+        }
+
+        private:
+            ImuPreintegration::PreintegrationResult preintegration_;
+            Eigen::Matrix<double, 15, 15> sqrt_information_;
+    };
+
+    struct UwbFactor {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+        UwbFactor(const Eigen::Vector3d& measurement, const Eigen::Matrix3d& covariance)
+            : measurement_(measurement) {
+            // Use Cholesky decomposition for numerical stability
+            Eigen::LLT<Eigen::Matrix3d> llt_of_info(covariance.inverse());
+            sqrt_information_ = llt_of_info.matrixL().transpose();
+        }
+
+        template <typename T>
+        bool operator()(const T* const state, T* residuals) const {
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> position(state);
+            Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residuals);
+
+            // Compute position error
+            residual = position - measurement_.cast<T>();
+            
+            // Scale by square root information matrix
+            residual = sqrt_information_.cast<T>() * residual;
+
+            return true;
+        }
+
+        private:
+            Eigen::Vector3d measurement_;
+            Eigen::Matrix3d sqrt_information_;
+    };
+
+    struct BiasRegularizationFactor {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+        BiasRegularizationFactor(double acc_weight = 1.0, double gyro_weight = 1.0) 
+            : acc_weight_(acc_weight), gyro_weight_(gyro_weight) {}
+
+        template <typename T>
+        bool operator()(const T* const state, T* residuals) const {
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> acc_bias(state + 10);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> gyro_bias(state + 13);
+            
+            Eigen::Map<Eigen::Matrix<T, 6, 1>> residual(residuals);
+            
+            // Limit maximum bias values
+            const T max_acc_bias = T(0.5);
+            const T max_gyro_bias = T(0.2);
+            
+            residual.template head<3>() = (acc_bias.array().min(max_acc_bias).max(-max_acc_bias)) * T(acc_weight_);
+            residual.template tail<3>() = (gyro_bias.array().min(max_gyro_bias).max(-max_gyro_bias)) * T(gyro_weight_);
+            
+            return true;
+        }
+
+        private:
+            double acc_weight_;
+            double gyro_weight_;
+    };
 
  struct PositionDriftFactor {
     explicit PositionDriftFactor(double max_drift) : max_drift_(max_drift) {}
@@ -701,19 +721,17 @@ class UwbImuFusion {
         // Add these members
 
         struct BatchState {
-
             EIGEN_MAKE_ALIGNED_OPERATOR_NEW
             
             double timestamp;
+            bool fixed;
             
-            bool fixed; // Whether this state is fixed in optimization
-            
-            Eigen::Vector3d position;
-            Eigen::Vector3d velocity;
-            Eigen::Quaterniond orientation;
-            Eigen::Vector3d acc_bias;
-            Eigen::Vector3d gyro_bias;
-            
+            // State variables in the same order as the parameter block
+            Eigen::Vector3d position;      // Indices 0-2
+            Eigen::Vector3d velocity;      // Indices 3-5
+            Eigen::Quaterniond orientation; // Indices 6-9
+            Eigen::Vector3d acc_bias;      // Indices 10-12
+            Eigen::Vector3d gyro_bias;     // Indices 13-15
         };
         std::vector<BatchState> trajectory_states_;
         ros::Publisher path_pub_;
@@ -751,7 +769,6 @@ class UwbImuFusion {
 
 
             // System parameters
-            window_size_ = 50;  // Reduced from 10 5
             min_uwb_measurements_ = 2;  // Reduced from 3
 
             // Adjusted noise parameters
@@ -774,9 +791,9 @@ class UwbImuFusion {
             last_imu_time_ = 0.0;
             
             // Add these parameters
-            max_imu_queue_size_ = 1000;  // About 2.5s of IMU data at 400Hz
-            max_uwb_queue_size_ = 30;    // About 3s of UWB data at 10Hz
-            min_imu_between_uwb_ = 20;   // Minimum IMU measurements between UWB updates
+            max_imu_queue_size_ = 1000;  // 1000 About 2.5s of IMU data at 400Hz
+            max_uwb_queue_size_ = 300;    // 30 About 3s of UWB data at 10Hz
+            min_imu_between_uwb_ = 20;   // 20 Minimum IMU measurements between UWB updates
 
             // Initialize pose history
             pose_history_.clear();
@@ -857,11 +874,12 @@ class UwbImuFusion {
             while (uwb_buffer_.size() > max_uwb_queue_size_) {
                 uwb_buffer_.pop_front();
             }
-        
+            
+            // Remove this part since we're not using optimize() anymore
             // Trigger optimization when enough measurements are collected
-            if (uwb_buffer_.size() >= min_uwb_measurements_) {
-                // optimize();
-            }
+            // if (uwb_buffer_.size() >= min_uwb_measurements_) {
+            //     // optimize();
+            // }
         }
     
         void propagateState(const ImuMeasurement& imu_data, double dt) {
@@ -944,6 +962,7 @@ class UwbImuFusion {
 
         void performBatchOptimization() {
             if (imu_buffer_.empty() || uwb_buffer_.empty()) {
+                ROS_INFO("Empty buffers, skipping optimization");
                 return;
             }
         
@@ -951,141 +970,178 @@ class UwbImuFusion {
             std::vector<BatchState> batch_states;
             initializeBatchStates(batch_states);
         
+            ROS_INFO("Number of batch states: %zu", batch_states.size());
+            if (batch_states.empty()) {
+                ROS_WARN("No batch states, skipping optimization");
+                return;
+            }
+        
             // Setup optimization problem
-            ceres::Problem problem;
+            ceres::Problem::Options problem_options;
+            problem_options.enable_fast_removal = true;
+            ceres::Problem problem(problem_options);
+            
             std::vector<double*> parameter_blocks;
-            std::unique_ptr<MarginalizationInfo> marg_info;
+            auto* quaternion_parameterization = new ceres::QuaternionParameterization();
         
-            // Create parameter blocks for all states
-            for (size_t i = 0; i < batch_states.size(); ++i) {
-                double* state_ptr = new double[16];
-                batchStateToArray(batch_states[i], state_ptr);
-                parameter_blocks.push_back(state_ptr);
-                
-                // Fix states that are marked as fixed
-                if (batch_states[i].fixed) {
-                    problem.SetParameterBlockConstant(state_ptr);
+            try {
+                // Step 1: Create all parameter blocks first
+                parameter_blocks.reserve(batch_states.size());
+                for (size_t i = 0; i < batch_states.size(); ++i) {
+                    double* state_ptr = new double[16];
+                    batchStateToArray(batch_states[i], state_ptr);
+                    parameter_blocks.push_back(state_ptr);
                 }
-            }
         
-            // Create marginalization info before adding other factors
-            if (!trajectory_states_.empty()) {
-                marg_info = std::make_unique<MarginalizationInfo>();
-                
-                // Add previous factors to marginalization
-                double* state_ptr = new double[16];
-                batchStateToArray(trajectory_states_.back(), state_ptr);
-                
-                // Add marginalization factor
-                if (parameter_blocks.size() > 0) {
-                    marg_info->addResidualBlock(
-                        new MarginalizationFactor(marg_info.get()),
-                        nullptr,
-                        {state_ptr},
-                        {0}  // Drop this state
-                    );
-                }
-                
-                delete[] state_ptr;
-            }
+                // Step 2: Add parameter blocks to the problem
+                for (size_t i = 0; i < batch_states.size(); ++i) {
+                    // First add the parameter block
+                    problem.AddParameterBlock(parameter_blocks[i], 16);
         
-            // Add IMU factors
-            for (size_t i = 0; i < batch_states.size() - 1; ++i) {
-                double t1 = batch_states[i].timestamp;
-                double t2 = batch_states[i + 1].timestamp;
-                
-                imu_preintegration_->reset();
-                
-                // Count IMU measurements between states
-                int imu_count = 0;
-                
-                // Integrate IMU measurements between consecutive states
-                for (const auto& imu : imu_buffer_) {
-                    if (imu.timestamp >= t1 && imu.timestamp < t2) {
-                        double dt = imu.timestamp - t1;
-                        imu_preintegration_->integrate(imu.acc, imu.gyro, dt);
-                        t1 = imu.timestamp;
-                        imu_count++;
+                    if (batch_states[i].fixed) {
+                        // problem.SetParameterBlockConstant(parameter_blocks[i]);
                     }
                 }
-                
-                // Only add IMU factor if we have enough measurements
-                if (imu_count > 0) {
-                    auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
-                    problem.AddResidualBlock(
-                        new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor),
-                        new ceres::HuberLoss(1.0),
-                        parameter_blocks[i],
-                        parameter_blocks[i + 1]
-                    );
-                    std::cout << "Added IMU factor between states " << i << " and " << i+1 
-                            << " with " << imu_count << " measurements" << std::endl;
-                }
-            }
         
-            // Add UWB factors
-            for (const auto& uwb : uwb_buffer_) {
-                size_t closest_idx = findClosestStateIndex(uwb.timestamp, batch_states);
-                
-                Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
-                auto* uwb_factor = new UwbFactor(uwb.position, uwb_cov);
-                
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                    new ceres::HuberLoss(0.1),
-                    parameter_blocks[closest_idx]
-                );
-            }
-        
-            // Add marginalization factor if available
-            if (marg_info) {
-                marg_info->marginalize();
-                if (parameter_blocks.size() > 0) {
-                    problem.AddResidualBlock(
-                        new MarginalizationFactor(marg_info.release()),
-                        nullptr,
-                        parameter_blocks[0]
-                    );
-                }
-            }
-        
-            // Solve optimization problem
-            ceres::Solver::Options options;
-            options.minimizer_progress_to_stdout = false;
-            options.linear_solver_type = ceres::DENSE_SCHUR;
-            options.trust_region_strategy_type = ceres::DOGLEG;
-            options.max_num_iterations = 50;
-            
-            auto t1 = ros::WallTime::now();
-            ceres::Solver::Summary summary;
-            ceres::Solve(options, &problem, &summary);
-
-            std::cout << "Number of IMU measurements: " << imu_buffer_.size() << std::endl;
-            std::cout << "Number of UWB measurements: " << uwb_buffer_.size() << std::endl;
-            
-            // After solving
-            std::cout << "Optimization status: " << summary.BriefReport() << std::endl;
-            std::cout << "Number of residual blocks: " << problem.NumResidualBlocks() << std::endl;
-        
-            if (summary.termination_type == ceres::CONVERGENCE) {
-                // Update batch states with optimization results
+                // Add bias regularization factors
                 for (size_t i = 0; i < batch_states.size(); ++i) {
-                    arrayToBatchState(parameter_blocks[i], batch_states[i]);
+                    auto* bias_factor = new BiasRegularizationFactor(0.1, 0.1);
+                    auto* cost_function = 
+                        new ceres::AutoDiffCostFunction<BiasRegularizationFactor, 6, 16>(bias_factor);
+                    problem.AddResidualBlock(cost_function, nullptr, parameter_blocks[i]);
                 }
-                
-                // Update trajectory and publish
-                updateTrajectory(batch_states);
-                clearOldTrajectoryData();  // Clear old trajectory data
-                publishTrajectory();
-            }
         
-            auto t2 = ros::WallTime::now();
-            std::cout << "Window size : " << parameter_blocks.size() << std::endl;
-            // Print detailed optimization results
-            std::cout << "Optimization took: " << (t2 - t1).toSec() * 1000 << " ms" << std::endl;
-            std::cout << "Initial cost: " << summary.initial_cost << std::endl;
-            std::cout << "Final cost: " << summary.final_cost << std::endl;
-            std::cout << "Number of iterations: " << summary.iterations.size() << std::endl<< std::endl;
+                // Add IMU factors
+                for (size_t i = 0; i < batch_states.size() - 1; ++i) {
+                    double t1 = batch_states[i].timestamp;
+                    double t2 = batch_states[i + 1].timestamp;
+                    
+                    imu_preintegration_->reset();
+                    
+                    int imu_count = 0;
+                    for (const auto& imu : imu_buffer_) {
+                        if (imu.timestamp >= t1 && imu.timestamp < t2) {
+                            double dt = imu.timestamp - t1;
+                            imu_preintegration_->integrate(imu.acc, imu.gyro, dt);
+                            t1 = imu.timestamp;
+                            imu_count++;
+                        }
+                    }
+                    
+                    if (imu_count > 0) {
+                        auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
+                        auto* cost_function = 
+                            new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor);
+                        
+                        problem.AddResidualBlock(
+                            cost_function,
+                            new ceres::HuberLoss(1.0),
+                            parameter_blocks[i],
+                            parameter_blocks[i + 1]
+                        );
+                    }
+                }
+        
+                // Add UWB factors
+                for (const auto& uwb : uwb_buffer_) {
+                    size_t closest_idx = findClosestStateIndex(uwb.timestamp, batch_states);
+                    
+                    Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
+                    auto* uwb_factor = new UwbFactor(uwb.position, uwb_cov);
+                    
+                    auto* cost_function = 
+                        new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor);
+                    
+                    problem.AddResidualBlock(
+                        cost_function,
+                        new ceres::HuberLoss(0.1),
+                        parameter_blocks[closest_idx]
+                    );
+                }
+        
+                // Create a local parameterization for the quaternion part
+                class StateParameterization : public ceres::LocalParameterization {
+                public:
+                    virtual ~StateParameterization() {}
+        
+                    virtual bool Plus(const double* x,
+                                    const double* delta,
+                                    double* x_plus_delta) const {
+                        // Copy position and velocity
+                        for (int i = 0; i < 6; ++i) {
+                            x_plus_delta[i] = x[i] + delta[i];
+                        }
+        
+                        // Handle quaternion (indices 6-9)
+                        Eigen::Map<const Eigen::Quaterniond> q(x + 6);
+                        Eigen::Map<const Eigen::Vector3d> dq(delta + 6);
+                        Eigen::Quaterniond q_plus_delta = q * Eigen::Quaterniond(Eigen::AngleAxisd(dq.norm(), dq.normalized()));
+                        Eigen::Map<Eigen::Quaterniond> q_out(x_plus_delta + 6);
+                        q_out = q_plus_delta.normalized();
+        
+                        // Copy biases
+                        for (int i = 10; i < 16; ++i) {
+                            x_plus_delta[i] = x[i] + delta[i];
+                        }
+        
+                        return true;
+                    }
+        
+                    virtual bool ComputeJacobian(const double* x,
+                                               double* jacobian) const {
+                        Eigen::Map<Eigen::Matrix<double, 16, 15, Eigen::RowMajor>> J(jacobian);
+                        J.setZero();
+                        
+                        // Position and velocity blocks
+                        J.block<6,6>(0,0).setIdentity();
+                        
+                        // Quaternion block
+                        J.block<4,3>(6,6) = Eigen::Matrix<double,4,3>::Identity();
+                        
+                        // Bias blocks
+                        J.block<6,6>(10,9).setIdentity();
+                        
+                        return true;
+                    }
+        
+                    virtual int GlobalSize() const { return 16; }
+                    virtual int LocalSize() const { return 15; }
+                };
+        
+                // Add the custom parameterization to all state blocks
+                auto* state_parameterization = new StateParameterization();
+                for (size_t i = 0; i < batch_states.size(); ++i) {
+                    problem.SetParameterization(parameter_blocks[i], state_parameterization);
+                }
+        
+                // Solve optimization problem
+                ceres::Solver::Options options;
+                options.minimizer_progress_to_stdout = true;
+                options.linear_solver_type = ceres::DENSE_SCHUR;
+                options.trust_region_strategy_type = ceres::DOGLEG;
+                options.max_num_iterations = 50;
+                
+                ceres::Solver::Summary summary;
+                ceres::Solve(options, &problem, &summary);
+        
+                ROS_INFO_STREAM("Optimization report: " << summary.BriefReport());
+        
+                if (summary.termination_type == ceres::CONVERGENCE) {
+                    for (size_t i = 0; i < batch_states.size(); ++i) {
+                        arrayToBatchState(parameter_blocks[i], batch_states[i]);
+                    }
+                    updateTrajectory(batch_states);
+                    clearOldTrajectoryData();
+                    publishTrajectory();
+                }
+        
+            } catch (const std::exception& e) {
+                ROS_ERROR_STREAM("Exception in optimization: " << e.what());
+                for (auto ptr : parameter_blocks) {
+                    delete[] ptr;
+                }
+                throw;
+            }
         
             // Cleanup
             for (auto ptr : parameter_blocks) {
@@ -1100,26 +1156,39 @@ class UwbImuFusion {
             batch_states.clear();
             
             double current_time = batch_start_time_;
+            ROS_INFO_STREAM("Initializing batch states from time: " << current_time);
+            
             for (size_t i = 0; i < num_states_batch_; ++i) {
                 BatchState state;
                 state.timestamp = current_time;
                 state.fixed = (i == 0 && !trajectory_states_.empty());
                 
                 if (i == 0 && !trajectory_states_.empty()) {
-                    // Initialize from last state of previous batch
                     state = trajectory_states_.back();
+                    ROS_INFO("Using previous state for initialization");
                 } else {
-                    // Initialize from measurements
                     state.position = interpolatePosition(current_time);
                     state.velocity.setZero();
                     state.orientation.setIdentity();
                     state.acc_bias.setZero();
                     state.gyro_bias.setZero();
+                    
+                    // Add small random noise to avoid perfect zero initialization
+                    state.position += Eigen::Vector3d::Random() * 0.01;
+                    state.velocity += Eigen::Vector3d::Random() * 0.01;
+                    state.orientation = Eigen::Quaterniond::UnitRandom();
+                    state.acc_bias += Eigen::Vector3d::Random() * 0.001;
+                    state.gyro_bias += Eigen::Vector3d::Random() * 0.001;
+                    
+                    ROS_INFO_STREAM("Initialized new state at time " << current_time);
                 }
                 
+                state.orientation.normalize();
                 batch_states.push_back(state);
                 current_time += state_dt_;
             }
+            
+            ROS_INFO_STREAM("Created " << batch_states.size() << " batch states");
         }
 
         void updateTrajectory(const std::vector<BatchState>& batch_states) {
@@ -1158,6 +1227,12 @@ class UwbImuFusion {
             pose.pose.orientation.x = latest_state.orientation.x();
             pose.pose.orientation.y = latest_state.orientation.y();
             pose.pose.orientation.z = latest_state.orientation.z();
+
+            std::cout<<"latest_state.acc_bias-> " <<latest_state.acc_bias<<std::endl;
+            std::cout<<"latest_state.gyro_bias-> " <<latest_state.gyro_bias<<std::endl;
+            std::cout<<"latest_state.velocity-> " <<latest_state.velocity<<std::endl;
+            std::cout<<"latest_state.position-> " <<latest_state.position<<std::endl;
+            std::cout<<"latest_state.orientation-> " <<latest_state.orientation.x()<<std::endl;
         
             // Add to pose history
             pose_history_.push_back(pose);
@@ -1277,126 +1352,33 @@ class UwbImuFusion {
             
             pose_pub_.publish(odom_msg);
         }
-    
-        void optimize() {
-            if (imu_buffer_.empty() || uwb_buffer_.size() < min_uwb_measurements_) {
-                return;
-            }
-        
-            // Setup optimization problem
-            ceres::Problem problem;
-            std::vector<State> state_window;
-            std::vector<double*> parameter_blocks;
-        
-            // Initialize state window
-            initializeStateWindow(state_window, parameter_blocks);
-        
-            // Add IMU factors with proper weighting
-            double imu_weight = 1.0;
-            // Update IMU factor dimensions from 9 to 15
-            for (size_t i = 0; i < state_window.size() - 1; ++i) {
-                auto* imu_factor = new ImuFactor(imu_preintegration_->getResult());
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<ImuFactor, 15, 16, 16>(imu_factor), // Changed from 9 to 15
-                    loss_function,
-                    parameter_blocks[i],
-                    parameter_blocks[i + 1]
-                );
-            }
-        
-            // Increase UWB weight significantly
-            double uwb_weight = 100.0;  // Increased from 10.0
-            for (const auto& uwb_data : uwb_buffer_) {
-                Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity() / uwb_weight;
-                auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                    new ceres::HuberLoss(0.1),  // Changed loss function
-                    parameter_blocks[0]
-                );
-            }
-
-            // Add position drift constraint
-            for (size_t i = 1; i < parameter_blocks.size(); ++i) {
-                auto* drift_factor = new PositionDriftFactor(5.0);  // 5.0 meters max drift
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<PositionDriftFactor, 3, 16, 16>(drift_factor),
-                    new ceres::CauchyLoss(1.0),
-                    parameter_blocks[0],
-                    parameter_blocks[i]
-                );
-            }
-        
-            // Set solver options
-            ceres::Solver::Options options;
-            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-            options.minimizer_progress_to_stdout = false;
-            options.max_num_iterations = 20;
-            options.function_tolerance = 1e-3;
-            options.gradient_tolerance = 1e-3;
-            options.parameter_tolerance = 1e-4;
-        
-            // Solve
-            ceres::Solver::Summary summary;
-            ceres::Solve(options, &problem, &summary);
-        
-            if (summary.termination_type == ceres::CONVERGENCE) {
-                // Update states only if optimization converged
-                updateStates(state_window, parameter_blocks);
-            } else {
-                ROS_WARN("Optimization failed to converge");
-            }
-        
-            // Cleanup
-            for (auto ptr : parameter_blocks) {
-                delete[] ptr;
-            }
-        
-            // Reset IMU preintegration and clear UWB buffer
-            imu_preintegration_->reset();
-            uwb_buffer_.clear();
-        
-            // Publish results
-            publishResults();
-        }
-    
-        void initializeStateWindow(std::vector<State>& state_window,
-                                 std::vector<double*>& parameter_blocks) {
-            state_window.clear();
-            parameter_blocks.clear();
-    
-            // First state is current state
-            state_window.push_back(current_state_);
-    
-            // Initialize other states using IMU propagation
-            for (size_t i = 1; i < window_size_; ++i) {
-                State state = state_window.back();
-                // Simple propagation (could be improved)
-                state.position += state.velocity * 0.01;  // Assume 100Hz
-                state_window.push_back(state);
-            }
-    
-            // Create parameter blocks
-            for (size_t i = 0; i < state_window.size(); ++i) {
-                double* state_ptr = new double[16];  // [p, v, q, ba, bg]
-                stateToArray(state_window[i], state_ptr);
-                parameter_blocks.push_back(state_ptr);
-            }
-        }
 
         void batchStateToArray(const BatchState& state, double* arr) {
-            Eigen::Map<Eigen::Vector3d> p(arr);
-            Eigen::Map<Eigen::Vector3d> v(arr + 3);
-            Eigen::Map<Eigen::Quaterniond> q(arr + 6);
-            Eigen::Map<Eigen::Vector3d> ba(arr + 10);
-            Eigen::Map<Eigen::Vector3d> bg(arr + 13);
-        
-            p = state.position;
-            v = state.velocity;
-            q = state.orientation;
-            ba = state.acc_bias;
-            bg = state.gyro_bias;
+            // Position (0-2)
+            arr[0] = state.position.x();
+            arr[1] = state.position.y();
+            arr[2] = state.position.z();
+            
+            // Velocity (3-5)
+            arr[3] = state.velocity.x();
+            arr[4] = state.velocity.y();
+            arr[5] = state.velocity.z();
+            
+            // Quaternion (6-9) - Note: Eigen quaternion order (x,y,z,w)
+            arr[6] = state.orientation.x();
+            arr[7] = state.orientation.y();
+            arr[8] = state.orientation.z();
+            arr[9] = state.orientation.w();
+            
+            // Accelerometer bias (10-12)
+            arr[10] = state.acc_bias.x();
+            arr[11] = state.acc_bias.y();
+            arr[12] = state.acc_bias.z();
+            
+            // Gyroscope bias (13-15)
+            arr[13] = state.gyro_bias.x();
+            arr[14] = state.gyro_bias.y();
+            arr[15] = state.gyro_bias.z();
         }
         
         void arrayToBatchState(const double* arr, BatchState& state) {
@@ -1456,62 +1438,6 @@ class UwbImuFusion {
             state.gyro_bias = bg;
         }
     
-        void addUwbFactor(ceres::Problem& problem, 
-                         const std::vector<double*>& parameter_blocks,
-                         const UwbMeasurement& uwb_data) {
-            // Find closest state
-            size_t closest_idx = 0;
-            double min_dt = std::numeric_limits<double>::max();
-            
-            for (size_t i = 0; i < parameter_blocks.size(); ++i) {
-                double dt = std::abs(uwb_data.timestamp - 
-                                   (last_imu_time_ - (parameter_blocks.size() - 1 - i) * 0.01));
-                if (dt < min_dt) {
-                    min_dt = dt;
-                    closest_idx = i;
-                }
-            }
-    
-            Eigen::Matrix3d uwb_cov = uwb_noise_ * Eigen::Matrix3d::Identity();
-            auto* uwb_factor = new UwbFactor(uwb_data.position, uwb_cov);
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<UwbFactor, 3, 16>(uwb_factor),
-                new ceres::HuberLoss(1.0),
-                parameter_blocks[closest_idx]
-            );
-            std::cout<<"add the UWB factors \n";
-        }
-    
-        void updateStates(const std::vector<State>& state_window,
-                         const std::vector<double*>& parameter_blocks) {
-            // Update current state with the latest optimized state
-            arrayToState(parameter_blocks.back(), current_state_);
-        }
-    
-        void publishResults() {
-            nav_msgs::Odometry odom_msg;
-            odom_msg.header.stamp = ros::Time(current_state_.timestamp);
-            odom_msg.header.frame_id = "map";
-            
-            // Position
-            odom_msg.pose.pose.position.x = current_state_.position.x();
-            odom_msg.pose.pose.position.y = current_state_.position.y();
-            odom_msg.pose.pose.position.z = current_state_.position.z();
-            
-            // Orientation
-            odom_msg.pose.pose.orientation.w = current_state_.orientation.w();
-            odom_msg.pose.pose.orientation.x = current_state_.orientation.x();
-            odom_msg.pose.pose.orientation.y = current_state_.orientation.y();
-            odom_msg.pose.pose.orientation.z = current_state_.orientation.z();
-            
-            // Velocity
-            odom_msg.twist.twist.linear.x = current_state_.velocity.x();
-            odom_msg.twist.twist.linear.y = current_state_.velocity.y();
-            odom_msg.twist.twist.linear.z = current_state_.velocity.z();
-            
-            pose_pub_.publish(odom_msg);
-        }
-    
         // ROS members
         ros::NodeHandle nh_;
         ros::Subscriber imu_sub_;
@@ -1531,7 +1457,6 @@ class UwbImuFusion {
         double imu_gyro_bias_noise_;
         double uwb_noise_;
         
-        size_t window_size_;
         size_t min_uwb_measurements_; 
         
         bool initialized_;
