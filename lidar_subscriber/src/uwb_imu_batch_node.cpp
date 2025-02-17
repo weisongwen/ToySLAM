@@ -1634,7 +1634,7 @@ class UwbImuFusion {
 
         // Add this to the private member variables
         std::deque<geometry_msgs::PoseStamped> pose_history_;
-        size_t max_pose_history_size_ = 1000;  // Store last 1000 poses
+        size_t max_pose_history_size_ = 1000;  // Store last 1000 poses 
 
         std::shared_ptr<MarginalizationInfo> last_marginalization_info_;
         std::vector<double*> last_marginalization_parameter_blocks_;
