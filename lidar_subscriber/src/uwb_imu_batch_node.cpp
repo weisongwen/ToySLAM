@@ -16,6 +16,13 @@
  #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Pose.h>
+
+// Add these new headers
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <atomic>
  
  namespace uwb_imu_fusion {
  
@@ -751,8 +758,13 @@ class UwbImuFusion {
 
         
     
-        UwbImuFusion() {
+        UwbImuFusion() : running_(true)  // Initialize atomic bool in constructor initializer list
+        {
+            // running_ = true;  // Add this before starting the thread
             initializeParameters();
+
+            // Start processing thread
+            imu_process_thread_ = std::thread(&UwbImuFusion::processImuLoop, this);
             
             // ROS subscribers and publishers
             // imu_sub_ = nh_.subscribe("/imu/data", 1000, &UwbImuFusion::imuCallback, this);
@@ -763,6 +775,9 @@ class UwbImuFusion {
 
 
             pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/optimized_pose", 100);
+
+            // In initializeParameters()
+            high_freq_pose_pub_ = nh_.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/high_freq_pose", 200);
     
             // Initialize IMU preintegration
             imu_preintegration_ = std::make_unique<ImuPreintegration>(
@@ -772,6 +787,10 @@ class UwbImuFusion {
         }
 
         ~UwbImuFusion() {
+            running_ = false;
+            if (imu_process_thread_.joinable()) {
+                imu_process_thread_.join();
+            }
             // Clean up marginalization resources
             last_marginalization_info_.reset();
             for (auto ptr : last_marginalization_parameter_blocks_) {
@@ -879,6 +898,10 @@ class UwbImuFusion {
         }
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
+            static int count = 0;
+            if (count++ % 100 == 0) {  // Print every 100th message
+                ROS_INFO("Received IMU message, timestamp: %.3f", msg->header.stamp.toSec());
+            }
             ImuMeasurement imu_data;
             imu_data.timestamp = msg->header.stamp.toSec();
             imu_data.acc = Eigen::Vector3d(msg->linear_acceleration.x,
@@ -887,50 +910,104 @@ class UwbImuFusion {
             imu_data.gyro = Eigen::Vector3d(msg->angular_velocity.x,
                                            msg->angular_velocity.y,
                                            msg->angular_velocity.z);
-    
-            processImuData(imu_data);
+        
+            imu_queue_.push(imu_data);
+        }
+
+        void processImuLoop() {
+            ROS_INFO("IMU processing thread started");
+            while (running_) {
+                ImuMeasurement imu_data;
+                if (imu_queue_.pop(imu_data)) {
+                    try {
+                        processImuData(imu_data);
+                        
+                        // Check if it's time for batch optimization
+                        if (initialized_ && imu_data.timestamp - batch_start_time_ >= batch_duration_) {
+                            performBatchOptimization();
+                        }
+                    } catch (const std::exception& e) {
+                        ROS_ERROR_STREAM("Error processing IMU data: " << e.what());
+                    }
+                } else {
+                    // Sleep a bit if queue is empty
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            ROS_INFO("IMU processing thread stopped");
         }
     
         void uwbCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
+            static int count = 0;
+            if (count++ % 10 == 0) {  // Print every 10th message
+                ROS_INFO("Received UWB message, timestamp: %.3f", msg->header.stamp.toSec());
+            }
+            
             UwbMeasurement uwb_data;
             uwb_data.timestamp = msg->header.stamp.toSec();
             uwb_data.position = Eigen::Vector3d(msg->point.x,
                                               msg->point.y,
                                               msg->point.z);
-    
+        
             processUwbData(uwb_data);
         }
     
         void processImuData(const ImuMeasurement& imu_data) {
+            std::lock_guard<std::mutex> lock(state_mutex_);  // Protect state access
             if (!initialized_) {
+                ROS_INFO("Initializing state with first IMU measurement");
                 initialized_ = true;
                 last_imu_time_ = imu_data.timestamp;
+                batch_start_time_ = imu_data.timestamp;
                 
-                if (!batch_initialized_) {
-                    batch_start_time_ = imu_data.timestamp;
-                    batch_initialized_ = true;
-                    batch_states_.clear();
-                    
-                    // Initialize first state
-                    State initial_state;
-                    initial_state.timestamp = imu_data.timestamp;
-                    initial_state.position.setZero();
-                    initial_state.velocity.setZero();
-                    initial_state.orientation.setIdentity();
-                    initial_state.acc_bias.setZero();
-                    initial_state.gyro_bias.setZero();
-                    
-                    batch_states_.push_back(initial_state);
-                }
+                // Initialize state
+                current_state_.timestamp = imu_data.timestamp;
+                current_state_.position.setZero();
+                current_state_.velocity.setZero();
+                current_state_.orientation.setIdentity();
+                current_state_.acc_bias.setZero();
+                current_state_.gyro_bias.setZero();
+                
                 return;
             }
         
-            // Store IMU measurements
-            imu_buffer_.push_back(imu_data);
-            
-            // Check if batch duration is reached
-            if (imu_data.timestamp - batch_start_time_ >= batch_duration_) {
-                performBatchOptimization();
+            // Propagate state using IMU
+            // Propagate state using IMU
+            double dt = imu_data.timestamp - last_imu_time_;
+            if (dt > 0) {
+                propagateState(imu_data, dt);
+                last_imu_time_ = imu_data.timestamp;
+                
+                // Publish high-frequency pose
+                nav_msgs::Odometry odom_msg;
+                odom_msg.header.stamp = ros::Time(imu_data.timestamp);
+                odom_msg.header.frame_id = "map";
+                
+                odom_msg.pose.pose.position.x = current_state_.position.x();
+                odom_msg.pose.pose.position.y = current_state_.position.y();
+                odom_msg.pose.pose.position.z = current_state_.position.z();
+                
+                odom_msg.pose.pose.orientation.w = current_state_.orientation.w();
+                odom_msg.pose.pose.orientation.x = current_state_.orientation.x();
+                odom_msg.pose.pose.orientation.y = current_state_.orientation.y();
+                odom_msg.pose.pose.orientation.z = current_state_.orientation.z();
+                
+                odom_msg.twist.twist.linear.x = current_state_.velocity.x();
+                odom_msg.twist.twist.linear.y = current_state_.velocity.y();
+                odom_msg.twist.twist.linear.z = current_state_.velocity.z();
+                
+                high_freq_pose_pub_.publish(odom_msg);
+            }
+
+            // Store IMU measurements for optimization
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                imu_buffer_.push_back(imu_data);
+                
+                // Limit buffer size
+                while (imu_buffer_.size() > max_imu_queue_size_) {
+                    imu_buffer_.pop_front();
+                }
             }
         }
     
@@ -1290,6 +1367,18 @@ class UwbImuFusion {
                     updateTrajectory(batch_states);
                     clearOldTrajectoryData();
                     publishTrajectory();
+
+                    // Update current state with latest optimized state
+                    {
+                        std::lock_guard<std::mutex> lock(state_mutex_);
+                        const BatchState& latest_state = batch_states.back();
+                        current_state_.position = latest_state.position;
+                        current_state_.velocity = latest_state.velocity;
+                        current_state_.orientation = latest_state.orientation;
+                        current_state_.acc_bias = latest_state.acc_bias;
+                        current_state_.gyro_bias = latest_state.gyro_bias;
+                        current_state_.timestamp = latest_state.timestamp;
+                    }
                 }
         
                 // Cleanup parameter blocks
@@ -1607,6 +1696,9 @@ class UwbImuFusion {
         ros::Subscriber imu_sub_;
         ros::Subscriber uwb_sub_;
         ros::Publisher pose_pub_;
+
+        // Add to private members
+        ros::Publisher high_freq_pose_pub_;
     
         // State and measurements
         State current_state_;
@@ -1640,13 +1732,44 @@ class UwbImuFusion {
         std::vector<double*> last_marginalization_parameter_blocks_;
 
         mutable std::mutex marginalization_mutex_;
+
+        // Add to private members
+        struct ThreadSafeQueue {
+            std::mutex mutex;
+            std::condition_variable cond;
+            std::deque<ImuMeasurement> queue;
+            
+            void push(const ImuMeasurement& data) {
+                std::lock_guard<std::mutex> lock(mutex);
+                queue.push_back(data);
+            }
+            
+            bool pop(ImuMeasurement& data) {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (queue.empty()) return false;
+                data = queue.front();
+                queue.pop_front();
+                return true;
+            }
+        };
+
+        ThreadSafeQueue imu_queue_;
+        std::thread imu_process_thread_;
+        std::atomic<bool> running_;
     };
  
  } // namespace uwb_imu_fusion
  
  int main(int argc, char** argv) {
-     ros::init(argc, argv, "uwb_imu_fusion_node");
-     uwb_imu_fusion::UwbImuFusion fusion;
-     ros::spin();
-     return 0;
- }
+    ros::init(argc, argv, "uwb_imu_fusion_node");
+    ros::NodeHandle nh;
+    
+    ROS_INFO("Starting UWB-IMU fusion node");
+    uwb_imu_fusion::UwbImuFusion fusion;
+    
+    ros::AsyncSpinner spinner(4);  // Use 4 threads
+    spinner.start();
+    ros::waitForShutdown();
+    
+    return 0;
+}
