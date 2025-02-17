@@ -50,10 +50,12 @@ public:
         // Initialize random generators
         std::random_device rd;
         gen_.reset(new std::mt19937(rd()));
-        accel_noise_ = std::normal_distribution<double>(0.0, 0.01);
-        gyro_noise_ = std::normal_distribution<double>(0.0, 0.005);
+        // accel_noise_ = std::normal_distribution<double>(0.0, 0.01);
+        // gyro_noise_ = std::normal_distribution<double>(0.0, 0.005);
+        accel_noise_ = std::normal_distribution<double>(0.0, 0.0001);
+        gyro_noise_ = std::normal_distribution<double>(0.0, 0.00005);
         // uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
-        uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
+        uwb_noise_ = std::normal_distribution<double>(0.0, 0.0001);
 
         // Setup timers
         imu_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_), &SensorSimulator::publishImu, this);

@@ -580,11 +580,11 @@
         explicit ImuFactor(const ImuPreintegration::PreintegrationResult& preintegration)
             : preintegration_(preintegration) {
             sqrt_information_ = Eigen::Matrix<double, 15, 15>::Identity();
-            // sqrt_information_.block<3,3>(0,0) *= 10.0;    // position weight
-            // sqrt_information_.block<3,3>(3,3) *= 5.0;     // velocity weight
-            // sqrt_information_.block<3,3>(6,6) *= 8.0;     // rotation weight
-            // sqrt_information_.block<3,3>(9,9) *= 1.0;     // acc bias weight
-            // sqrt_information_.block<3,3>(12,12) *= 1.0;   // gyro bias weight
+            sqrt_information_.block<3,3>(0,0) *= 1.0;     // position weight
+            sqrt_information_.block<3,3>(3,3) *= 2.0;     // velocity weight
+            sqrt_information_.block<3,3>(6,6) *= 10.0;    // rotation weight (increased)
+            sqrt_information_.block<3,3>(9,9) *= 1.0;     // acc bias weight
+            sqrt_information_.block<3,3>(12,12) *= 5.0;   // gyro bias weight (increased)
         }
 
         template <typename T>
@@ -654,6 +654,37 @@
         private:
             ImuPreintegration::PreintegrationResult preintegration_;
             Eigen::Matrix<double, 15, 15> sqrt_information_;
+    };
+
+    // Add this new factor
+    struct OrientationRegularizationFactor {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+        OrientationRegularizationFactor(double weight = 1.0) : weight_(weight) {}
+    
+        template <typename T>
+        bool operator()(const T* const state1, const T* const state2, T* residuals) const {
+            Eigen::Map<const Eigen::Quaternion<T>> q1(state1 + 6);
+            Eigen::Map<const Eigen::Quaternion<T>> q2(state2 + 6);
+    
+            // Normalize quaternions
+            Eigen::Quaternion<T> q1_norm = q1.normalized();
+            Eigen::Quaternion<T> q2_norm = q2.normalized();
+    
+            // Compute relative rotation
+            Eigen::Quaternion<T> q_diff = q1_norm.conjugate() * q2_norm;
+    
+            // Extract vector part as residual (simpler approach)
+            Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residuals);
+            
+            // Scale the vector part of the quaternion
+            residual = q_diff.vec() * T(2.0) * T(weight_);
+    
+            return true;
+        }
+    
+    private:
+        double weight_;
     };
 
     struct UwbFactor {
@@ -838,7 +869,7 @@ class UwbImuFusion {
         void initializeParameters() {
 
             // Batch processing parameters
-            batch_duration_ = 1.0;     // Process 5 seconds of data at a time
+            batch_duration_ = 2.0;     // Process 5 seconds of data at a time
             state_dt_ = 0.1;          // State every 0.1 seconds, 0.1
             num_states_batch_ = static_cast<size_t>(batch_duration_ / state_dt_);
             batch_initialized_ = false;
@@ -859,7 +890,7 @@ class UwbImuFusion {
             imu_gyro_noise_ = 0.001;  // Reduced
             imu_acc_bias_noise_ = 0.0001;
             imu_gyro_bias_noise_ = 0.0001;
-            uwb_noise_ = 0.1;  // Increased for stronger position constraint
+            uwb_noise_ = 0.0001;  // Increased for stronger position constraint
 
             // Initialize current state
             // Initialize current state
@@ -874,8 +905,8 @@ class UwbImuFusion {
             last_imu_time_ = 0.0;
             
             // Add these parameters
-            max_imu_queue_size_ = 1000;  // 1000 About 2.5s of IMU data at 400Hz
-            max_uwb_queue_size_ = 300;    // 30 About 3s of UWB data at 10Hz
+            max_imu_queue_size_ = 10000;  // 1000 About 2.5s of IMU data at 400Hz
+            max_uwb_queue_size_ = 3000;    // 30 About 3s of UWB data at 10Hz
             min_imu_between_uwb_ = 20;   // 20 Minimum IMU measurements between UWB updates
 
             // Initialize pose history
@@ -896,11 +927,119 @@ class UwbImuFusion {
             std::memcpy(dest, source, 16 * sizeof(double));
             return dest;
         }
+
+        bool initializeOrientation(const std::deque<ImuMeasurement>& imu_buffer) {
+            if (imu_buffer.size() < 200) {
+                return false;
+            }
+        
+            // Use initial period to estimate gravity direction and initial heading
+            Eigen::Vector3d avg_acc = Eigen::Vector3d::Zero();
+            Eigen::Vector3d avg_gyro = Eigen::Vector3d::Zero();
+            size_t valid_samples = 0;
+            
+            // Compute mean and variance of measurements
+            std::vector<double> acc_norms;
+            for (const auto& imu : imu_buffer) {
+                double acc_norm = imu.acc.norm();
+                acc_norms.push_back(acc_norm);
+                
+                if (std::abs(acc_norm - GRAVITY_MAGNITUDE) < 0.5) {
+                    avg_acc += imu.acc;
+                    avg_gyro += imu.gyro;
+                    valid_samples++;
+                }
+            }
+        
+            if (valid_samples < 100) {
+                ROS_WARN("Not enough static samples for initialization");
+                return false;
+            }
+        
+            avg_acc /= valid_samples;
+            avg_gyro /= valid_samples;
+        
+            // Estimate initial gyro bias
+            current_state_.gyro_bias = avg_gyro;
+        
+            // Compute gravity direction in body frame
+            Eigen::Vector3d g_body = -avg_acc.normalized();
+            Eigen::Vector3d g_world(0, 0, -1);  // Assuming Z-up coordinate system
+        
+            // Construct initial orientation that aligns gravity
+            Eigen::Vector3d rot_axis = g_body.cross(g_world);
+            if (rot_axis.norm() > 1e-8) {
+                double rot_angle = std::acos(g_body.dot(g_world));
+                Eigen::AngleAxisd rot_align(rot_angle, rot_axis.normalized());
+                current_state_.orientation = Eigen::Quaterniond(rot_align);
+            } else {
+                current_state_.orientation.setIdentity();
+            }
+        
+            // Initialize covariance
+            double acc_var = 0;
+            for (const auto& norm : acc_norms) {
+                acc_var += std::pow(norm - GRAVITY_MAGNITUDE, 2);
+            }
+            acc_var /= acc_norms.size();
+            
+            ROS_INFO("Initialization complete:");
+            ROS_INFO("  Initial gyro bias: [%.3f, %.3f, %.3f]", 
+                     current_state_.gyro_bias.x(),
+                     current_state_.gyro_bias.y(),
+                     current_state_.gyro_bias.z());
+            ROS_INFO("  Accelerometer variance: %.3f", acc_var);
+        
+            return true;
+        }
+
+        void estimateGyroBias() {
+            if (imu_buffer_.size() < 100) return;
+    
+            Eigen::Vector3d avg_gyro = Eigen::Vector3d::Zero();
+            size_t count = 0;
+    
+            // Use samples when acceleration is close to gravity (static periods)
+            for (const auto& imu : imu_buffer_) {
+                if (std::abs(imu.acc.norm() - GRAVITY_MAGNITUDE) < 0.1) {
+                    avg_gyro += imu.gyro;
+                    count++;
+                }
+            }
+    
+            if (count > 50) {  // Only update if enough static samples
+                Eigen::Vector3d new_gyro_bias = avg_gyro / count;
+                
+                // Smooth update
+                const double alpha = 0.1;  // Smoothing factor
+                current_state_.gyro_bias = (1-alpha) * current_state_.gyro_bias + 
+                                         alpha * new_gyro_bias;
+                
+                ROS_DEBUG("Updated gyro bias: [%.6f, %.6f, %.6f]", 
+                         current_state_.gyro_bias.x(),
+                         current_state_.gyro_bias.y(),
+                         current_state_.gyro_bias.z());
+            }
+        }
+
+        
+        bool checkOrientationConsistency(const Eigen::Quaterniond& q1, 
+            const Eigen::Quaterniond& q2) {
+        // Check for large orientation jumps
+        double angle_diff = std::abs(2.0 * std::acos(std::abs(q1.dot(q2))));
+        if (angle_diff > M_PI/4) {  // More than 45 degrees
+        ROS_WARN("Large orientation jump detected: %.1f degrees", 
+        angle_diff * 180/M_PI);
+        return false;
+        }
+        return true;
+        }
+
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
             static int count = 0;
             if (count++ % 100 == 0) {  // Print every 100th message
-                ROS_INFO("Received IMU message, timestamp: %.3f", msg->header.stamp.toSec());
+                // ROS_INFO("Received IMU message, timestamp: %.3f", msg->header.stamp.toSec());
             }
             ImuMeasurement imu_data;
             imu_data.timestamp = msg->header.stamp.toSec();
@@ -923,7 +1062,8 @@ class UwbImuFusion {
                         processImuData(imu_data);
                         
                         // Check if it's time for batch optimization
-                        if (initialized_ && imu_data.timestamp - batch_start_time_ >= batch_duration_) {
+                        if (initialized_ && imu_data.timestamp - batch_start_time_ >= batch_duration_) 
+                        {
                             performBatchOptimization();
                         }
                     } catch (const std::exception& e) {
@@ -940,7 +1080,7 @@ class UwbImuFusion {
         void uwbCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
             static int count = 0;
             if (count++ % 10 == 0) {  // Print every 10th message
-                ROS_INFO("Received UWB message, timestamp: %.3f", msg->header.stamp.toSec());
+                // ROS_INFO("Received UWB message, timestamp: %.3f", msg->header.stamp.toSec());
             }
             
             UwbMeasurement uwb_data;
@@ -955,19 +1095,16 @@ class UwbImuFusion {
         void processImuData(const ImuMeasurement& imu_data) {
             std::lock_guard<std::mutex> lock(state_mutex_);  // Protect state access
             if (!initialized_) {
-                ROS_INFO("Initializing state with first IMU measurement");
-                initialized_ = true;
-                last_imu_time_ = imu_data.timestamp;
-                batch_start_time_ = imu_data.timestamp;
+                imu_buffer_.push_back(imu_data);
                 
-                // Initialize state
-                current_state_.timestamp = imu_data.timestamp;
-                current_state_.position.setZero();
-                current_state_.velocity.setZero();
-                current_state_.orientation.setIdentity();
-                current_state_.acc_bias.setZero();
-                current_state_.gyro_bias.setZero();
-                
+                if (imu_buffer_.size() >= 200) {
+                    if (initializeOrientation(imu_buffer_)) {
+                        initialized_ = true;
+                        last_imu_time_ = imu_data.timestamp;
+                        batch_start_time_ = imu_data.timestamp;
+                        ROS_INFO("System initialized with orientation alignment");
+                    }
+                }
                 return;
             }
         
@@ -1038,60 +1175,81 @@ class UwbImuFusion {
         }
     
         void propagateState(const ImuMeasurement& imu_data, double dt) {
-            // Add numerical stability checks
-            if (std::isnan(dt) || std::isinf(dt)) {
-                ROS_ERROR("Invalid dt in propagateState");
-                return;
-            }
-
-            // Check for NaN in state
-            if (current_state_.position.hasNaN() || 
-            current_state_.velocity.hasNaN() ||
-            current_state_.orientation.coeffs().hasNaN()) {
-                ROS_ERROR("NaN detected in state");
-                return;
-            }
-
-            // Remove bias and integrate IMU data
+            if (dt <= 0) return;
+        
+            // Apply bias and threshold corrections
             Eigen::Vector3d acc_unbias = imu_data.acc - current_state_.acc_bias;
             Eigen::Vector3d gyro_unbias = imu_data.gyro - current_state_.gyro_bias;
         
-            // Add strict limits
-            const double MAX_ACC = 20.0;  // Reduced from 50.0 m/s^2
-            const double MAX_GYRO = 50.0;  // rad/s
-            acc_unbias = acc_unbias.array().min(MAX_ACC).max(-MAX_ACC);
-            gyro_unbias = gyro_unbias.array().min(MAX_GYRO).max(-MAX_GYRO);
+            // Thresholds for noise reduction
+            const double GYRO_THRESHOLD = 0.001;  // rad/s
+            const double ACC_THRESHOLD = 0.05;    // m/s^2
         
-            // First update orientation
-            Eigen::Vector3d angle_axis = gyro_unbias * dt;
-            if (angle_axis.norm() > 1e-8) {  // Changed from 1e-12
-                current_state_.orientation = current_state_.orientation * 
-                    Eigen::Quaterniond(Eigen::AngleAxisd(angle_axis.norm(), angle_axis.normalized()));
+            // Apply thresholds to remove small noisy measurements
+            for (int i = 0; i < 3; i++) {
+                if (std::abs(gyro_unbias[i]) < GYRO_THRESHOLD) gyro_unbias[i] = 0.0;
+                if (std::abs(acc_unbias[i]) < ACC_THRESHOLD) acc_unbias[i] = 0.0;
             }
-            current_state_.orientation.normalize();  // Important!
         
-            // Then update position and velocity in world frame
-            Eigen::Vector3d acc_world = current_state_.orientation * acc_unbias + GRAVITY_VECTOR;
+            // Update orientation using exponential map
+            Eigen::Vector3d omega = gyro_unbias;
+            double omega_norm = omega.norm();
             
-            // Stricter velocity limits
-            const double MAX_VELOCITY = 50.0;  // Reduced from 10.0 m/s
-            
-            // Integration with velocity limiting
+            if (omega_norm > 1e-10) {
+                Eigen::Vector3d omega_normalized = omega / omega_norm;
+                double half_angle = omega_norm * dt * 0.5;
+                double cos_half = std::cos(half_angle);
+                double sin_half = std::sin(half_angle);
+                
+                Eigen::Quaterniond dq(cos_half, 
+                                     sin_half * omega_normalized.x(),
+                                     sin_half * omega_normalized.y(),
+                                     sin_half * omega_normalized.z());
+                
+                current_state_.orientation = (current_state_.orientation * dq).normalized();
+            }
+        
+            // Transform acceleration to world frame
+            Eigen::Matrix3d R = current_state_.orientation.toRotationMatrix();
+            Eigen::Vector3d acc_world = R * acc_unbias;
+        
+            // Remove gravity
+            acc_world += GRAVITY_VECTOR;
+        
+            // Velocity integration with bounds
+            const double MAX_VELOCITY = 10.0;  // m/s
             Eigen::Vector3d delta_v = acc_world * dt;
-            delta_v = delta_v.array().min(MAX_VELOCITY * dt).max(-MAX_VELOCITY * dt);
+            current_state_.velocity += delta_v;
             
-            Eigen::Vector3d next_velocity = current_state_.velocity + delta_v;
-            next_velocity = next_velocity.array().min(MAX_VELOCITY).max(-MAX_VELOCITY);
+            // Apply velocity bounds using min/max instead of clamp
+            for (int i = 0; i < 3; i++) {
+                current_state_.velocity[i] = std::min(std::max(current_state_.velocity[i], 
+                                                              -MAX_VELOCITY), 
+                                                    MAX_VELOCITY);
+            }
+        
+            // Position integration
+            current_state_.position += current_state_.velocity * dt + 
+                                      0.5 * acc_world * dt * dt;
+        
+            // Debug orientation changes
+            static Eigen::Vector3d last_euler = 
+                current_state_.orientation.toRotationMatrix().eulerAngles(0, 1, 2);
+            Eigen::Vector3d current_euler = 
+                current_state_.orientation.toRotationMatrix().eulerAngles(0, 1, 2);
             
-            // Position update with smaller time step
-            current_state_.position += current_state_.velocity * dt + 0.5 * delta_v * dt;
-            current_state_.velocity = next_velocity;
-        
-            // Update timestamp
-            current_state_.timestamp = imu_data.timestamp;
-        
-            // Integrate IMU preintegration
-            imu_preintegration_->integrate(imu_data.acc, imu_data.gyro, dt);
+            // Detect large orientation changes
+            Eigen::Vector3d euler_diff = (current_euler - last_euler).array().abs();
+            if (euler_diff.maxCoeff() > 0.1) {  // > ~5.7 degrees
+                ROS_DEBUG("Large orientation change detected:");
+                ROS_DEBUG("  Gyro input: [%.3f, %.3f, %.3f]", 
+                          gyro_unbias.x(), gyro_unbias.y(), gyro_unbias.z());
+                ROS_DEBUG("  Delta orientation (deg): [%.1f, %.1f, %.1f]",
+                          euler_diff.x() * 180/M_PI,
+                          euler_diff.y() * 180/M_PI,
+                          euler_diff.z() * 180/M_PI);
+            }
+            last_euler = current_euler;
         }
 
         void addImuFactor(ceres::Problem& problem, double* state_i, double* state_j) {
@@ -1208,6 +1366,21 @@ class UwbImuFusion {
                             parameter_blocks[i + 1]
                         );
                     }
+                }
+
+                // Add orientation regularization between consecutive states
+                const double orientation_weight = 1.0;
+                for (size_t i = 0; i < batch_states.size() - 1; ++i) {
+                    ceres::CostFunction* orientation_cost = 
+                        new ceres::AutoDiffCostFunction<OrientationRegularizationFactor, 3, 16, 16>(
+                            new OrientationRegularizationFactor(orientation_weight));
+                    
+                    problem.AddResidualBlock(
+                        orientation_cost,
+                        new ceres::HuberLoss(0.1),
+                        parameter_blocks[i],
+                        parameter_blocks[i + 1]
+                    );
                 }
         
                 // Add UWB factors
@@ -1378,6 +1551,15 @@ class UwbImuFusion {
                         current_state_.acc_bias = latest_state.acc_bias;
                         current_state_.gyro_bias = latest_state.gyro_bias;
                         current_state_.timestamp = latest_state.timestamp;
+
+                        geometry_msgs::Vector3 euler_msg;
+                        auto euler = current_state_.orientation.toRotationMatrix().eulerAngles(0, 1, 2);
+                        euler_msg.x = euler.x() * 180/M_PI;  // Convert to degrees
+                        euler_msg.y = euler.y() * 180/M_PI;
+                        euler_msg.z = euler.z() * 180/M_PI;
+                        std::cout<<"euler_msg.x-> " << euler_msg.x<<"\n";
+                        std::cout<<"euler_msg.y-> " << euler_msg.y<<"\n";
+                        std::cout<<"euler_msg.z-> " << euler_msg.z<<"\n";
                     }
                 }
         
@@ -1427,7 +1609,7 @@ class UwbImuFusion {
                     state.acc_bias += Eigen::Vector3d::Random() * 0.001;
                     state.gyro_bias += Eigen::Vector3d::Random() * 0.001;
                     
-                    ROS_INFO_STREAM("Initialized new state at time " << current_time);
+                    // ROS_INFO_STREAM("Initialized new state at time " << current_time);
                 }
                 
                 state.orientation.normalize();
@@ -1440,7 +1622,8 @@ class UwbImuFusion {
 
         void updateTrajectory(const std::vector<BatchState>& batch_states) {
             // Keep a fixed number of previous states for marginalization
-            const size_t keep_states = 2;
+            const size_t keep_states = 20; // 2
+            // const size_t keep_states = std::max(size_t(2), num_states_batch_ / 4) * 8;
             
             if (trajectory_states_.size() > keep_states) {
                 trajectory_states_.erase(
