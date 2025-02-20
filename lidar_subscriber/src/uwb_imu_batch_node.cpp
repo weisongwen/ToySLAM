@@ -32,11 +32,12 @@
  
  // Measurement structures
  struct ImuMeasurement {
-     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-     Eigen::Vector3d acc;
-     Eigen::Vector3d gyro;
-     double timestamp;
- };
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Vector3d acc;
+    Eigen::Vector3d gyro;
+    Eigen::Quaterniond orientation;  // Add IMU orientation
+    double timestamp;
+};
  
  struct UwbMeasurement {
      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -727,6 +728,40 @@
         Eigen::Vector3d gravity_;
     };
 
+
+    struct ImuOrientationFactor {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+        ImuOrientationFactor(const Eigen::Quaterniond& measured_orientation, double weight = 1.0)
+            : measured_orientation_(measured_orientation), weight_(weight) {
+                sqrt_information_ = weight * Eigen::Matrix3d::Identity();
+        }
+    
+        template <typename T>
+        bool operator()(const T* const state, T* residuals) const {
+            Eigen::Map<const Eigen::Quaternion<T>> q_state(state + 6);
+            Eigen::Quaternion<T> q_state_normalized = q_state.normalized();
+            Eigen::Quaternion<T> q_measured = measured_orientation_.cast<T>();
+    
+            // Compute orientation error
+            Eigen::Quaternion<T> q_error = q_measured.conjugate() * q_state_normalized;
+            
+            // Convert to angle-axis representation
+            Eigen::Map<Eigen::Matrix<T, 3, 1>> residual(residuals);
+            residual = T(2.0) * q_error.vec();
+    
+            // Apply weight
+            residual = sqrt_information_.cast<T>() * residual;
+    
+            return true;
+        }
+    
+    private:
+        Eigen::Quaterniond measured_orientation_;
+        Eigen::Matrix3d sqrt_information_;
+        double weight_;
+    };
+
     // Add this new factor
     struct OrientationRegularizationFactor {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -1115,10 +1150,6 @@ class UwbImuFusion {
 
     
         void imuCallback(const sensor_msgs::Imu::ConstPtr& msg) {
-            static int count = 0;
-            if (count++ % 100 == 0) {  // Print every 100th message
-                // ROS_INFO("Received IMU message, timestamp: %.3f", msg->header.stamp.toSec());
-            }
             ImuMeasurement imu_data;
             imu_data.timestamp = msg->header.stamp.toSec();
             imu_data.acc = Eigen::Vector3d(msg->linear_acceleration.x,
@@ -1127,7 +1158,11 @@ class UwbImuFusion {
             imu_data.gyro = Eigen::Vector3d(msg->angular_velocity.x,
                                            msg->angular_velocity.y,
                                            msg->angular_velocity.z);
-        
+            imu_data.orientation = Eigen::Quaterniond(msg->orientation.w,
+                                                    msg->orientation.x,
+                                                    msg->orientation.y,
+                                                    msg->orientation.z);
+            
             imu_queue_.push(imu_data);
         }
 
@@ -1446,20 +1481,47 @@ class UwbImuFusion {
                     }
                 }
 
-                // Add orientation regularization between consecutive states
-                const double orientation_weight = 1.0;
-                for (size_t i = 0; i < batch_states.size() - 1; ++i) {
-                    ceres::CostFunction* orientation_cost = 
-                        new ceres::AutoDiffCostFunction<OrientationRegularizationFactor, 3, 16, 16>(
-                            new OrientationRegularizationFactor(orientation_weight));
+                
+                // Add IMU orientation factors
+                for (size_t i = 0; i < batch_states.size(); ++i) {
+                    double state_time = batch_states[i].timestamp;
                     
-                    problem.AddResidualBlock(
-                        orientation_cost,
-                        new ceres::HuberLoss(0.1),
-                        parameter_blocks[i],
-                        parameter_blocks[i + 1]
-                    );
+                    // Find closest IMU measurement
+                    auto it = std::lower_bound(imu_buffer_.begin(), imu_buffer_.end(), state_time,
+                        [](const ImuMeasurement& imu, double time) {
+                            return imu.timestamp < time;
+                        });
+                    
+                    if (it != imu_buffer_.end() && 
+                        std::abs(it->timestamp - state_time) < state_dt_) {
+                        auto* orientation_factor = 
+                            new ImuOrientationFactor(it->orientation, 100.0); // Adjust weight as needed
+                        
+                        auto* cost_function = 
+                            new ceres::AutoDiffCostFunction<ImuOrientationFactor, 3, 16>(orientation_factor);
+                        
+                        problem.AddResidualBlock(
+                            cost_function,
+                            new ceres::HuberLoss(1.0),
+                            parameter_blocks[i]
+                        );
+                    }
                 }
+
+                // Add orientation regularization between consecutive states
+                // const double orientation_weight = 1.0;
+                // for (size_t i = 0; i < batch_states.size() - 1; ++i) {
+                //     ceres::CostFunction* orientation_cost = 
+                //         new ceres::AutoDiffCostFunction<OrientationRegularizationFactor, 3, 16, 16>(
+                //             new OrientationRegularizationFactor(orientation_weight));
+                    
+                //     problem.AddResidualBlock(
+                //         orientation_cost,
+                //         new ceres::HuberLoss(0.1),
+                //         parameter_blocks[i],
+                //         parameter_blocks[i + 1]
+                //     );
+                // }
         
                 // Add UWB factors
                 for (const auto& uwb : uwb_buffer_) {
