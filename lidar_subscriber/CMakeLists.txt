@@ -7,6 +7,9 @@ project(ToySLAM)
 # add_definitions(-std=c++14)
 # set(CMAKE_CXX_STANDARD 14)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # set(CMAKE_BUILD_TYPE "Release")
 # set(CMAKE_CXX_FLAGS "-std=c++11")
 # set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
@@ -28,6 +31,8 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   sensor_msgs
 )
+
+find_package(absl REQUIRED)
 
 find_package(PCL 1.8 REQUIRED COMPONENTS common io filters kdtree)
 # find_package(PCL REQUIRED)
@@ -146,6 +151,7 @@ target_link_libraries(uwb_imu_batch_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
   ${PCL_LIBRARIES}
   # pclomp
   OpenMP::OpenMP_CXX
+  absl::strings
 )
 
 add_executable(RangingRC src/RangingRC.cpp)
