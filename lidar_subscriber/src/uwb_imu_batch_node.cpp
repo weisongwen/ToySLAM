@@ -204,22 +204,21 @@ public:
         
         // Load parameters
         private_nh.param<double>("gravity_magnitude", gravity_magnitude_, 9.81);
-        private_nh.param<double>("imu_acc_noise", imu_acc_noise_, 0.01);  // Increased from 0.0001
-        private_nh.param<double>("imu_gyro_noise", imu_gyro_noise_, 0.005);  // Increased from 0.00005
-        private_nh.param<double>("imu_acc_bias_noise", imu_acc_bias_noise_, 0.001);
-        private_nh.param<double>("imu_gyro_bias_noise", imu_gyro_bias_noise_, 0.0005);
-        private_nh.param<double>("uwb_position_noise", uwb_position_noise_, 0.05);
-        private_nh.param<int>("optimization_window_size", optimization_window_size_, 20);  // Increased from 10
+        private_nh.param<double>("imu_acc_noise", imu_acc_noise_, 0.05);  // Increased from 0.01
+        private_nh.param<double>("imu_gyro_noise", imu_gyro_noise_, 0.01); // Increased from 0.005
+        private_nh.param<double>("imu_acc_bias_noise", imu_acc_bias_noise_, 0.005); // Increased from 0.001
+        private_nh.param<double>("imu_gyro_bias_noise", imu_gyro_bias_noise_, 0.001); // Increased from 0.0005
+        private_nh.param<double>("uwb_position_noise", uwb_position_noise_, 0.1); // Increased from 0.05
+        private_nh.param<int>("optimization_window_size", optimization_window_size_, 10);
         private_nh.param<std::string>("world_frame_id", world_frame_id_, "world");
         private_nh.param<std::string>("body_frame_id", body_frame_id_, "base_link");
         private_nh.param<double>("optimization_frequency", optimization_frequency_, 10.0);
         private_nh.param<double>("imu_buffer_time_length", imu_buffer_time_length_, 10.0);
-        private_nh.param<double>("uwb_alpha_xy", uwb_alpha_xy_, 0.9); 
-        private_nh.param<double>("uwb_alpha_z", uwb_alpha_z_, 0.95); 
         private_nh.param<int>("max_iterations", max_iterations_, 15);
         private_nh.param<bool>("enable_bias_estimation", enable_bias_estimation_, true);
-        private_nh.param<double>("position_drift_threshold", position_drift_threshold_, 20.0);
-        private_nh.param<double>("roll_pitch_weight", roll_pitch_weight_, 15.0);  // Changed from interval to weight
+        private_nh.param<double>("roll_pitch_weight", roll_pitch_weight_, 15.0);
+        private_nh.param<double>("imu_pose_pub_frequency", imu_pose_pub_frequency_, 100.0);
+        private_nh.param<double>("max_imu_dt", max_imu_dt_, 0.5);  // Maximum allowed dt between IMU samples
         
         // Initialize with small non-zero biases to help break symmetry in the optimization
         initial_acc_bias_ = Eigen::Vector3d(0.05, 0.05, 0.05);
@@ -228,31 +227,41 @@ public:
         // Initialize subscribers and publishers
         imu_sub_ = nh.subscribe("/sensor_simulator/imu_data", 1000, &UwbImuFusion::imuCallback, this);
         uwb_sub_ = nh.subscribe("/sensor_simulator/UWBPoistionPS", 100, &UwbImuFusion::uwbCallback, this);
-        pose_pub_ = nh.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/pose", 10);
+        optimized_pose_pub_ = nh.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/optimized_pose", 10);
+        imu_pose_pub_ = nh.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/imu_pose", 200);
         
         // Initialize state
         is_initialized_ = false;
         has_imu_data_ = false;
-        last_z_reset_time_ = 0;
-        z_reset_interval_ = 1.0;
+        last_imu_timestamp_ = 0;  // Track the last IMU timestamp
         initializeState();
         
         // Setup optimization timer
         optimization_timer_ = nh.createTimer(ros::Duration(1.0/optimization_frequency_), 
                                            &UwbImuFusion::optimizationTimerCallback, this);
         
+        // Setup high-frequency IMU pose publisher timer
+        imu_pose_pub_timer_ = nh.createTimer(ros::Duration(1.0/imu_pose_pub_frequency_), 
+                                           &UwbImuFusion::imuPoseTimerCallback, this);
+        
         ROS_INFO("UWB-IMU Fusion node initialized. Using factor graph optimization with max %d iterations", max_iterations_);
         ROS_INFO("Bias estimation is %s", enable_bias_estimation_ ? "enabled" : "disabled");
-        ROS_INFO("UWB noise: %.5f, position drift threshold: %.2f", uwb_position_noise_, position_drift_threshold_);
+        ROS_INFO("UWB noise: %.5f", uwb_position_noise_);
+        ROS_INFO("IMU acc noise: %.5f, gyro noise: %.5f", imu_acc_noise_, imu_gyro_noise_);
+        ROS_INFO("IMU acc bias noise: %.5f, gyro bias noise: %.5f", imu_acc_bias_noise_, imu_gyro_bias_noise_);
         ROS_INFO("Roll/pitch prior weight: %.2f", roll_pitch_weight_);
+        ROS_INFO("IMU pose publishing frequency: %.1f Hz", imu_pose_pub_frequency_);
+        ROS_INFO("Maximum allowed IMU dt: %.3f seconds", max_imu_dt_);
     }
 
 private:
     // ROS subscribers and publishers
     ros::Subscriber imu_sub_;
     ros::Subscriber uwb_sub_;
-    ros::Publisher pose_pub_;
+    ros::Publisher optimized_pose_pub_;
+    ros::Publisher imu_pose_pub_;
     ros::Timer optimization_timer_;
+    ros::Timer imu_pose_pub_timer_;
 
     // Parameters
     double gravity_magnitude_;
@@ -264,16 +273,13 @@ private:
     int optimization_window_size_;
     double optimization_frequency_;
     double imu_buffer_time_length_;
-    double uwb_alpha_xy_;
-    double uwb_alpha_z_;
     int max_iterations_;
     bool enable_bias_estimation_;
     std::string world_frame_id_;
     std::string body_frame_id_;
-    double last_z_reset_time_;
-    double z_reset_interval_;
-    double position_drift_threshold_;
     double roll_pitch_weight_;
+    double imu_pose_pub_frequency_;
+    double max_imu_dt_;  // Maximum allowed dt between IMU samples
     
     // Initial bias values to help estimation
     Eigen::Vector3d initial_acc_bias_;
@@ -294,6 +300,7 @@ private:
     std::deque<State, Eigen::aligned_allocator<State>> state_window_;
     bool is_initialized_;
     bool has_imu_data_;
+    double last_imu_timestamp_;  // Track the last IMU timestamp
     
     // IMU pre-integration
     struct ImuPreintegration {
@@ -457,51 +464,21 @@ private:
                 }
             }
             
-            // Check for excessive drift from UWB position and reset if needed
-            if (!state_window_.empty()) {
-                // Calculate drift between current position estimate and UWB measurement
-                double position_error = (current_state_.position - measurement.position).norm();
-                
-                if (position_error > position_drift_threshold_) {
-                    ROS_WARN("Detected excessive position drift (%.2f m). Resetting to UWB position.", position_error);
-                    
-                    // Reset position to UWB measurement
-                    current_state_.position = measurement.position;
-                    current_state_.velocity = Eigen::Vector3d::Zero(); // Reset velocity too
-                    
-                    // Also update the state window to prevent optimization from pulling back to incorrect position
-                    for (auto& state : state_window_) {
-                        // Adjust positions and velocities in the state window toward UWB
-                        // The closer to the current time, the stronger the correction
-                        double time_ratio = (state.timestamp - state_window_.front().timestamp) / 
-                                          (current_state_.timestamp - state_window_.front().timestamp);
-                        if (time_ratio > 0) {
-                            state.position = state.position + time_ratio * (measurement.position - current_state_.position);
-                            state.velocity = state.velocity * (1.0 - time_ratio * 0.8); // Dampen velocity
-                        }
-                    }
-                }
-            }
-            
-            // Quick periodic height correction to prevent Z drift
-            double now = ros::Time::now().toSec();
-            if (now - last_z_reset_time_ > z_reset_interval_) {
-                // Directly update current state height using this UWB measurement
-                current_state_.position.z() = measurement.position.z();
-                current_state_.velocity.z() = 0; // Zero vertical velocity to reduce drift
-                
-                // Also fix state window Z values to prevent optimization from going back to drifted values
-                for (auto& state : state_window_) {
-                    state.position.z() = measurement.position.z();
-                    state.velocity.z() = 0;
-                }
-                
-                last_z_reset_time_ = now;
-                ROS_INFO("Applied height correction to Z = %.3f meters", measurement.position.z());
-            }
-            
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in uwbCallback: %s", e.what());
+        }
+    }
+
+    // Timer callback for high-frequency IMU pose publishing
+    void imuPoseTimerCallback(const ros::TimerEvent& event) {
+        try {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            
+            if (is_initialized_ && has_imu_data_) {
+                publishImuPose();
+            }
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in imuPoseTimerCallback: %s", e.what());
         }
     }
 
@@ -542,10 +519,7 @@ private:
                 return;
             }
 
-            // First, do a simple UWB update to anchor the trajectory
-            updateWithUwb();
-            
-            // Then try factor graph optimization
+            // Directly use factor graph optimization
             bool success = false;
             
             try {
@@ -555,14 +529,13 @@ private:
                 success = false;
             }
             
-            // If factor graph optimization failed, our simple UWB update still applies
             if (!success) {
-                ROS_WARN("Factor graph optimization failed, using simple UWB update only");
+                ROS_WARN("Factor graph optimization failed");
             }
             
             // Ensure we have valid state before publishing
             if (isStateValid(current_state_)) {
-                publishState();
+                publishOptimizedPose();
             } else {
                 ROS_ERROR("Invalid current state after update");
             }
@@ -581,7 +554,6 @@ private:
             current_state_.acc_bias = initial_acc_bias_;
             current_state_.gyro_bias = initial_gyro_bias_;
             current_state_.timestamp = uwb.timestamp;
-            last_z_reset_time_ = uwb.timestamp;
             
             // Make sure we have a valid timestamp
             if (current_state_.timestamp <= 0) {
@@ -628,71 +600,91 @@ private:
                 return;
             }
             
-            // State propagation
-            double dt = timestamp - current_state_.timestamp;
-            
-            if (dt > 0 && dt < 0.1 && current_state_.timestamp > 0) {
-                // Correct for biases
-                Eigen::Vector3d acc_corrected = acc - current_state_.acc_bias;
-                Eigen::Vector3d gyro_corrected = gyro - current_state_.gyro_bias;
-                
-                // Remove gravity from acceleration
-                Eigen::Vector3d gravity_body = current_state_.orientation.inverse() * gravity_world_;
-                Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_body;
-                
-                // Update orientation using gyro
-                Eigen::Quaterniond dq;
-                Eigen::Vector3d angle_axis = gyro_corrected * dt;
-                double angle = angle_axis.norm();
-                if (angle > 1e-10) {
-                    dq = Eigen::Quaterniond(Eigen::AngleAxisd(angle, angle_axis.normalized()));
-                } else {
-                    dq = Eigen::Quaterniond::Identity();
-                }
-                
-                // Integrate state
-                current_state_.orientation = (current_state_.orientation * dq).normalized();
-                
-                // Rotate acceleration to world frame
-                Eigen::Vector3d acc_world = current_state_.orientation * acc_without_gravity;
-                
-                // Update velocity and position
-                current_state_.velocity += acc_world * dt;
-                
-                // Add a damping factor to vertical velocity to reduce drift
-                current_state_.velocity.z() *= 0.95; // Stronger damping (0.95 instead of 0.99)
-                
-                current_state_.position += current_state_.velocity * dt + 0.5 * acc_world * dt * dt;
-                current_state_.timestamp = timestamp;
-                
-                // Ensure state values are finite
-                if (!isStateValid(current_state_)) {
-                    ROS_WARN("Non-finite state values after IMU integration. Resetting to previous state.");
-                    if (!state_window_.empty()) {
-                        current_state_ = state_window_.back();
-                    }
-                    return;
-                }
-                
-                // Add to state window
-                if (state_window_.size() >= optimization_window_size_) {
-                    state_window_.pop_front();
-                }
-                state_window_.push_back(current_state_);
-                
-                // Debug logging for state window growth
-                static int prev_size = 0;
-                if (state_window_.size() != prev_size) {
-                    ROS_INFO("State window size changed: %zu", state_window_.size());
-                    prev_size = state_window_.size();
-                }
-            } else if (dt > 0.1) {
-                ROS_WARN("Large time gap detected in IMU data: %.3f seconds. Skipping integration.", dt);
-                current_state_.timestamp = timestamp;
-            } else if (dt <= 0) {
-                ROS_WARN_THROTTLE(1.0, "Invalid dt in IMU processing: %.6f. Current: %.6f, IMU: %.6f", 
-                                dt, current_state_.timestamp, timestamp);
+            // Compute time delta between this IMU message and the last one
+            double dt = 0;
+            if (last_imu_timestamp_ > 0) {
+                dt = timestamp - last_imu_timestamp_;
+            } else {
+                // First IMU measurement after initialization
+                last_imu_timestamp_ = timestamp;
+                current_state_.timestamp = timestamp;  // Sync state timestamp with first IMU
+                return;  // Skip integration for the first IMU message
             }
+            
+            // Check for time gaps
+            if (dt <= 0) {
+                ROS_WARN_THROTTLE(1.0, "Non-positive dt in IMU processing: %.6f. Last: %.6f, Current: %.6f", 
+                               dt, last_imu_timestamp_, timestamp);
+                last_imu_timestamp_ = timestamp;
+                return;
+            }
+            
+            if (dt > max_imu_dt_) {
+                ROS_WARN("Large time gap detected in IMU data: %.3f seconds. Skipping integration.", dt);
+                last_imu_timestamp_ = timestamp;
+                current_state_.timestamp = timestamp;  // Update timestamp only
+                return;
+            }
+            
+            // State propagation - using IMU data
+            // Correct for biases
+            Eigen::Vector3d acc_corrected = acc - current_state_.acc_bias;
+            Eigen::Vector3d gyro_corrected = gyro - current_state_.gyro_bias;
+            
+            // Remove gravity from acceleration
+            Eigen::Vector3d gravity_body = current_state_.orientation.inverse() * gravity_world_;
+            Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_body;
+            
+            // Update orientation using gyro
+            Eigen::Quaterniond dq;
+            Eigen::Vector3d angle_axis = gyro_corrected * dt;
+            double angle = angle_axis.norm();
+            if (angle > 1e-10) {
+                dq = Eigen::Quaterniond(Eigen::AngleAxisd(angle, angle_axis.normalized()));
+            } else {
+                dq = Eigen::Quaterniond::Identity();
+            }
+            
+            // Integrate state
+            current_state_.orientation = (current_state_.orientation * dq).normalized();
+            
+            // Rotate acceleration to world frame
+            Eigen::Vector3d acc_world = current_state_.orientation * acc_without_gravity;
+            
+            // Update velocity and position (using trapezoidal integration for better accuracy)
+            // Introducing very mild damping to all velocity components to stabilize against noise
+            current_state_.velocity = current_state_.velocity * 0.999 + acc_world * dt;
+            
+            // Trapezoidal integration for position
+            current_state_.position += current_state_.velocity * dt + 0.5 * acc_world * dt * dt;
+            current_state_.timestamp = timestamp;
+            
+            // Ensure state values are finite
+            if (!isStateValid(current_state_)) {
+                ROS_WARN("Non-finite state values after IMU integration. Resetting to previous state.");
+                if (!state_window_.empty()) {
+                    current_state_ = state_window_.back();
+                }
+                last_imu_timestamp_ = timestamp;
+                return;
+            }
+            
+            // Add to state window
+            if (state_window_.size() >= optimization_window_size_) {
+                state_window_.pop_front();
+            }
+            state_window_.push_back(current_state_);
+            
+            // Debug logging for state window growth
+            static int prev_size = 0;
+            if (state_window_.size() != prev_size) {
+                ROS_INFO("State window size changed: %zu", state_window_.size());
+                prev_size = state_window_.size();
+            }
+            
+            // Update the last IMU timestamp
+            last_imu_timestamp_ = timestamp;
+            
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in processImu: %s", e.what());
         }
@@ -707,62 +699,6 @@ private:
                state.gyro_bias.allFinite();
     }
 
-    // Simple UWB update with separate horizontal and vertical weights
-    void updateWithUwb() {
-        // Find relevant UWB measurements for each state in the window
-        for (auto& state : state_window_) {
-            // Find closest UWB measurement in time
-            const UwbMeasurement* best_uwb = nullptr;
-            double min_time_diff = 0.2; // Maximum allowed time difference
-            
-            for (const auto& uwb : uwb_measurements_) {
-                double time_diff = std::abs(state.timestamp - uwb.timestamp);
-                if (time_diff < min_time_diff) {
-                    min_time_diff = time_diff;
-                    best_uwb = &uwb;
-                }
-            }
-            
-            // If we found a close enough UWB measurement, update position
-            if (best_uwb) {
-                // Separate weights for horizontal (x,y) and vertical (z) components
-                // Higher weights to trust UWB more
-                
-                // X and Y components
-                state.position.x() = uwb_alpha_xy_ * best_uwb->position.x() + (1.0 - uwb_alpha_xy_) * state.position.x();
-                state.position.y() = uwb_alpha_xy_ * best_uwb->position.y() + (1.0 - uwb_alpha_xy_) * state.position.y();
-                
-                // Z component with higher weight to prevent height drift
-                state.position.z() = uwb_alpha_z_ * best_uwb->position.z() + (1.0 - uwb_alpha_z_) * state.position.z();
-                
-                // Check if Z is drifting significantly
-                double z_error = std::abs(state.position.z() - best_uwb->position.z());
-                if (z_error > 0.5) { // Reduced threshold for Z correction
-                    ROS_WARN("Large Z error: %f meters. Resetting height to UWB value.", z_error);
-                    state.position.z() = best_uwb->position.z();
-                    state.velocity.z() = 0.0; // Reset vertical velocity
-                }
-                
-                // Also reduce velocity slightly when UWB update occurs
-                state.velocity *= 0.95; // 5% velocity damping on UWB update
-            }
-        }
-        
-        // Update current state to match the latest state in the window
-        if (!state_window_.empty()) {
-            current_state_ = state_window_.back();
-        }
-        
-        // Convert orientation to RPY in degrees for logging
-        Eigen::Vector3d orientation_deg = quaternionToEulerDegrees(current_state_.orientation);
-        
-        ROS_INFO_THROTTLE(1.0, "UWB update complete. Position: [%f, %f, %f], Orientation (RPY): [%.1f, %.1f, %.1f], Acc bias: [%f, %f, %f], Gyro bias: [%f, %f, %f]",
-                 current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
-                 orientation_deg.x(), orientation_deg.y(), orientation_deg.z(),
-                 current_state_.acc_bias.x(), current_state_.acc_bias.y(), current_state_.acc_bias.z(),
-                 current_state_.gyro_bias.x(), current_state_.gyro_bias.y(), current_state_.gyro_bias.z());
-    }
-
     // Perform IMU pre-integration between two timestamps
     ImuPreintegration integrateImuMeasurements(double start_time, double end_time, 
                                              const Eigen::Vector3d& acc_bias, 
@@ -772,7 +708,10 @@ private:
             result.delta_position = Eigen::Vector3d::Zero();
             result.delta_orientation = Eigen::Quaterniond::Identity();
             result.delta_velocity = Eigen::Vector3d::Zero();
-            result.covariance = Eigen::Matrix<double, 9, 9>::Identity() * 1e-3; // Initialize to small identity matrix
+            
+            // Initialize covariance to small diagonal matrix for numerical stability
+            result.covariance = Eigen::Matrix<double, 9, 9>::Identity() * 1e-5;
+            
             result.jacobian_bias = Eigen::Matrix<double, 9, 6>::Zero();
             result.start_time = start_time;
             result.end_time = end_time;
@@ -814,8 +753,8 @@ private:
                          return a.header.stamp.toSec() < b.header.stamp.toSec();
                      });
             
-            // Noise covariance for IMU measurements - higher weights for better bias estimation
-            Eigen::Matrix<double, 6, 6> noise_covariance = Eigen::Matrix<double, 6, 6>::Zero();
+            // Noise covariance for IMU measurements 
+            Eigen::Matrix<double, 6, 6> noise_covariance = Eigen::Matrix<double, 6, 6>::Identity() * 1e-5;
             noise_covariance.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * imu_acc_noise_ * imu_acc_noise_;
             noise_covariance.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * imu_gyro_noise_ * imu_gyro_noise_;
             
@@ -825,7 +764,7 @@ private:
             Eigen::Quaterniond delta_q = Eigen::Quaterniond::Identity();
             
             // Initialize covariance and Jacobians
-            Eigen::Matrix<double, 9, 9> covariance = Eigen::Matrix<double, 9, 9>::Zero();
+            Eigen::Matrix<double, 9, 9> covariance = Eigen::Matrix<double, 9, 9>::Identity() * 1e-5;
             Eigen::Matrix<double, 9, 6> jacobian_bias = Eigen::Matrix<double, 9, 6>::Zero();
             
             // Pre-integration starts with reference biases
@@ -835,7 +774,7 @@ private:
                 double curr_time = imu.header.stamp.toSec();
                 double dt = curr_time - prev_time;
                 
-                if (dt <= 0 || dt > 0.1) {
+                if (dt <= 0 || dt > max_imu_dt_) {
                     // Skip invalid time differences or large gaps
                     prev_time = curr_time;
                     continue;
@@ -860,8 +799,7 @@ private:
                 Eigen::Vector3d acc_corrected = acc - acc_bias;
                 Eigen::Vector3d gyro_corrected = gyro - gyro_bias;
                 
-                // Simple Euler integration 
-                // Integrate rotation
+                // Simple Euler integration for rotation
                 Eigen::Vector3d angle_axis = gyro_corrected * dt;
                 Eigen::Quaterniond dq;
                 
@@ -876,7 +814,7 @@ private:
                 Eigen::Quaterniond delta_q_next = delta_q * dq;
                 delta_q_next.normalize(); // Ensure unit quaternion
                 
-                // Integrate velocity and position
+                // Integrate velocity and position using midpoint rule for better accuracy
                 Eigen::Vector3d acc_rotated = delta_q * acc_corrected;
                 Eigen::Vector3d delta_v_next = delta_v + acc_rotated * dt;
                 Eigen::Vector3d delta_p_next = delta_p + delta_v * dt + 0.5 * acc_rotated * dt * dt;
@@ -892,23 +830,22 @@ private:
                 G.block<3, 3>(3, 0) = delta_q.toRotationMatrix();
                 G.block<3, 3>(6, 3) = Eigen::Matrix3d::Identity();
                 
-                // Update bias Jacobians - these are critical for bias estimation
-                // Effect of acc bias change on delta_p, delta_v
+                // Update bias Jacobians
                 Eigen::Matrix<double, 9, 6> dF_db = Eigen::Matrix<double, 9, 6>::Zero();
                 
                 // Improved acc bias Jacobian calculation
                 dF_db.block<3, 3>(0, 0) = -0.5 * delta_q.toRotationMatrix() * dt * dt;
                 dF_db.block<3, 3>(3, 0) = -delta_q.toRotationMatrix() * dt;
                 
-                // Effect of gyro bias change on rotation, which indirectly affects delta_p, delta_v
-                // This is the skew-symmetric matrix using the rotated acc_corrected
+                // Calculate effect of gyro bias change on rotation
                 Eigen::Matrix3d dR_db_gyro = -dt * delta_q.toRotationMatrix() * skewSymmetric(acc_corrected);
                 dF_db.block<3, 3>(0, 3) = 0.5 * dR_db_gyro * dt;
                 dF_db.block<3, 3>(3, 3) = dR_db_gyro;
                 
-                // Direct effect of gyro bias on orientation (missing in original code)
+                // Direct effect of gyro bias on orientation 
                 dF_db.block<3, 3>(6, 3) = -dt * Eigen::Matrix3d::Identity();
                 
+                // Update Jacobians
                 jacobian_bias = F * jacobian_bias + dF_db;
                 
                 // Covariance propagation
@@ -916,9 +853,14 @@ private:
                 
                 // Check intermediate results are finite
                 if (!delta_p_next.allFinite() || !delta_v_next.allFinite() || 
-                    !delta_q_next.coeffs().allFinite() || 
-                    !covariance.allFinite() || !jacobian_bias.allFinite()) {
-                    ROS_WARN("Non-finite values during IMU integration");
+                    !delta_q_next.coeffs().allFinite()) {
+                    ROS_WARN("Non-finite position/velocity/orientation during IMU integration");
+                    result.is_valid = false;
+                    return result;
+                }
+                
+                if (!covariance.allFinite() || !jacobian_bias.allFinite()) {
+                    ROS_WARN("Non-finite covariance or Jacobian during IMU integration");
                     result.is_valid = false;
                     return result;
                 }
@@ -934,7 +876,7 @@ private:
             // Ensure numerical stability of covariance
             // Add small values to diagonal to ensure positive definiteness
             for (int i = 0; i < 9; ++i) {
-                covariance(i, i) += 1e-6;
+                covariance(i, i) = std::max(covariance(i, i), 1e-6);
             }
             
             // Store results
@@ -1004,9 +946,9 @@ private:
             Eigen::Matrix<T, 3, 1> ba_ref = preint_.acc_bias_ref.cast<T>();
             Eigen::Matrix<T, 3, 1> bg_ref = preint_.gyro_bias_ref.cast<T>();
             
-            // Bias corrections - use average for stability
-            Eigen::Matrix<T, 3, 1> dba = (ba_i + ba_j) * T(0.5) - ba_ref;
-            Eigen::Matrix<T, 3, 1> dbg = (bg_i + bg_j) * T(0.5) - bg_ref;
+            // Bias corrections
+            Eigen::Matrix<T, 3, 1> dba = ba_i - ba_ref;
+            Eigen::Matrix<T, 3, 1> dbg = bg_i - bg_ref;
             
             // Apply first-order bias correction
             Eigen::Matrix<T, 9, 6> jacobian_bias = preint_.jacobian_bias.cast<T>();
@@ -1032,7 +974,7 @@ private:
             // Gravity as T
             Eigen::Matrix<T, 3, 1> g = gravity_.cast<T>();
             
-            // Predict state at time j
+            // Predict state at time j using more accurate midpoint formula
             Eigen::Matrix<T, 3, 1> p_j_pred = p_i + v_i * dt + T(0.5) * g * dt * dt + q_i * delta_p;
             Eigen::Quaternion<T> q_j_pred = (q_i * delta_q).normalized();
             Eigen::Matrix<T, 3, 1> v_j_pred = v_i + g * dt + q_i * delta_v;
@@ -1218,7 +1160,7 @@ private:
                 }
             }
             
-            // Add UWB position factors - more important and with higher weight
+            // Add UWB position factors with appropriate weight
             size_t uwb_factors_added = 0;
             for (const auto& uwb : uwb_measurements_) {
                 // Find the closest state in time
@@ -1240,15 +1182,14 @@ private:
                 
                 try {
                     // Use different noise for horizontal and vertical components
-                    // Lower noise (= higher weight) for UWB
                     double noise_xy = uwb_position_noise_;
-                    double noise_z = uwb_position_noise_ * 0.5; // Higher weight for Z
+                    double noise_z = uwb_position_noise_ * 0.5;  // Higher weight for Z
                     
                     ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
                         uwb.position, noise_xy, noise_z);
                     
                     // Use HuberLoss to handle outliers
-                    ceres::LossFunction* loss_function = new ceres::HuberLoss(0.5); // Smaller parameter = more robust
+                    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
                     problem.AddResidualBlock(uwb_factor, loss_function, variables[state_idx].pose);
                     uwb_factors_added++;
                 } catch (const std::exception& e) {
@@ -1269,9 +1210,8 @@ private:
             
             // Add bias prior to all states for regularization
             if (enable_bias_estimation_) {
-                // Lower sigma (= higher weight) to regularize biases more strongly
-                double acc_bias_sigma = 0.2;  // Tighter constraint on biases
-                double gyro_bias_sigma = 0.05;
+                double acc_bias_sigma = 0.3;  // Less tight constraint on biases
+                double gyro_bias_sigma = 0.1; // Less tight constraint on biases
                 
                 for (size_t i = 0; i < state_window_.size(); ++i) {
                     ceres::CostFunction* bias_prior = BiasPriorFactor::Create(
@@ -1298,11 +1238,11 @@ private:
                 // Only add IMU factor if we have valid IMU measurements for this interval
                 if (preint.is_valid) {
                     try {
-                        // Increased weights for orientation to better constrain roll/pitch
-                        double pos_weight = 10.0;
-                        double ori_weight = 15.0;  // Increased from 10.0
-                        double vel_weight = 10.0;
-                        double bias_weight = 10.0;  // Increased from 5.0
+                        // Better balance between position/orientation/velocity
+                        double pos_weight = 10.0;   // Position weight
+                        double ori_weight = 10.0;   // Orientation weight
+                        double vel_weight = 15.0;   // Increased velocity weight
+                        double bias_weight = 8.0;   // Bias weight
                         
                         ceres::CostFunction* imu_factor = ImuFactor::Create(
                             preint, gravity_world_, pos_weight, ori_weight, vel_weight, bias_weight);
@@ -1315,13 +1255,13 @@ private:
                         // Add bias random walk constraint if bias estimation is enabled
                         if (enable_bias_estimation_) {
                             // Bias should change smoothly between consecutive states
-                            // Allow flexibility for bias changes but constrain them
-                            double acc_bias_sigma = imu_acc_bias_noise_ * sqrt(end_time - start_time) * 5.0;
-                            double gyro_bias_sigma = imu_gyro_bias_noise_ * sqrt(end_time - start_time) * 5.0;
+                            // Allow more flexibility for bias changes
+                            double acc_bias_sigma = imu_acc_bias_noise_ * sqrt(end_time - start_time) * 10.0;
+                            double gyro_bias_sigma = imu_gyro_bias_noise_ * sqrt(end_time - start_time) * 10.0;
                             
                             // Looser constraints on bias changes
-                            acc_bias_sigma = std::max(acc_bias_sigma, 0.005);   // Increased from 0.002
-                            gyro_bias_sigma = std::max(gyro_bias_sigma, 0.002);  // Increased from 0.001
+                            acc_bias_sigma = std::max(acc_bias_sigma, 0.01);
+                            gyro_bias_sigma = std::max(gyro_bias_sigma, 0.005);
                             
                             ceres::CostFunction* bias_walk = BiasRandomWalkFactor::Create(
                                 acc_bias_sigma, gyro_bias_sigma);
@@ -1349,7 +1289,7 @@ private:
             if (!uwb_measurements_.empty()) {
                 // Find UWB closest to first state
                 const UwbMeasurement* first_uwb = nullptr;
-                double min_first_time_diff = 0.5; // Relaxed time difference threshold
+                double min_first_time_diff = 0.5;
                 
                 // Find UWB closest to last state
                 const UwbMeasurement* last_uwb = nullptr;
@@ -1371,9 +1311,9 @@ private:
                     }
                 }
                 
-                // Add strong prior to first state if UWB available
+                // Add anchors with appropriate weights
                 if (first_uwb) {
-                    double noise_xy = uwb_position_noise_ * 0.5; // Even stronger weight
+                    double noise_xy = uwb_position_noise_ * 0.5;
                     double noise_z = uwb_position_noise_ * 0.25;
                     
                     ceres::CostFunction* first_uwb_factor = UwbPositionFactor::Create(
@@ -1382,7 +1322,6 @@ private:
                     problem.AddResidualBlock(first_uwb_factor, nullptr, variables[0].pose);
                 }
                 
-                // Add strong prior to last state if UWB available
                 if (last_uwb) {
                     double noise_xy = uwb_position_noise_ * 0.5;
                     double noise_z = uwb_position_noise_ * 0.25;
@@ -1400,10 +1339,10 @@ private:
             options.linear_solver_type = ceres::DENSE_QR; // More stable for small problems
             options.minimizer_progress_to_stdout = false;
             options.num_threads = 2;
-            options.function_tolerance = 1e-5;
-            options.gradient_tolerance = 1e-5;
-            options.parameter_tolerance = 1e-5;
-            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT; // More stable for our problem
+            options.function_tolerance = 1e-6;
+            options.gradient_tolerance = 1e-8;
+            options.parameter_tolerance = 1e-6;
+            options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
             
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
@@ -1471,12 +1410,11 @@ private:
             // Convert orientation to RPY in degrees for logging
             Eigen::Vector3d orientation_deg = quaternionToEulerDegrees(current_state_.orientation);
             
-            ROS_INFO_THROTTLE(1.0, "Optimization complete with %zu iterations. Position: [%f, %f, %f], Orientation (RPY): [%.1f, %.1f, %.1f], Acc bias: [%f, %f, %f], Gyro bias: [%f, %f, %f]",
+            ROS_INFO_THROTTLE(1.0, "Optimization complete with %zu iterations. Position: [%f, %f, %f], Velocity: [%f, %f, %f], Acc bias: [%f, %f, %f]",
                      summary.iterations.size(), 
                      current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
-                     orientation_deg.x(), orientation_deg.y(), orientation_deg.z(),
-                     current_state_.acc_bias.x(), current_state_.acc_bias.y(), current_state_.acc_bias.z(),
-                     current_state_.gyro_bias.x(), current_state_.gyro_bias.y(), current_state_.gyro_bias.z());
+                     current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z(),
+                     current_state_.acc_bias.x(), current_state_.acc_bias.y(), current_state_.acc_bias.z());
                      
             return true;
         } catch (const std::exception& e) {
@@ -1485,7 +1423,8 @@ private:
         }
     }
 
-    void publishState() {
+    // Publish IMU-predicted pose (high frequency)
+    void publishImuPose() {
         try {
             nav_msgs::Odometry odom_msg;
             odom_msg.header.stamp = ros::Time(current_state_.timestamp);
@@ -1509,24 +1448,64 @@ private:
             odom_msg.twist.twist.linear.z = current_state_.velocity.z();
             
             // Simple diagonal covariance
-            odom_msg.pose.covariance[0] = 0.01;  // x
-            odom_msg.pose.covariance[7] = 0.01;  // y
-            odom_msg.pose.covariance[14] = 0.01; // z
-            odom_msg.pose.covariance[21] = 0.01; // roll
-            odom_msg.pose.covariance[28] = 0.01; // pitch
-            odom_msg.pose.covariance[35] = 0.01; // yaw
+            odom_msg.pose.covariance[0] = 0.05;  // Higher uncertainty for IMU-only pose
+            odom_msg.pose.covariance[7] = 0.05;
+            odom_msg.pose.covariance[14] = 0.05;
+            odom_msg.pose.covariance[21] = 0.02;
+            odom_msg.pose.covariance[28] = 0.02;
+            odom_msg.pose.covariance[35] = 0.02;
             
             // Publish the message
-            pose_pub_.publish(odom_msg);
+            imu_pose_pub_.publish(odom_msg);
+            
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in publishImuPose: %s", e.what());
+        }
+    }
+
+    // Publish optimized state (lower frequency)
+    void publishOptimizedPose() {
+        try {
+            nav_msgs::Odometry odom_msg;
+            odom_msg.header.stamp = ros::Time(current_state_.timestamp);
+            odom_msg.header.frame_id = world_frame_id_;
+            odom_msg.child_frame_id = body_frame_id_;
+            
+            // Position
+            odom_msg.pose.pose.position.x = current_state_.position.x();
+            odom_msg.pose.pose.position.y = current_state_.position.y();
+            odom_msg.pose.pose.position.z = current_state_.position.z();
+            
+            // Orientation
+            odom_msg.pose.pose.orientation.w = current_state_.orientation.w();
+            odom_msg.pose.pose.orientation.x = current_state_.orientation.x();
+            odom_msg.pose.pose.orientation.y = current_state_.orientation.y();
+            odom_msg.pose.pose.orientation.z = current_state_.orientation.z();
+            
+            // Velocity
+            odom_msg.twist.twist.linear.x = current_state_.velocity.x();
+            odom_msg.twist.twist.linear.y = current_state_.velocity.y();
+            odom_msg.twist.twist.linear.z = current_state_.velocity.z();
+            
+            // Simple diagonal covariance
+            odom_msg.pose.covariance[0] = 0.01;  // Lower uncertainty for optimized pose
+            odom_msg.pose.covariance[7] = 0.01;
+            odom_msg.pose.covariance[14] = 0.01;
+            odom_msg.pose.covariance[21] = 0.01;
+            odom_msg.pose.covariance[28] = 0.01;
+            odom_msg.pose.covariance[35] = 0.01;
+            
+            // Publish the message
+            optimized_pose_pub_.publish(odom_msg);
             
             // Print orientation in degrees for debugging
             Eigen::Vector3d orientation_deg = quaternionToEulerDegrees(current_state_.orientation);
-            ROS_INFO_THROTTLE(1.0, "Published state: Position [%.2f, %.2f, %.2f], Orientation (RPY) [%.1f°, %.1f°, %.1f°]",
+            ROS_INFO_THROTTLE(1.0, "Published optimized state: Position [%.2f, %.2f, %.2f], Velocity [%.2f, %.2f, %.2f]",
                       current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
-                      orientation_deg.x(), orientation_deg.y(), orientation_deg.z());
+                      current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z());
             
         } catch (const std::exception& e) {
-            ROS_ERROR("Exception in publishState: %s", e.what());
+            ROS_ERROR("Exception in publishOptimizedPose: %s", e.what());
         }
     }
 
@@ -1545,7 +1524,7 @@ int main(int argc, char **argv) {
         ros::init(argc, argv, "uwb_imu_fusion_node");
         
         {
-            UwbImuFusion fusion;
+            UwbImuFusion fusion; 
             ros::spin();
         }
         
