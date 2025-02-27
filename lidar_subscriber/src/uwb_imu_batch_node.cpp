@@ -469,6 +469,9 @@ private:
     // but we need to remember that IMU measurements have gravity along POSITIVE Z
     Eigen::Vector3d gravity_world_;
     
+    // Parameterization that can be reused between optimizations
+    static ceres::LocalParameterization* pose_parameterization_;
+    
     // Helper functions
     
     // Compute quaternion for small angle rotation - overloaded for different types
@@ -607,10 +610,12 @@ private:
                 propagateStateWithImu(*msg);
             }
             
-            // Clean up old IMU messages
-            double oldest_allowed_time = ros::Time::now().toSec() - 2.0 * imu_buffer_time_length_;
-            while (!imu_buffer_.empty() && imu_buffer_.front().header.stamp.toSec() < oldest_allowed_time) {
-                imu_buffer_.pop_front();
+            // Clean up old IMU messages - more efficient algorithm
+            if (imu_buffer_.size() > 1000) { // Only clean when buffer is large
+                double oldest_allowed_time = ros::Time::now().toSec() - 2.0 * imu_buffer_time_length_;
+                while (!imu_buffer_.empty() && imu_buffer_.front().header.stamp.toSec() < oldest_allowed_time) {
+                    imu_buffer_.pop_front();
+                }
             }
             
             // Keep buffer size reasonable but larger to prevent data loss
@@ -646,9 +651,9 @@ private:
                 measurement.timestamp = ros::Time::now().toSec();
             }
             
-            // Keep uwb_measurements_ limited to a reasonable size
-            if (uwb_measurements_.size() > 50) {
-                uwb_measurements_.erase(uwb_measurements_.begin(), uwb_measurements_.begin() + 25);
+            // Keep uwb_measurements_ limited to a reasonable size - only when necessary
+            if (uwb_measurements_.size() > 100) {
+                uwb_measurements_.erase(uwb_measurements_.begin(), uwb_measurements_.begin() + 50);
             }
             
             // Add to UWB measurements list
@@ -701,8 +706,12 @@ private:
                 return;
             }
             
-            // Log the time interval between keyframes
-            ROS_INFO("Time interval between keyframes: %.3f seconds", dt);
+            // Log the time interval between keyframes (but not too frequently)
+            static double last_log_time = 0;
+            if (ros::Time::now().toSec() - last_log_time > 1.0) {
+                ROS_INFO_THROTTLE(2.0, "Time interval between keyframes: %.3f seconds", dt);
+                last_log_time = ros::Time::now().toSec();
+            }
             
             // Compute the propagated state at the UWB timestamp
             State propagated_state = propagateState(state_window_.back(), uwb.timestamp);
@@ -730,7 +739,8 @@ private:
                 performPreintegrationBetweenKeyframes(start_time, end_time, state_window_[n-2].acc_bias, state_window_[n-2].gyro_bias);
             }
             
-            ROS_INFO("Added new UWB-based keyframe at t=%.3f, window size: %zu", uwb.timestamp, state_window_.size());
+            // Throttle logging to avoid log spam
+            ROS_INFO_THROTTLE(1.0, "Added new UWB-based keyframe at t=%.3f, window size: %zu", uwb.timestamp, state_window_.size());
             
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in createKeyframe: %s", e.what());
@@ -748,6 +758,7 @@ private:
         
         // Find IMU measurements between reference_state.timestamp and target_time
         std::vector<sensor_msgs::Imu> relevant_imu_msgs;
+        relevant_imu_msgs.reserve(100); // Reasonable pre-allocation
         
         for (const auto& imu : imu_buffer_) {
             double timestamp = imu.header.stamp.toSec();
@@ -756,11 +767,13 @@ private:
             }
         }
         
-        // Sort by timestamp just to be safe
-        std::sort(relevant_imu_msgs.begin(), relevant_imu_msgs.end(), 
-                 [](const sensor_msgs::Imu& a, const sensor_msgs::Imu& b) {
-                     return a.header.stamp.toSec() < b.header.stamp.toSec();
-                 });
+        // Sort by timestamp just to be safe (with our IMU buffer this should be unnecessary)
+        if (relevant_imu_msgs.size() > 1) {
+            std::sort(relevant_imu_msgs.begin(), relevant_imu_msgs.end(), 
+                     [](const sensor_msgs::Imu& a, const sensor_msgs::Imu& b) {
+                         return a.header.stamp.toSec() < b.header.stamp.toSec();
+                     });
+        }
         
         // Propagate state using IMU messages
         double prev_time = reference_state.timestamp;
@@ -996,7 +1009,8 @@ private:
                 return;
             }
             
-            ROS_INFO_THROTTLE(1.0, "Performing optimization with %zu keyframes and %zu UWB measurements", 
+            // Throttle info log
+            ROS_INFO_THROTTLE(2.0, "Performing optimization with %zu keyframes and %zu UWB measurements", 
                               state_window_.size(), uwb_measurements_.size());
             
             // Check for extreme velocity
@@ -1046,14 +1060,13 @@ private:
             for (size_t i = 0; i < state_window_.size() - 1; ++i) {
                 double start_time = state_window_[i].timestamp;
                 double end_time = state_window_[i+1].timestamp;
-                double frame_dt = end_time - start_time;
                 
                 std::pair<double, double> key(start_time, end_time);
                 
                 if (preintegration_map_.find(key) == preintegration_map_.end()) {
-                    // Perform preintegration for this interval
-                    ROS_INFO("Computing preintegration between keyframes at %.3f and %.3f (dt = %.3f s)", 
-                             start_time, end_time, frame_dt);
+                    // Perform preintegration for this interval (with throttled logging)
+                    ROS_DEBUG("Computing preintegration between keyframes at %.3f and %.3f (dt = %.3f s)", 
+                             start_time, end_time, end_time - start_time);
                     performPreintegrationBetweenKeyframes(start_time, end_time, 
                                                          state_window_[i].acc_bias, 
                                                          state_window_[i].gyro_bias);
@@ -1151,7 +1164,6 @@ private:
                 if ((existing.acc_bias_ref - acc_bias).norm() < 1e-8 && 
                     (existing.gyro_bias_ref - gyro_bias).norm() < 1e-8) {
                     // Bias reference is the same, no need to recompute
-                    ROS_DEBUG("Reusing existing preintegration for interval [%.3f, %.3f]", start_time, end_time);
                     return;
                 }
             }
@@ -1164,32 +1176,33 @@ private:
             preint.acc_bias_ref = acc_bias;
             preint.gyro_bias_ref = gyro_bias;
             
-            // Find relevant IMU measurements
-            bool found_data = false;
+            // Find relevant IMU measurements - with better performance
+            preint.imu_measurements.reserve(100); // Pre-allocate for better performance
             
             for (const auto& imu : imu_buffer_) {
                 double timestamp = imu.header.stamp.toSec();
                 if (timestamp >= start_time && timestamp <= end_time) {
                     preint.imu_measurements.push_back(imu);
-                    found_data = true;
                 }
             }
             
-            if (!found_data) {
-                ROS_WARN("No IMU data found between keyframes %.6f and %.6f", start_time, end_time);
+            if (preint.imu_measurements.empty()) {
+                ROS_WARN_THROTTLE(2.0, "No IMU data found between keyframes %.6f and %.6f", start_time, end_time);
                 return;
             }
             
-            // Log number of IMU measurements and time interval
+            // Only log extensive information at DEBUG level
             double time_interval = end_time - start_time;
-            ROS_INFO("Integrating %zu IMU measurements over %.3f seconds between keyframes", 
+            ROS_DEBUG("Integrating %zu IMU measurements over %.3f seconds between keyframes", 
                      preint.imu_measurements.size(), time_interval);
             
             // Sort IMU measurements by timestamp
-            std::sort(preint.imu_measurements.begin(), preint.imu_measurements.end(), 
-                     [](const sensor_msgs::Imu& a, const sensor_msgs::Imu& b) {
-                         return a.header.stamp.toSec() < b.header.stamp.toSec();
-                     });
+            if (preint.imu_measurements.size() > 1) {
+                std::sort(preint.imu_measurements.begin(), preint.imu_measurements.end(), 
+                         [](const sensor_msgs::Imu& a, const sensor_msgs::Imu& b) {
+                             return a.header.stamp.toSec() < b.header.stamp.toSec();
+                         });
+            }
             
             // Perform preintegration
             double prev_time = start_time;
@@ -1199,6 +1212,11 @@ private:
             // CRITICAL: In your IMU measurements, gravity is reported along +Z axis in sensor frame
             // We need to define the sensor-frame gravity vector and then subtract it
             Eigen::Vector3d sensor_gravity(0, 0, gravity_magnitude_); // POSITIVE Z in sensor frame
+            
+            // Precompute IMU noise matrix once
+            Eigen::Matrix<double, 6, 6> noise_cov = Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
+            noise_cov.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * imu_acc_noise_ * imu_acc_noise_;
+            noise_cov.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * imu_gyro_noise_ * imu_gyro_noise_;
             
             for (const auto& imu_msg : preint.imu_measurements) {
                 double timestamp = imu_msg.header.stamp.toSec();
@@ -1272,11 +1290,6 @@ private:
                 G.block<3, 3>(3, 0) = delta_q_half.toRotationMatrix();
                 G.block<3, 3>(6, 3) = Eigen::Matrix3d::Identity();
                 
-                // 10. IMU noise covariance
-                Eigen::Matrix<double, 6, 6> noise_cov = Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
-                noise_cov.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * imu_acc_noise_ * imu_acc_noise_;
-                noise_cov.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity() * imu_gyro_noise_ * imu_gyro_noise_;
-                
                 // 11. Update bias Jacobians
                 Eigen::Matrix<double, 9, 6> dF_db = Eigen::Matrix<double, 9, 6>::Zero();
                 
@@ -1311,7 +1324,8 @@ private:
             // Store in map
             preintegration_map_[key] = preint;
             
-            ROS_INFO("Completed preintegration with delta_t=%.3f seconds, using %zu IMU measurements", 
+            // Only log at debug level
+            ROS_DEBUG("Completed preintegration with delta_t=%.3f seconds, using %zu IMU measurements", 
                      preint.sum_dt, preint.imu_measurements.size());
             
         } catch (const std::exception& e) {
@@ -1526,11 +1540,15 @@ private:
             return false;
         }
         
-        // Create Ceres problem
-        ceres::Problem problem;
+        // Create Ceres problem with more efficient options
+        ceres::Problem::Options problem_options;
+        problem_options.enable_fast_removal = true;  // Speeds up parameter block removal
+        ceres::Problem problem(problem_options);
         
-        // Use a fresh parameterization for each optimization run
-        ceres::LocalParameterization* pose_parameterization = new PoseParameterization();
+        // Initialize pose parameterization if not already done
+        if (!pose_parameterization_) {
+            pose_parameterization_ = new PoseParameterization();
+        }
         
         // Structure for storing state variables for Ceres
         struct OptVariables {
@@ -1541,41 +1559,45 @@ private:
         };
         
         try {
-            // Create a vector to store optimization variables 
-            std::vector<OptVariables, Eigen::aligned_allocator<OptVariables>> variables(state_window_.size());
+            // Preallocate with reserve instead of resize to avoid unnecessary initialization
+            std::vector<OptVariables, Eigen::aligned_allocator<OptVariables>> variables;
+            variables.reserve(state_window_.size());
             
             // Initialize variables from state window
             for (size_t i = 0; i < state_window_.size(); ++i) {
+                OptVariables var;
                 const auto& state = state_window_[i];
                 
                 // Position
-                variables[i].pose[0] = state.position.x();
-                variables[i].pose[1] = state.position.y();
-                variables[i].pose[2] = state.position.z();
+                var.pose[0] = state.position.x();
+                var.pose[1] = state.position.y();
+                var.pose[2] = state.position.z();
                 
                 // Orientation (quaternion): w, x, y, z
-                variables[i].pose[3] = state.orientation.w();
-                variables[i].pose[4] = state.orientation.x();
-                variables[i].pose[5] = state.orientation.y();
-                variables[i].pose[6] = state.orientation.z();
+                var.pose[3] = state.orientation.w();
+                var.pose[4] = state.orientation.x();
+                var.pose[5] = state.orientation.y();
+                var.pose[6] = state.orientation.z();
                 
                 // Velocity
-                variables[i].velocity[0] = state.velocity.x();
-                variables[i].velocity[1] = state.velocity.y();
-                variables[i].velocity[2] = state.velocity.z();
+                var.velocity[0] = state.velocity.x();
+                var.velocity[1] = state.velocity.y();
+                var.velocity[2] = state.velocity.z();
                 
                 // Biases
-                variables[i].bias[0] = state.acc_bias.x();
-                variables[i].bias[1] = state.acc_bias.y();
-                variables[i].bias[2] = state.acc_bias.z();
-                variables[i].bias[3] = state.gyro_bias.x();
-                variables[i].bias[4] = state.gyro_bias.y();
-                variables[i].bias[5] = state.gyro_bias.z();
+                var.bias[0] = state.acc_bias.x();
+                var.bias[1] = state.acc_bias.y();
+                var.bias[2] = state.acc_bias.z();
+                var.bias[3] = state.gyro_bias.x();
+                var.bias[4] = state.gyro_bias.y();
+                var.bias[5] = state.gyro_bias.z();
+                
+                variables.push_back(var);
             }
             
             // Add pose parameterization for all pose variables
             for (size_t i = 0; i < state_window_.size(); ++i) {
-                problem.AddParameterBlock(variables[i].pose, 7, pose_parameterization);
+                problem.AddParameterBlock(variables[i].pose, 7, pose_parameterization_);
             }
             
             // If bias estimation is disabled, set biases constant
@@ -1602,34 +1624,28 @@ private:
             }
             
             // Add UWB position factors for each keyframe
-            // Each keyframe is already associated with a UWB measurement
             int uwb_factors_added = 0;
             for (size_t i = 0; i < state_window_.size(); ++i) {
-                try {
-                    double keyframe_time = state_window_[i].timestamp;
-                    
-                    // Find any UWB measurement that matches this keyframe's timestamp
-                    for (const auto& uwb : uwb_measurements_) {
-                        if (std::abs(uwb.timestamp - keyframe_time) < 0.01) { // 10ms tolerance
-                            // Use smaller noise values in emergency mode
-                            double noise_xy = emergency_mode ? uwb_position_noise_ * 0.01 : uwb_position_noise_ * 0.1;
-                            double noise_z = emergency_mode ? uwb_position_noise_ * 0.005 : uwb_position_noise_ * 0.05;
-                            
-                            ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
-                                uwb.position, noise_xy, noise_z);
-                            
-                            // Use HuberLoss to handle outliers
-                            ceres::LossFunction* loss_function = new ceres::HuberLoss(0.5);
-                            problem.AddResidualBlock(uwb_factor, loss_function, variables[i].pose);
-                            uwb_factors_added++;
-                            break;
-                        }
+                double keyframe_time = state_window_[i].timestamp;
+                
+                // Find any UWB measurement that matches this keyframe's timestamp
+                for (const auto& uwb : uwb_measurements_) {
+                    if (std::abs(uwb.timestamp - keyframe_time) < 0.01) { // 10ms tolerance
+                        // Use smaller noise values in emergency mode
+                        double noise_xy = emergency_mode ? uwb_position_noise_ * 0.01 : uwb_position_noise_ * 0.1;
+                        double noise_z = emergency_mode ? uwb_position_noise_ * 0.005 : uwb_position_noise_ * 0.05;
+                        
+                        ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
+                            uwb.position, noise_xy, noise_z);
+                        
+                        // Use HuberLoss to handle outliers
+                        ceres::LossFunction* loss_function = new ceres::HuberLoss(0.5);
+                        problem.AddResidualBlock(uwb_factor, loss_function, variables[i].pose);
+                        uwb_factors_added++;
+                        break;
                     }
-                } catch (const std::exception& e) {
-                    ROS_ERROR("Exception while adding UWB factor: %s", e.what());
                 }
             }
-            ROS_INFO("Added %d UWB position factors", uwb_factors_added);
             
             // Add roll/pitch prior to all states
             for (size_t i = 0; i < state_window_.size(); ++i) {
@@ -1670,59 +1686,50 @@ private:
                 if (preintegration_map_.find(key) != preintegration_map_.end()) {
                     const auto& preint = preintegration_map_[key];
                     
-                    try {
-                        ceres::CostFunction* imu_factor = ImuFactor::Create(preint, gravity_world_);
+                    ceres::CostFunction* imu_factor = ImuFactor::Create(preint, gravity_world_);
+                    
+                    problem.AddResidualBlock(imu_factor, nullptr,
+                                           variables[i].pose, variables[i].velocity, variables[i].bias,
+                                           variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
+                    imu_factors_added++;
+                    
+                    // Add bias random walk constraint if bias estimation is enabled
+                    if (enable_bias_estimation_) {
+                        // Bias should change smoothly between consecutive states
+                        double time_diff = end_time - start_time;
+                        double acc_bias_sigma = imu_acc_bias_noise_ * sqrt(time_diff) * 2.0;
+                        double gyro_bias_sigma = imu_gyro_bias_noise_ * sqrt(time_diff) * 2.0;
                         
-                        problem.AddResidualBlock(imu_factor, nullptr,
-                                               variables[i].pose, variables[i].velocity, variables[i].bias,
-                                               variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
-                        imu_factors_added++;
+                        // Ensure minimum values
+                        acc_bias_sigma = std::max(acc_bias_sigma, 0.002);
+                        gyro_bias_sigma = std::max(gyro_bias_sigma, 0.0005);
                         
-                        // Add bias random walk constraint if bias estimation is enabled
-                        if (enable_bias_estimation_) {
-                            // Bias should change smoothly between consecutive states
-                            double time_diff = end_time - start_time;
-                            double acc_bias_sigma = imu_acc_bias_noise_ * sqrt(time_diff) * 2.0;
-                            double gyro_bias_sigma = imu_gyro_bias_noise_ * sqrt(time_diff) * 2.0;
-                            
-                            // Ensure minimum values
-                            acc_bias_sigma = std::max(acc_bias_sigma, 0.002);
-                            gyro_bias_sigma = std::max(gyro_bias_sigma, 0.0005);
-                            
-                            ceres::CostFunction* bias_walk = BiasRandomWalkFactor::Create(
-                                acc_bias_sigma, gyro_bias_sigma);
-                            
-                            problem.AddResidualBlock(bias_walk, nullptr, 
-                                                   variables[i].bias, variables[i+1].bias);
-                        }
-                    } catch (const std::exception& e) {
-                        ROS_ERROR("Exception while adding IMU factor: %s", e.what());
+                        ceres::CostFunction* bias_walk = BiasRandomWalkFactor::Create(
+                            acc_bias_sigma, gyro_bias_sigma);
+                        
+                        problem.AddResidualBlock(bias_walk, nullptr, 
+                                               variables[i].bias, variables[i+1].bias);
                     }
                 } else {
                     // If no preintegration data, add a state constraint
-                    ROS_WARN("No preintegration data between keyframes at %.3f and %.3f", start_time, end_time);
-                    try {
-                        // Increased weights for state constraints
-                        ceres::CostFunction* state_constraint = StateConstraintFactor::Create(10.0, 8.0);
-                        problem.AddResidualBlock(state_constraint, nullptr,
-                                               variables[i].pose, variables[i].velocity, variables[i].bias,
-                                               variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
-                    } catch (const std::exception& e) {
-                        ROS_ERROR("Exception while adding state constraint: %s", e.what());
-                    }
+                    ROS_WARN_THROTTLE(5.0, "No preintegration data between keyframes at %.3f and %.3f", start_time, end_time);
+                    // Increased weights for state constraints
+                    ceres::CostFunction* state_constraint = StateConstraintFactor::Create(10.0, 8.0);
+                    problem.AddResidualBlock(state_constraint, nullptr,
+                                           variables[i].pose, variables[i].velocity, variables[i].bias,
+                                           variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
                 }
             }
-            ROS_INFO("Added %d IMU factors between keyframes", imu_factors_added);
             
-            // Configure solver
+            // Configure solver - Proper settings
             ceres::Solver::Options options;
             options.max_num_iterations = max_iterations_;
-            options.linear_solver_type = ceres::DENSE_QR; // More stable for small problems
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;  // Much faster sparse solver
             options.minimizer_progress_to_stdout = false;
-            // options.num_threads = 4;  // Reasonable thread count for most systems
-            // options.function_tolerance = 1e-6;
-            // options.gradient_tolerance = 1e-8;
-            // options.parameter_tolerance = 1e-6;
+            options.num_threads = 4;  // Explicit thread count
+            options.function_tolerance = 1e-6;
+            options.gradient_tolerance = 1e-8;
+            options.parameter_tolerance = 1e-6;
             options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
             
             // Enable line search if we're in emergency mode for better stability
@@ -1742,12 +1749,10 @@ private:
                 return false;
             }
             
-            // Debug outputs
-            std::ostringstream debug_str;
-            debug_str << "Initial biases: acc=[" << initial_acc_bias_.x() << ", " << initial_acc_bias_.y() 
-                     << ", " << initial_acc_bias_.z() << "], gyro=[" << initial_gyro_bias_.x() << ", " 
-                     << initial_gyro_bias_.y() << ", " << initial_gyro_bias_.z() << "]";
-            ROS_INFO_THROTTLE(5.0, "%s", debug_str.str().c_str());
+            // Debug outputs - use throttled logging to reduce overhead
+            ROS_INFO_THROTTLE(5.0, "Initial biases: acc=[%.3f, %.3f, %.3f], gyro=[%.3f, %.3f, %.3f]",
+                     initial_acc_bias_.x(), initial_acc_bias_.y(), initial_acc_bias_.z(),
+                     initial_gyro_bias_.x(), initial_gyro_bias_.y(), initial_gyro_bias_.z());
             
             // Update state with optimized values
             for (size_t i = 0; i < state_window_.size(); ++i) {
@@ -1825,11 +1830,6 @@ private:
                     summary.iterations.size(), 
                     summary.final_cost);
             
-            ROS_INFO("Position: [%.3f, %.3f, %.3f], Velocity: [%.3f, %.3f, %.3f], Acc bias: [%.3f, %.3f, %.3f]",
-                    current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
-                    current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z(),
-                    current_state_.acc_bias.x(), current_state_.acc_bias.y(), current_state_.acc_bias.z());
-                     
             return true;
         } catch (const std::exception& e) {
             ROS_ERROR("Exception during optimization: %s", e.what());
@@ -1912,7 +1912,7 @@ private:
             // Publish the message
             optimized_pose_pub_.publish(odom_msg);
             
-            // Print position for debugging
+            // Print position for debugging (throttled)
             ROS_INFO_THROTTLE(1.0, "Published optimized state: Position [%.2f, %.2f, %.2f], Velocity [%.2f, %.2f, %.2f]",
                       current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
                       current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z());
@@ -1922,6 +1922,9 @@ private:
         }
     }
 };
+
+// Initialize static members
+ceres::LocalParameterization* UwbImuFusion::pose_parameterization_ = nullptr;
 
 int main(int argc, char **argv) {
     try {
