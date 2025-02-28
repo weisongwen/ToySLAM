@@ -1,725 +1,1103 @@
-/**
- * @file gps_raim_node.cpp
- * @brief ROS node for GPS single point positioning with RAIM and protection level calculation
- * 
- * This node simulates GPS satellites and implements a receiver that:
- * 1. Performs single point positioning to estimate the receiver position
- * 2. Implements RAIM for fault detection
- * 3. Calculates horizontal and vertical protection levels using rigorous methods
- */
+#include <ros/ros.h>
+#include <sensor_msgs/NavSatFix.h>
+#include <sensor_msgs/NavSatStatus.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <geometry_msgs/PoseWithCovariance.h>
+#include <nav_msgs/Odometry.h>
+#include <nav_msgs/Path.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <Eigen/Dense>
+#include <random>
+#include <vector>
+#include <cmath>
+#include <deque>
 
- #include <ros/ros.h>
- #include <sensor_msgs/NavSatFix.h>
- #include <geometry_msgs/PoseWithCovarianceStamped.h>
- #include <Eigen/Dense>
- #include <random>
- #include <vector>
- #include <cmath>
- 
- // Constants
- const double PI = 3.14159265358979323846;
- const double EARTH_RADIUS = 6378137.0;  // Earth radius in meters (WGS84)
- const double MU = 3.986005e14;          // Earth's gravitational constant
- const double OMEGA_E = 7.2921151467e-5; // Earth's rotation rate in rad/s
- const double C = 299792458.0;           // Speed of light in m/s
- const double SV_CLOCK_BIAS_SD = 30.0;   // Standard deviation of satellite clock bias in meters
- const double SV_POS_SD = 10.0;          // Standard deviation of satellite position error in meters
- const double PSEUDORANGE_SD = 5.0;      // Standard deviation of pseudorange measurement noise in meters
- const double CHI_SQUARE_THRESHOLD = 11.07; // Chi-square threshold for fault detection (95% confidence, 5 DoF)
- 
- // WGS84 parameters
- const double WGS84_a = 6378137.0;       // Semi-major axis in meters
- const double WGS84_f = 1.0/298.257223563; // Flattening
- const double WGS84_e2 = 2*WGS84_f - WGS84_f*WGS84_f; // Eccentricity squared
- 
- // Structures
- struct SatelliteData {
-     int prn;               // Satellite PRN number
-     double x, y, z;        // ECEF coordinates in meters
-     double vx, vy, vz;     // Velocity in ECEF frame in m/s
-     double clock_bias;     // Satellite clock bias in seconds
-     double clock_drift;    // Satellite clock drift in seconds/second
-     double pseudorange;    // Pseudorange measurement in meters
-     bool used;             // Flag to indicate if the satellite is used in the solution
- };
- 
- struct ReceiverState {
-     double x, y, z;        // ECEF coordinates in meters
-     double clock_bias;     // Receiver clock bias in seconds
-     Eigen::Matrix4d covariance; // Covariance matrix of the state
-     double hdop;           // Horizontal dilution of precision
-     double vdop;           // Vertical dilution of precision
-     double hpl;            // Horizontal protection level in meters
-     double vpl;            // Vertical protection level in meters
-     bool raim_alert;       // RAIM alert flag
-     double test_statistic; // RAIM test statistic
- };
- 
- class GpsRaimNode {
- private:
-     ros::NodeHandle nh_;
-     ros::Publisher position_pub_;
-     ros::Publisher navsat_pub_;
-     ros::Timer timer_;
-     
-     std::vector<SatelliteData> satellites_;
-     ReceiverState receiver_state_;
-     std::default_random_engine generator_;
-     
-     // Simulation parameters
-     double true_receiver_x_;
-     double true_receiver_y_;
-     double true_receiver_z_;
-     double simulation_time_;
-     double time_step_;
-     
-     // RAIM parameters
-     double pfa_;           // Probability of false alarm
-     double pmd_;           // Probability of missed detection
-     double bias_error_;    // Minimum detectable bias
- 
- public:
-     GpsRaimNode(ros::NodeHandle& nh) : nh_(nh) {
-         // Initialize publishers
-         position_pub_ = nh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("gps_position", 10);
-         navsat_pub_ = nh_.advertise<sensor_msgs::NavSatFix>("gps_fix", 10);
-         
-         // Initialize random number generator with a seed
-         generator_.seed(static_cast<unsigned int>(time(nullptr)));
-         
-         // Initialize simulation parameters
-         nh_.param<double>("true_receiver_x", true_receiver_x_, 0.0);
-         nh_.param<double>("true_receiver_y", true_receiver_y_, 0.0);
-         nh_.param<double>("true_receiver_z", true_receiver_z_, EARTH_RADIUS);
-         nh_.param<double>("time_step", time_step_, 1.0);
-         
-         // Initialize RAIM parameters
-         nh_.param<double>("pfa", pfa_, 1e-5);           // Probability of false alarm
-         nh_.param<double>("pmd", pmd_, 1e-3);           // Probability of missed detection
-         nh_.param<double>("bias_error", bias_error_, 30.0); // Minimum detectable bias in meters
-         
-         simulation_time_ = 0.0;
-         
-         // Initialize receiver state with a reasonable guess
-         receiver_state_.x = true_receiver_x_;
-         receiver_state_.y = true_receiver_y_;
-         receiver_state_.z = true_receiver_z_;
-         receiver_state_.clock_bias = 0.0;
-         receiver_state_.hpl = 9999.0;
-         receiver_state_.vpl = 9999.0;
-         receiver_state_.raim_alert = false;
-         receiver_state_.test_statistic = 0.0;
-         
-         // Generate initial satellite constellation
-         generateSatelliteConstellation();
-         
-         // Start the timer for regular updates
-         timer_ = nh_.createTimer(ros::Duration(time_step_), &GpsRaimNode::timerCallback, this);
-         
-         ROS_INFO("GPS RAIM Node initialized");
-     }
-     
-     // Generate a simulated satellite constellation
-     void generateSatelliteConstellation() {
-         satellites_.clear();
-         
-         // Create a constellation of GPS satellites
-         // This is a simplified simulation - in reality, you would use almanac or ephemeris data
-         
-         // We'll create 32 satellites in 6 orbital planes
-         const int num_satellites = 32;
-         const int planes = 6;
-         const double inclination = 55.0 * PI / 180.0;  // 55 degrees
-         const double semi_major_axis = 26559700.0;     // Semi-major axis in meters
-         const double eccentricity = 0.01;              // Eccentricity
-         
-         std::uniform_real_distribution<double> rand_anomaly(0.0, 2.0 * PI);
-         std::normal_distribution<double> rand_clock_bias(0.0, SV_CLOCK_BIAS_SD / C);
-         
-         for (int i = 0; i < num_satellites; ++i) {
-             SatelliteData sat;
-             sat.prn = i + 1;
-             
-             // Calculate orbital parameters
-             int plane = i % planes;
-             double raan = (2.0 * PI * plane) / planes;  // Right Ascension of Ascending Node
-             double mean_anomaly = rand_anomaly(generator_);
-             
-             // Convert mean anomaly to eccentric anomaly (simplified)
-             double eccentric_anomaly = mean_anomaly;
-             for (int j = 0; j < 5; ++j) {  // A few iterations should be enough
-                 eccentric_anomaly = mean_anomaly + eccentricity * sin(eccentric_anomaly);
-             }
-             
-             // Calculate position in orbital plane
-             double x_orbit = semi_major_axis * (cos(eccentric_anomaly) - eccentricity);
-             double y_orbit = semi_major_axis * sin(eccentric_anomaly) * sqrt(1 - eccentricity * eccentricity);
-             
-             // Rotate to ECEF frame
-             double x_temp = x_orbit;
-             double y_temp = y_orbit * cos(inclination);
-             double z_temp = y_orbit * sin(inclination);
-             
-             sat.x = x_temp * cos(raan) - y_temp * sin(raan);
-             sat.y = x_temp * sin(raan) + y_temp * cos(raan);
-             sat.z = z_temp;
-             
-             // Set velocity (simplified)
-             double orbital_velocity = sqrt(MU / semi_major_axis);
-             sat.vx = -orbital_velocity * sin(eccentric_anomaly);
-             sat.vy = orbital_velocity * cos(eccentric_anomaly) * sqrt(1 - eccentricity * eccentricity);
-             sat.vz = 0.0;
-             
-             // Set clock bias and drift
-             sat.clock_bias = rand_clock_bias(generator_);
-             sat.clock_drift = 0.0;  // Simplified: no drift
-             
-             sat.used = true;  // Initially, all satellites are used
-             satellites_.push_back(sat);
-         }
-         
-         // Update pseudoranges
-         updatePseudoranges();
-     }
-     
-     // Update satellite positions and pseudoranges
-     void updateSatellites() {
-         simulation_time_ += time_step_;
-         
-         // Update each satellite's position based on velocity
-         for (auto& sat : satellites_) {
-             // Simple linear motion (in a real implementation, you would use orbital mechanics)
-             sat.x += sat.vx * time_step_;
-             sat.y += sat.vy * time_step_;
-             sat.z += sat.vz * time_step_;
-             
-             // Update clock bias
-             sat.clock_bias += sat.clock_drift * time_step_;
-         }
-         
-         // Update pseudoranges
-         updatePseudoranges();
-     }
-     
-     // Calculate pseudoranges based on true receiver position and satellite positions
-     void updatePseudoranges() {
-         std::normal_distribution<double> noise(0.0, PSEUDORANGE_SD);
-         std::normal_distribution<double> sv_pos_error(0.0, SV_POS_SD);
-         
-         for (auto& sat : satellites_) {
-             // Add small random errors to satellite positions (more realistic)
-             double x_err = sv_pos_error(generator_);
-             double y_err = sv_pos_error(generator_);
-             double z_err = sv_pos_error(generator_);
-             
-             // Calculate true geometric range to actual receiver position
-             double dx = sat.x + x_err - true_receiver_x_;
-             double dy = sat.y + y_err - true_receiver_y_;
-             double dz = sat.z + z_err - true_receiver_z_;
-             double geometric_range = sqrt(dx*dx + dy*dy + dz*dz);
-             
-             // Add satellite clock bias effect
-             double pseudorange = geometric_range + sat.clock_bias * C;
-             
-             // Add measurement noise
-             pseudorange += noise(generator_);
-             
-             sat.pseudorange = pseudorange;
-             
-             // Determine if satellite is visible from receiver
-             // This is a simple elevation mask check
-             double lat, lon, h;
-             ecefToGeodetic(true_receiver_x_, true_receiver_y_, true_receiver_z_, lat, lon, h);
-             
-             // Calculate local ENU coordinates of satellite
-             double e, n, u;
-             ecefToEnu(sat.x, sat.y, sat.z, true_receiver_x_, true_receiver_y_, true_receiver_z_, lat, lon, e, n, u);
-             
-             // Calculate elevation angle
-             double elevation = atan2(u, sqrt(e*e + n*n)) * 180.0 / PI;
-             
-             // Apply elevation mask of 5 degrees
-             if (elevation < 5.0) {
-                 sat.used = false;
-             } else {
-                 sat.used = true;
-             }
-         }
-     }
-     
-     // Perform single point positioning
-     void singlePointPositioning() {
-         // Count the number of satellites being used
-         int num_used_sats = 0;
-         for (const auto& sat : satellites_) {
-             if (sat.used) {
-                 num_used_sats++;
-             }
-         }
-         
-         // We need at least 4 satellites for a solution
-         if (num_used_sats < 4) {
-             ROS_WARN("Not enough satellites for positioning (need at least 4, got %d)", num_used_sats);
-             return;
-         }
-         
-         // Initialize current estimate of receiver position and clock bias
-         Eigen::Vector4d state;
-         state << receiver_state_.x, receiver_state_.y, receiver_state_.z, receiver_state_.clock_bias * C;
-         
-         // Iterative solution (typically converges in a few iterations)
-         for (int iter = 0; iter < 10; ++iter) {
-             Eigen::MatrixXd H(num_used_sats, 4);  // Geometry matrix
-             Eigen::VectorXd z(num_used_sats);     // Measurement residual vector
-             Eigen::VectorXd w(num_used_sats);     // Weights
-             
-             int row = 0;
-             for (const auto& sat : satellites_) {
-                 if (!sat.used) {
-                     continue;
-                 }
-                 
-                 // Calculate predicted pseudorange based on current estimate
-                 double dx = sat.x - state(0);
-                 double dy = sat.y - state(1);
-                 double dz = sat.z - state(2);
-                 double range = sqrt(dx*dx + dy*dy + dz*dz);
-                 double pred_pseudorange = range + state(3);  // Add clock bias
-                 
-                 // Calculate residual
-                 z(row) = sat.pseudorange - pred_pseudorange;
-                 
-                 // Calculate geometry matrix row
-                 H(row, 0) = -dx / range;  // Partial derivative with respect to x
-                 H(row, 1) = -dy / range;  // Partial derivative with respect to y
-                 H(row, 2) = -dz / range;  // Partial derivative with respect to z
-                 H(row, 3) = 1.0;          // Partial derivative with respect to clock bias
-                 
-                 // Set weight (inverse of measurement variance)
-                 w(row) = 1.0 / (PSEUDORANGE_SD * PSEUDORANGE_SD);
-                 
-                 row++;
-             }
-             
-             // Create weight matrix
-             Eigen::MatrixXd W = w.asDiagonal();
-             
-             // Calculate state update using weighted least squares
-             Eigen::MatrixXd H_T_W = H.transpose() * W;
-             Eigen::Matrix4d H_T_W_H_inv = (H_T_W * H).inverse();
-             Eigen::Vector4d delta_state = H_T_W_H_inv * H_T_W * z;
-             
-             // Update state
-             state += delta_state;
-             
-             // Check convergence
-             if (delta_state.norm() < 1e-3) {
-                 // Store the covariance matrix for later use
-                 receiver_state_.covariance = H_T_W_H_inv;
-                 break;
-             }
-         }
-         
-         // Update receiver state
-         receiver_state_.x = state(0);
-         receiver_state_.y = state(1);
-         receiver_state_.z = state(2);
-         receiver_state_.clock_bias = state(3) / C;
-         
-         // Calculate DOP (Dilution of Precision) values
-         calculateDOP();
-     }
-     
-     // Calculate Dilution of Precision values
-     void calculateDOP() {
-         // Count the number of satellites being used
-         int num_used_sats = 0;
-         for (const auto& sat : satellites_) {
-             if (sat.used) {
-                 num_used_sats++;
-             }
-         }
-         
-         if (num_used_sats < 4) {
-             return;  // Can't calculate DOP with fewer than 4
-         }
-         
-         // Convert ECEF to local East-North-Up (ENU)
-         double lat, lon, h;
-         ecefToGeodetic(receiver_state_.x, receiver_state_.y, receiver_state_.z, lat, lon, h);
-         
-         // Rotation matrix from ECEF to ENU
-         Eigen::Matrix3d R_ecef_to_enu;
-         R_ecef_to_enu << -sin(lon), cos(lon), 0,
-                          -sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat),
-                          cos(lat)*cos(lon),  cos(lat)*sin(lon), sin(lat);
-         
-         // Extract position part of covariance
-         Eigen::Matrix3d pos_cov = receiver_state_.covariance.block<3,3>(0,0);
-         
-         // Transform to ENU
-         Eigen::Matrix3d enu_cov = R_ecef_to_enu * pos_cov * R_ecef_to_enu.transpose();
-         
-         // Calculate DOP values
-         receiver_state_.hdop = sqrt(enu_cov(0,0) + enu_cov(1,1));
-         receiver_state_.vdop = sqrt(enu_cov(2,2));
-     }
-     
-     // Perform RAIM fault detection using the chi-square test
-     bool raimFaultDetection() {
-         // Count the number of satellites being used
-         int num_used_sats = 0;
-         for (const auto& sat : satellites_) {
-             if (sat.used) {
-                 num_used_sats++;
-             }
-         }
-         
-         // We need at least 5 satellites for RAIM
-         if (num_used_sats < 5) {
-             ROS_WARN("Not enough satellites for RAIM (need at least 5, got %d)", num_used_sats);
-             receiver_state_.raim_alert = true;
-             receiver_state_.test_statistic = 0.0;
-             return false;
-         }
-         
-         // Create geometry matrix
-         Eigen::MatrixXd H(num_used_sats, 4);
-         Eigen::VectorXd residuals(num_used_sats);
-         
-         int row = 0;
-         for (const auto& sat : satellites_) {
-             if (!sat.used) {
-                 continue;
-             }
-             
-             // Calculate predicted pseudorange
-             double dx = sat.x - receiver_state_.x;
-             double dy = sat.y - receiver_state_.y;
-             double dz = sat.z - receiver_state_.z;
-             double range = sqrt(dx*dx + dy*dy + dz*dz);
-             double pred_pseudorange = range + receiver_state_.clock_bias * C;
-             
-             // Calculate residual
-             residuals(row) = sat.pseudorange - pred_pseudorange;
-             
-             // Fill geometry matrix
-             H(row, 0) = -dx / range;
-             H(row, 1) = -dy / range;
-             H(row, 2) = -dz / range;
-             H(row, 3) = 1.0;
-             
-             row++;
-         }
-         
-         // Calculate the weighted least squares solution matrix
-         Eigen::MatrixXd W = Eigen::MatrixXd::Identity(num_used_sats, num_used_sats) / (PSEUDORANGE_SD * PSEUDORANGE_SD);
-         Eigen::MatrixXd G = (H.transpose() * W * H).inverse() * H.transpose() * W;
-         
-         // Calculate the parity matrix
-         Eigen::MatrixXd P = Eigen::MatrixXd::Identity(num_used_sats, num_used_sats) - H * G;
-         
-         // Calculate SSE (Sum of Squared Errors) in the parity space
-         receiver_state_.test_statistic = residuals.transpose() * W * P * W * residuals;
-         
-         // Degrees of freedom is the redundancy (num_sats - 4)
-         int dof = num_used_sats - 4;
-         
-         // Compare with chi-square threshold
-         receiver_state_.raim_alert = (receiver_state_.test_statistic > CHI_SQUARE_THRESHOLD);
-         
-         return !receiver_state_.raim_alert;
-     }
-     
-     // Calculate protection levels using a rigorous approach based on parity space
-     void calculateProtectionLevels() {
-         // Count the number of satellites being used
-         int num_used_sats = 0;
-         for (const auto& sat : satellites_) {
-             if (sat.used) {
-                 num_used_sats++;
-             }
-         }
-         
-         // We need at least 5 satellites for protection levels
-         if (num_used_sats < 5) {
-             receiver_state_.hpl = 9999.0;  // Set to a very large value
-             receiver_state_.vpl = 9999.0;
-             return;
-         }
-         
-         // Create geometry matrix in ECEF
-         Eigen::MatrixXd H(num_used_sats, 4);
-         
-         int row = 0;
-         for (const auto& sat : satellites_) {
-             if (!sat.used) {
-                 continue;
-             }
-             
-             double dx = sat.x - receiver_state_.x;
-             double dy = sat.y - receiver_state_.y;
-             double dz = sat.z - receiver_state_.z;
-             double range = sqrt(dx*dx + dy*dy + dz*dz);
-             
-             H(row, 0) = -dx / range;
-             H(row, 1) = -dy / range;
-             H(row, 2) = -dz / range;
-             H(row, 3) = 1.0;
-             
-             row++;
-         }
-         
-         // Weight matrix (assuming equal weights for simplicity)
-         double sigma2 = PSEUDORANGE_SD * PSEUDORANGE_SD;
-         Eigen::MatrixXd W = Eigen::MatrixXd::Identity(num_used_sats, num_used_sats) / sigma2;
-         
-         // Calculate the least squares solution matrix
-         Eigen::Matrix4d G = (H.transpose() * W * H).inverse() * H.transpose() * W;
-         
-         // Calculate the parity matrix
-         Eigen::MatrixXd P = Eigen::MatrixXd::Identity(num_used_sats, num_used_sats) - H * G;
-         
-         // Convert ECEF to geodetic coordinates
-         double lat, lon, h;
-         ecefToGeodetic(receiver_state_.x, receiver_state_.y, receiver_state_.z, lat, lon, h);
-         
-         // Create rotation matrix from ECEF to local ENU frame
-         Eigen::Matrix3d R_ecef_to_enu;
-         R_ecef_to_enu << -sin(lon), cos(lon), 0,
-                          -sin(lat)*cos(lon), -sin(lat)*sin(lon), cos(lat),
-                          cos(lat)*cos(lon),  cos(lat)*sin(lon), sin(lat);
-         
-         // Calculate slopes for each satellite
-         std::vector<double> h_slopes(num_used_sats);
-         std::vector<double> v_slopes(num_used_sats);
-         
-         for (int i = 0; i < num_used_sats; ++i) {
-             // Extract the i-th column of G (sensitivity of position to measurement i)
-             Eigen::Vector4d g_i = G.col(i);
-             
-             // Transform position error to local ENU frame
-             Eigen::Vector3d delta_enu = R_ecef_to_enu * g_i.head<3>();
-             
-             // Calculate horizontal and vertical components
-             double delta_h = sqrt(delta_enu(0)*delta_enu(0) + delta_enu(1)*delta_enu(1));
-             double delta_v = fabs(delta_enu(2));
-             
-             // Extract the i-th column of P (sensitivity of parity vector to measurement i)
-             Eigen::VectorXd p_i = P.col(i);
-             
-             // Calculate the magnitude of the parity vector component
-             double p_i_norm = p_i.norm();
-             
-             // Calculate slopes (only if p_i_norm is not too small to avoid division by zero)
-             if (p_i_norm > 1e-10) {
-                 h_slopes[i] = delta_h / p_i_norm;
-                 v_slopes[i] = delta_v / p_i_norm;
-             } else {
-                 h_slopes[i] = 0.0;
-                 v_slopes[i] = 0.0;
-             }
-         }
-         
-         // Find maximum slopes
-         double max_h_slope = *std::max_element(h_slopes.begin(), h_slopes.end());
-         double max_v_slope = *std::max_element(v_slopes.begin(), v_slopes.end());
-         
-         // Calculate the non-centrality parameter for the chi-square distribution
-         // based on the probability of missed detection (pmd_)
-         int dof = num_used_sats - 4;  // Degrees of freedom
-         
-         // These constants are derived from statistical tables
-         // For a given Pmd and Pfa, these represent the non-centrality parameter
-         // of the chi-square distribution
-         const double K_hpl = 6.0;  // For horizontal protection level
-         const double K_vpl = 5.33; // For vertical protection level
-         
-         // Calculate protection levels
-         receiver_state_.hpl = K_hpl * max_h_slope * PSEUDORANGE_SD;
-         receiver_state_.vpl = K_vpl * max_v_slope * PSEUDORANGE_SD;
-         
-         // Alternative approach: calculate HPL using the position covariance
-         Eigen::Matrix3d enu_cov = R_ecef_to_enu * receiver_state_.covariance.block<3,3>(0,0) * R_ecef_to_enu.transpose();
-         
-         // Calculate semi-major axis of horizontal error ellipse
-         double a = enu_cov(0,0);
-         double b = enu_cov(0,1);
-         double c = enu_cov(1,1);
-         double discriminant = sqrt((a-c)*(a-c) + 4*b*b);
-         double eigenvalue1 = (a+c+discriminant)/2;
-         double eigenvalue2 = (a+c-discriminant)/2;
-         double semi_major = sqrt(std::max(eigenvalue1, eigenvalue2));
-         
-         // Use the larger of the two methods for HPL
-         double hpl_alt = K_hpl * semi_major;
-         receiver_state_.hpl = std::max(receiver_state_.hpl, hpl_alt);
-     }
-     
-     // Convert ECEF coordinates to geodetic (latitude, longitude, height)
-     void ecefToGeodetic(double x, double y, double z, double& lat, double& lon, double& h) {
-         // Calculate longitude
-         lon = atan2(y, x);
-         
-         // Initial values
-         double p = sqrt(x*x + y*y);
-         double theta = atan2(z*WGS84_a, p*WGS84_a*(1-WGS84_f));
-         
-         // Iterative calculation
-         double N, lat_prev;
-         lat = atan2(z + WGS84_e2*WGS84_a*sin(theta)*sin(theta)*sin(theta),
-                    p - WGS84_e2*WGS84_a*cos(theta)*cos(theta)*cos(theta));
-         
-         do {
-             lat_prev = lat;
-             N = WGS84_a / sqrt(1 - WGS84_e2*sin(lat)*sin(lat));
-             h = p/cos(lat) - N;
-             lat = atan2(z, p*(1-WGS84_e2*N/(N+h)));
-         } while (fabs(lat - lat_prev) > 1e-12);
-     }
-     
-     // Convert ECEF to ENU coordinates relative to a reference point
-     void ecefToEnu(double x, double y, double z, double ref_x, double ref_y, double ref_z, 
-                   double ref_lat, double ref_lon, double& e, double& n, double& u) {
-         // Compute the delta in ECEF
-         double dx = x - ref_x;
-         double dy = y - ref_y;
-         double dz = z - ref_z;
-         
-         // Compute the transformation matrix
-         double sin_lat = sin(ref_lat);
-         double cos_lat = cos(ref_lat);
-         double sin_lon = sin(ref_lon);
-         double cos_lon = cos(ref_lon);
-         
-         // ENU components
-         e = -sin_lon*dx + cos_lon*dy;
-         n = -sin_lat*cos_lon*dx - sin_lat*sin_lon*dy + cos_lat*dz;
-         u = cos_lat*cos_lon*dx + cos_lat*sin_lon*dy + sin_lat*dz;
-     }
-     
-     // Convert geodetic coordinates to ECEF
-     void geodeticToEcef(double lat, double lon, double h, double& x, double& y, double& z) {
-         double N = WGS84_a / sqrt(1 - WGS84_e2 * sin(lat) * sin(lat));
-         
-         x = (N + h) * cos(lat) * cos(lon);
-         y = (N + h) * cos(lat) * sin(lon);
-         z = (N * (1 - WGS84_e2) + h) * sin(lat);
-     }
-     
-     // Publish the position results
-     void publishResults() {
-         ros::Time now = ros::Time::now();
-         
-         // Convert ECEF to geodetic coordinates
-         double lat, lon, h;
-         ecefToGeodetic(receiver_state_.x, receiver_state_.y, receiver_state_.z, lat, lon, h);
-         
-         // Publish NavSatFix message
-         sensor_msgs::NavSatFix navsat_msg;
-         navsat_msg.header.stamp = now;
-         navsat_msg.header.frame_id = "gps";
-         navsat_msg.latitude = lat * 180.0 / PI;
-         navsat_msg.longitude = lon * 180.0 / PI;
-         navsat_msg.altitude = h;
-         
-         // Set covariance
-         navsat_msg.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_KNOWN;
-         
-         // Convert ECEF covariance to geodetic
-         // This is a simplification - a proper transformation would be more complex
-         navsat_msg.position_covariance[0] = receiver_state_.covariance(0,0);  // lat-lat
-         navsat_msg.position_covariance[4] = receiver_state_.covariance(1,1);  // lon-lon
-         navsat_msg.position_covariance[8] = receiver_state_.covariance(2,2);  // alt-alt
-         
-         // Set status based on RAIM
-         if (receiver_state_.raim_alert) {
-             navsat_msg.status.status = sensor_msgs::NavSatStatus::STATUS_NO_FIX;
-         } else {
-             navsat_msg.status.status = sensor_msgs::NavSatStatus::STATUS_FIX;
-         }
-         navsat_msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
-         
-         navsat_pub_.publish(navsat_msg);
-         
-         // Publish PoseWithCovariance message
-         geometry_msgs::PoseWithCovarianceStamped pose_msg;
-         pose_msg.header.stamp = now;
-         pose_msg.header.frame_id = "map";
-         
-         pose_msg.pose.pose.position.x = receiver_state_.x;
-         pose_msg.pose.pose.position.y = receiver_state_.y;
-         pose_msg.pose.pose.position.z = receiver_state_.z;
-         
-         // Identity quaternion (no rotation information in GPS)
-         pose_msg.pose.pose.orientation.w = 1.0;
-         pose_msg.pose.pose.orientation.x = 0.0;
-         pose_msg.pose.pose.orientation.y = 0.0;
-         pose_msg.pose.pose.orientation.z = 0.0;
-         
-         // Copy covariance
-         for (int i = 0; i < 3; ++i) {
-             for (int j = 0; j < 3; ++j) {
-                 pose_msg.pose.covariance[6*i + j] = receiver_state_.covariance(i,j);
-             }
-         }
-         
-         position_pub_.publish(pose_msg);
-         
-         // Print debug information
-         ROS_INFO("Position: %.3f, %.3f, %.3f (ECEF)", 
-                  receiver_state_.x, receiver_state_.y, receiver_state_.z);
-         ROS_INFO("Position: %.6f, %.6f, %.3f (LLH)", 
-                  lat * 180.0 / PI, lon * 180.0 / PI, h);
-         ROS_INFO("Clock Bias: %.3f ms", receiver_state_.clock_bias * 1000.0);
-         ROS_INFO("HDOP: %.2f, VDOP: %.2f", receiver_state_.hdop, receiver_state_.vdop);
-         ROS_INFO("HPL: %.2f m, VPL: %.2f m", receiver_state_.hpl, receiver_state_.vpl);
-         ROS_INFO("RAIM Test Statistic: %.2f (Threshold: %.2f)", 
-                  receiver_state_.test_statistic, CHI_SQUARE_THRESHOLD);
-         ROS_INFO("RAIM Alert: %s", receiver_state_.raim_alert ? "YES" : "NO");
-         ROS_INFO("Satellites used: %d/%d\n", 
-                  std::count_if(satellites_.begin(), satellites_.end(), 
-                               [](const SatelliteData& s) { return s.used; }),
-                  satellites_.size());
-     }
-     
-     // Timer callback function
-     void timerCallback(const ros::TimerEvent&) {
-         // Update satellite positions and pseudoranges
-         updateSatellites();
-         
-         // Perform single point positioning
-         singlePointPositioning();
-         
-         // Perform RAIM fault detection
-         raimFaultDetection();
-         
-         // Calculate protection levels
-         calculateProtectionLevels();
-         
-         // Publish the results
-         publishResults();
-     }
-     
-     // Simulate a faulty satellite
-     void simulateFaultySatellite(int prn, double error) {
-         for (auto& sat : satellites_) {
-             if (sat.prn == prn) {
-                 sat.pseudorange += error;
-                 ROS_INFO("Simulated fault of %.2f meters applied to PRN %d", error, prn);
-                 break;
-             }
-         }
-     }
- };
- 
- int main(int argc, char** argv) {
-     ros::init(argc, argv, "gps_raim_node");
-     ros::NodeHandle nh;
-     
-     GpsRaimNode node(nh);
-     
-     ros::spin();
-     
-     return 0;
- }
+class GPSRAIMNode {
+private:
+    // ROS handles
+    ros::NodeHandle nh_;
+    ros::Publisher raim_results_pub_;
+    ros::Publisher protection_level_pub_;
+    ros::Publisher simulated_gps_pub_;
+    ros::Publisher satellite_viz_pub_;
+    ros::Publisher position_viz_pub_;
+    ros::Publisher protection_level_viz_pub_;
+    ros::Publisher pose_with_cov_pub_;
+    ros::Publisher path_pub_;
+    ros::Timer simulation_timer_;
+    tf2_ros::TransformBroadcaster tf_broadcaster_;
+
+    // RAIM parameters
+    double chi_square_threshold_;
+    double alarm_limit_;
+    double prob_false_alarm_; 
+    double prob_missed_detection_; 
+    int min_satellites_for_raim_;
+    
+    // Visualization parameters
+    std::string fixed_frame_;
+    std::string user_frame_;
+    
+    // Satellite information
+    struct SatelliteInfo {
+        Eigen::Vector3d position_ecef;
+        double pseudorange;
+        double elevation;
+        double azimuth;
+        int id;
+        bool is_faulty;
+    };
+    std::vector<SatelliteInfo> satellites_;
+
+    // Circular trajectory parameters
+    double trajectory_radius_m_;
+    double trajectory_speed_mps_;
+    double trajectory_angular_velocity_rad_s_;
+    double trajectory_center_lat_deg_;
+    double trajectory_center_lon_deg_;
+    double trajectory_center_alt_m_;
+    double trajectory_angle_rad_;
+    Eigen::Vector3d trajectory_center_ecef_;
+    
+    // Path history for visualization
+    nav_msgs::Path path_;
+    std::deque<geometry_msgs::PoseStamped> pose_history_;
+    int max_path_history_;
+
+    // Simulation parameters
+    double simulation_rate_hz_;
+    double noise_stddev_m_;
+    double failure_probability_;
+    double failure_magnitude_m_;
+    int num_satellites_;
+    int satellite_failure_idx_;
+    bool force_satellite_failure_;
+    
+    // Constants
+    const double DEG_TO_RAD = M_PI / 180.0;
+    const double RAD_TO_DEG = 180.0 / M_PI;
+    const double EARTH_RADIUS_M = 6371000.0;
+    const double SPEED_OF_LIGHT = 299792458.0; // m/s
+    
+    // User position and protection levels
+    Eigen::Vector3d true_position_ecef_;
+    Eigen::Vector3d estimated_position_ecef_;
+    double horizontal_protection_level_;
+    double vertical_protection_level_;
+    
+    // Previous trajectory center ENU for creating consistent paths
+    Eigen::Vector3d previous_center_enu_;
+    bool first_update_;
+    
+    // Random number generators
+    std::mt19937 gen_;
+    std::uniform_real_distribution<double> uniform_dist_;
+    std::normal_distribution<double> normal_dist_;
+    
+    // Student-t distribution values for different confidence levels
+    std::map<double, double> t_distribution_values_;
+
+public:
+    GPSRAIMNode() : nh_("~"), tf_broadcaster_() {
+        // Load parameters
+        loadParameters();
+        
+        // Initialize t-distribution values for different confidence levels
+        initializeStatisticalValues();
+        
+        // Initialize random number generators
+        std::random_device rd;
+        gen_ = std::mt19937(rd());
+        uniform_dist_ = std::uniform_real_distribution<double>(0.0, 1.0);
+        normal_dist_ = std::normal_distribution<double>(0.0, noise_stddev_m_);
+        
+        // Set up publishers
+        raim_results_pub_ = nh_.advertise<std_msgs::Float64MultiArray>("raim_results", 10);
+        protection_level_pub_ = nh_.advertise<std_msgs::Float64MultiArray>("protection_levels", 10);
+        satellite_viz_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("satellite_markers", 10);
+        position_viz_pub_ = nh_.advertise<visualization_msgs::Marker>("position_marker", 10);
+        protection_level_viz_pub_ = nh_.advertise<visualization_msgs::Marker>("protection_level_marker", 10);
+        pose_with_cov_pub_ = nh_.advertise<geometry_msgs::PoseWithCovariance>("gps_pose_with_covariance", 10);
+        path_pub_ = nh_.advertise<nav_msgs::Path>("gps_path", 10);
+        simulated_gps_pub_ = nh_.advertise<sensor_msgs::NavSatFix>("simulated_gps", 10);
+        
+        // Initialize trajectory angle
+        trajectory_angle_rad_ = 0.0;
+        
+        // Calculate trajectory center in ECEF
+        trajectory_center_ecef_ = geodeticToECEF(
+            trajectory_center_lat_deg_ * DEG_TO_RAD, 
+            trajectory_center_lon_deg_ * DEG_TO_RAD, 
+            trajectory_center_alt_m_);
+        
+        // Initialize user position at the start of the circular trajectory
+        updateUserPosition();
+        estimated_position_ecef_ = true_position_ecef_;
+        
+        // Initialize protection levels
+        horizontal_protection_level_ = 0.0;
+        vertical_protection_level_ = 0.0;
+        
+        // Initialize path history
+        path_.header.frame_id = fixed_frame_;
+        max_path_history_ = 500;
+        first_update_ = true;
+        
+        // Start simulation timer after initialization
+        simulation_timer_ = nh_.createTimer(ros::Duration(1.0/simulation_rate_hz_), 
+                                          &GPSRAIMNode::simulationCallback, this);
+        
+        ROS_INFO("GPS RAIM node initialized with circular trajectory");
+        ROS_INFO("Trajectory center: Lat=%.6f°, Lon=%.6f°, Alt=%.1fm, Radius=%.1fm", 
+                trajectory_center_lat_deg_, trajectory_center_lon_deg_, 
+                trajectory_center_alt_m_, trajectory_radius_m_);
+    }
+
+    void loadParameters() {
+        // RAIM parameters
+        nh_.param<double>("chi_square_threshold", chi_square_threshold_, 5.99); 
+        nh_.param<double>("alarm_limit", alarm_limit_, 100.0); // meters
+        nh_.param<double>("prob_false_alarm", prob_false_alarm_, 0.05); 
+        nh_.param<double>("prob_missed_detection", prob_missed_detection_, 0.001);
+        nh_.param<int>("min_satellites_for_raim", min_satellites_for_raim_, 5);
+        
+        // Visualization parameters
+        nh_.param<std::string>("fixed_frame", fixed_frame_, "world");
+        nh_.param<std::string>("user_frame", user_frame_, "gps_user");
+        
+        // Circular trajectory parameters
+        nh_.param<double>("trajectory_radius_m", trajectory_radius_m_, 100.0);
+        nh_.param<double>("trajectory_speed_mps", trajectory_speed_mps_, 5.0);
+        nh_.param<double>("trajectory_center_lat_deg", trajectory_center_lat_deg_, 40.0);
+        nh_.param<double>("trajectory_center_lon_deg", trajectory_center_lon_deg_, -75.0);
+        nh_.param<double>("trajectory_center_alt_m", trajectory_center_alt_m_, 100.0);
+        
+        // Calculate angular velocity from speed and radius
+        trajectory_angular_velocity_rad_s_ = trajectory_speed_mps_ / trajectory_radius_m_;
+        
+        // Simulation parameters
+        nh_.param<double>("simulation_rate_hz", simulation_rate_hz_, 10.0);
+        nh_.param<double>("noise_stddev_m", noise_stddev_m_, 5.0);
+        nh_.param<double>("failure_probability", failure_probability_, 0.1);
+        nh_.param<double>("failure_magnitude_m", failure_magnitude_m_, 30.0);
+        nh_.param<int>("num_satellites", num_satellites_, 8);
+        
+        // Satellite failure parameters
+        nh_.param<bool>("force_satellite_failure", force_satellite_failure_, false);
+        nh_.param<int>("satellite_failure_idx", satellite_failure_idx_, 0);
+    }
+    
+    void initializeStatisticalValues() {
+        // Student-t distribution values for different confidence levels
+        t_distribution_values_[0.5] = 0.674;    // 50% confidence
+        t_distribution_values_[0.95] = 1.96;    // 95% confidence
+        t_distribution_values_[0.99] = 2.576;   // 99% confidence
+        t_distribution_values_[0.999] = 3.291;  // 99.9% confidence
+        t_distribution_values_[0.9999] = 3.891; // 99.99% confidence
+    }
+    
+    void simulationCallback(const ros::TimerEvent& event) {
+        // Update user position along circular trajectory
+        updateUserPosition();
+        
+        // Generate and place satellites around user
+        generateSatelliteConstellation();
+        
+        // Perform RAIM and calculate protection levels
+        runRAIMAndCalculateProtectionLevels();
+        
+        // Visualize everything
+        visualize();
+        
+        // Publish GPS data
+        publishGPSData();
+        
+        // Update and publish path
+        updatePath();
+        
+        // Broadcast TF transform for the user position
+        broadcastTransform();
+    }
+    
+    void updateUserPosition() {
+        // Update angle based on angular velocity
+        trajectory_angle_rad_ += trajectory_angular_velocity_rad_s_ / simulation_rate_hz_;
+        if (trajectory_angle_rad_ > 2 * M_PI) {
+            trajectory_angle_rad_ -= 2 * M_PI;
+        }
+        
+        // Get center coordinates in geodetic for local frame calculations
+        double center_lat, center_lon, center_alt;
+        ECEFToGeodetic(trajectory_center_ecef_, center_lat, center_lon, center_alt);
+        
+        // Calculate position offset in local ENU frame
+        double east = trajectory_radius_m_ * cos(trajectory_angle_rad_);
+        double north = trajectory_radius_m_ * sin(trajectory_angle_rad_);
+        
+        // Convert ENU offset to ECEF
+        Eigen::Vector3d enu_offset(east, north, 0.0);
+        true_position_ecef_ = ENUToECEF(enu_offset, trajectory_center_ecef_, center_lat, center_lon);
+        
+        // For the first update, set previous center ENU
+        if (first_update_) {
+            previous_center_enu_ = Eigen::Vector3d(0, 0, 0);
+            first_update_ = false;
+        }
+    }
+    
+    void generateSatelliteConstellation() {
+        satellites_.clear();
+        
+        // Get user position in geodetic for local frame calculations
+        double user_lat, user_lon, user_alt;
+        ECEFToGeodetic(true_position_ecef_, user_lat, user_lon, user_alt);
+        
+        for (int i = 0; i < num_satellites_; i++) {
+            SatelliteInfo sat;
+            
+            // Distribute satellites in sky with good geometry
+            sat.azimuth = 360.0 * i / num_satellites_ + 10.0 * normal_dist_(gen_) / noise_stddev_m_;
+            sat.elevation = 20.0 + 60.0 * uniform_dist_(gen_); // Elevations between 20° and 80°
+            
+            // Calculate satellite position in ECEF
+            double sat_distance = EARTH_RADIUS_M + 20200000.0; // GPS orbit ~20,200 km
+            
+            // Convert satellite azimuth and elevation to local ENU coordinates
+            double x = sat_distance * cos(sat.elevation * DEG_TO_RAD) * cos(sat.azimuth * DEG_TO_RAD);
+            double y = sat_distance * cos(sat.elevation * DEG_TO_RAD) * sin(sat.azimuth * DEG_TO_RAD);
+            double z = sat_distance * sin(sat.elevation * DEG_TO_RAD);
+            
+            // Convert local ENU to ECEF for satellite position
+            Eigen::Vector3d sat_enu(x, y, z);
+            sat.position_ecef = ENUToECEF(sat_enu, true_position_ecef_, user_lat, user_lon);
+            
+            // Calculate true range
+            double true_range = (sat.position_ecef - true_position_ecef_).norm();
+            
+            // Add noise to the pseudorange
+            double noise = normal_dist_(gen_);
+            
+            // Possibility of adding a satellite failure
+            sat.is_faulty = false;
+            
+            // Apply forced satellite failure or random failures
+            if (force_satellite_failure_ && i == satellite_failure_idx_) {
+                noise += failure_magnitude_m_;
+                sat.is_faulty = true;
+                ROS_DEBUG("Forced failure on satellite %d with magnitude %.2f meters", i+1, failure_magnitude_m_);
+            }
+            else if (!force_satellite_failure_ && uniform_dist_(gen_) < failure_probability_) {
+                noise += (uniform_dist_(gen_) > 0.5 ? 1 : -1) * failure_magnitude_m_;
+                sat.is_faulty = true;
+                ROS_DEBUG("Satellite %d has simulated failure of %.2f meters", i+1, noise);
+            }
+            
+            sat.pseudorange = true_range + noise;
+            sat.id = i + 1; // PRN numbers starting from 1
+            
+            satellites_.push_back(sat);
+        }
+    }
+    
+    void runRAIMAndCalculateProtectionLevels() {
+        // Extract satellite data
+        std::vector<Eigen::Vector3d> sat_positions;
+        std::vector<double> pseudoranges;
+        std::vector<int> satellite_ids;
+        
+        for (const auto& sat : satellites_) {
+            sat_positions.push_back(sat.position_ecef);
+            pseudoranges.push_back(sat.pseudorange);
+            satellite_ids.push_back(sat.id);
+        }
+        
+        // Check if we have enough satellites for RAIM
+        if (sat_positions.size() < min_satellites_for_raim_) {
+            ROS_WARN("Not enough satellites for RAIM: %zu (minimum %d required)",
+                    sat_positions.size(), min_satellites_for_raim_);
+            return;
+        }
+        
+        // Initial position estimate (needed for linearization)
+        Eigen::Vector4d user_state = Eigen::Vector4d::Zero(); // x, y, z, clock_bias
+        user_state.head(3) = estimated_position_ecef_; // Use previous estimate
+        
+        // Weighted least-squares position estimation
+        Eigen::Vector4d estimated_state;
+        Eigen::MatrixXd geometry_matrix;
+        Eigen::MatrixXd weight_matrix;
+        bool convergence = estimatePositionWeightedLeastSquares(
+            sat_positions, pseudoranges, user_state, estimated_state, geometry_matrix, weight_matrix);
+        
+        if (!convergence) {
+            ROS_WARN("Position estimation did not converge");
+            return;
+        }
+        
+        // Extract position and clock bias
+        estimated_position_ecef_ = estimated_state.head(3);
+        double clock_bias = estimated_state(3);
+        
+        // Calculate residuals and test statistic for RAIM
+        Eigen::VectorXd residuals;
+        double test_statistic = calculateRAIMResiduals(
+            sat_positions, pseudoranges, estimated_state, geometry_matrix, weight_matrix, residuals);
+        
+        // Determine if RAIM detected a failure
+        bool raim_failure = test_statistic > chi_square_threshold_;
+        
+        // Calculate position covariance
+        Eigen::MatrixXd covariance = calculatePositionCovariance(geometry_matrix, weight_matrix);
+        
+        // Calculate protection levels
+        calculateRigorousProtectionLevels(
+            geometry_matrix, covariance, weight_matrix, 
+            horizontal_protection_level_, vertical_protection_level_);
+        
+        // Check if protection levels exceed alarm limits
+        bool integrity_available = horizontal_protection_level_ <= alarm_limit_ && 
+                                  vertical_protection_level_ <= alarm_limit_;
+        
+        // Publish RAIM results
+        std_msgs::Float64MultiArray raim_msg;
+        raim_msg.data.push_back(test_statistic);
+        raim_msg.data.push_back(raim_failure ? 1.0 : 0.0);
+        raim_msg.data.push_back(integrity_available ? 1.0 : 0.0);
+        raim_results_pub_.publish(raim_msg);
+        
+        // Publish protection levels
+        std_msgs::Float64MultiArray pl_msg;
+        pl_msg.data.push_back(horizontal_protection_level_);
+        pl_msg.data.push_back(vertical_protection_level_);
+        protection_level_pub_.publish(pl_msg);
+        
+        // Publish position with covariance for RVIZ
+        publishPositionWithCovariance(estimated_position_ecef_, covariance);
+        
+        // Calculate actual position error
+        double position_error = (estimated_position_ecef_ - true_position_ecef_).norm();
+        
+        ROS_INFO("RAIM Results: TS=%.2f (Threshold=%.2f), Failure=%s, HPL=%.2f m, VPL=%.2f m, Error=%.2f m",
+                test_statistic, chi_square_threshold_, 
+                raim_failure ? "TRUE" : "FALSE",
+                horizontal_protection_level_, vertical_protection_level_,
+                position_error);
+        
+        // Perform fault exclusion if failure detected
+        if (raim_failure && sat_positions.size() > min_satellites_for_raim_) {
+            performFaultExclusion(sat_positions, pseudoranges, satellite_ids, estimated_state);
+        }
+    }
+    
+    bool estimatePositionWeightedLeastSquares(
+            const std::vector<Eigen::Vector3d>& sat_positions,
+            const std::vector<double>& pseudoranges,
+            const Eigen::Vector4d& initial_state,
+            Eigen::Vector4d& estimated_state,
+            Eigen::MatrixXd& geometry_matrix,
+            Eigen::MatrixXd& weight_matrix) {
+        
+        const int max_iterations = 10;
+        const double convergence_threshold = 0.01; // meters
+        
+        estimated_state = initial_state;
+        
+        if (estimated_state.head(3).norm() < 1.0) {
+            // If initial position is at origin, use a better initial guess
+            estimated_state.head(3) = true_position_ecef_; // In simulation we know the true position
+        }
+        
+        // Setup weight matrix based on satellite elevations
+        weight_matrix.resize(sat_positions.size(), sat_positions.size());
+        weight_matrix.setZero();
+        
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            // Current position estimate
+            Eigen::Vector3d position = estimated_state.head(3);
+            double clock_bias = estimated_state(3);
+            
+            // Setup geometry matrix (G matrix)
+            geometry_matrix.resize(sat_positions.size(), 4);
+            Eigen::VectorXd predicted_ranges(sat_positions.size());
+            Eigen::VectorXd delta_ranges(sat_positions.size());
+            
+            // Re-calculate weights based on satellite elevations
+            for (size_t i = 0; i < sat_positions.size(); ++i) {
+                Eigen::Vector3d sat_pos = sat_positions[i];
+                
+                // Calculate geometric range
+                Eigen::Vector3d difference = sat_pos - position;
+                double range = difference.norm();
+                predicted_ranges(i) = range + clock_bias;
+                
+                // Calculate line-of-sight vector
+                Eigen::Vector3d los = difference / range;
+                
+                // Fill geometry matrix row
+                geometry_matrix.row(i) << -los.transpose(), 1.0;
+                
+                // Calculate difference between measured and predicted pseudorange
+                delta_ranges(i) = pseudoranges[i] - predicted_ranges(i);
+                
+                // Calculate elevation angle for weighting
+                // Convert ECEF position to geodetic
+                double lat, lon, alt;
+                ECEFToGeodetic(position, lat, lon, alt);
+                
+                // Calculate local East-North-Up (ENU) coordinates for the satellite
+                Eigen::Vector3d sat_enu = ECEFToENU(sat_pos, position, lat, lon);
+                
+                // Calculate elevation angle
+                double elevation = atan2(sat_enu(2), sqrt(sat_enu(0)*sat_enu(0) + sat_enu(1)*sat_enu(1)));
+                
+                // Set weight based on elevation (sin^2(elevation) model)
+                double sin_elev = sin(elevation);
+                weight_matrix(i, i) = sin_elev * sin_elev;
+                
+                // Minimum weight for numerical stability
+                if (weight_matrix(i, i) < 0.01) weight_matrix(i, i) = 0.01;
+            }
+            
+            // Solve for state update using weighted least squares
+            // (G^T * W * G)^-1 * G^T * W * delta_ranges
+            Eigen::Vector4d delta_state;
+            delta_state = (geometry_matrix.transpose() * weight_matrix * geometry_matrix).inverse() 
+                         * geometry_matrix.transpose() * weight_matrix * delta_ranges;
+            
+            // Update state
+            estimated_state += delta_state;
+            
+            // Check for convergence
+            if (delta_state.head(3).norm() < convergence_threshold) {
+                return true; // Converged
+            }
+        }
+        
+        ROS_WARN("Position estimation did not converge within %d iterations", max_iterations);
+        return false;
+    }
+    
+    double calculateRAIMResiduals(
+            const std::vector<Eigen::Vector3d>& sat_positions,
+            const std::vector<double>& pseudoranges,
+            const Eigen::Vector4d& estimated_state,
+            const Eigen::MatrixXd& geometry_matrix,
+            const Eigen::MatrixXd& weight_matrix,
+            Eigen::VectorXd& residuals) {
+        
+        Eigen::Vector3d position = estimated_state.head(3);
+        double clock_bias = estimated_state(3);
+        
+        // Calculate predicted pseudoranges based on estimated position
+        Eigen::VectorXd predicted_ranges(sat_positions.size());
+        for (size_t i = 0; i < sat_positions.size(); ++i) {
+            predicted_ranges(i) = (sat_positions[i] - position).norm() + clock_bias;
+        }
+        
+        // Calculate residuals (measured minus predicted)
+        Eigen::VectorXd delta_ranges(sat_positions.size());
+        for (size_t i = 0; i < sat_positions.size(); ++i) {
+            delta_ranges(i) = pseudoranges[i] - predicted_ranges(i);
+        }
+        
+        // Calculate weighted least-squares solution
+        Eigen::MatrixXd G_W_Ginv = (geometry_matrix.transpose() * weight_matrix * geometry_matrix).inverse();
+        Eigen::MatrixXd hat_matrix = geometry_matrix * G_W_Ginv * geometry_matrix.transpose() * weight_matrix;
+        
+        // Calculate the residual matrix S = I - hat_matrix
+        Eigen::MatrixXd S = Eigen::MatrixXd::Identity(sat_positions.size(), sat_positions.size()) - hat_matrix;
+        
+        // Calculate the residuals vector
+        residuals = S * delta_ranges;
+        
+        // Calculate the test statistic (weighted sum of squared residuals)
+        // Normalized by degrees of freedom
+        double weighted_ssr = residuals.transpose() * weight_matrix * residuals;
+        int dof = sat_positions.size() - 4; // 4 unknowns (x, y, z, clock bias)
+        double test_statistic = weighted_ssr / dof;
+        
+        return test_statistic;
+    }
+    
+    Eigen::MatrixXd calculatePositionCovariance(
+            const Eigen::MatrixXd& geometry_matrix,
+            const Eigen::MatrixXd& weight_matrix) {
+        
+        // Calculate covariance matrix using weighted least squares formula
+        // Cov = (G^T * W * G)^-1
+        Eigen::MatrixXd covariance = (geometry_matrix.transpose() * weight_matrix * geometry_matrix).inverse();
+        
+        // Scale by estimated measurement variance 
+        // In a real implementation, you would estimate this from the residuals
+        double estimated_variance = noise_stddev_m_ * noise_stddev_m_;
+        covariance *= estimated_variance;
+        
+        return covariance;
+    }
+    
+    void calculateRigorousProtectionLevels(
+            const Eigen::MatrixXd& geometry_matrix,
+            const Eigen::MatrixXd& covariance,
+            const Eigen::MatrixXd& weight_matrix,
+            double& horizontal_protection_level,
+            double& vertical_protection_level) {
+        
+        // Convert current ECEF position to geodetic for local frame rotation
+        double user_lat, user_lon, user_alt;
+        ECEFToGeodetic(estimated_position_ecef_, user_lat, user_lon, user_alt);
+        
+        // Create rotation matrix from ECEF to ENU
+        Eigen::Matrix3d R_ecef_to_enu = createRotationMatrix(user_lat, user_lon);
+        
+        // Transform position covariance to local ENU frame
+        Eigen::Matrix3d position_cov_ecef = covariance.block<3,3>(0,0);
+        Eigen::Matrix3d position_cov_enu = R_ecef_to_enu * position_cov_ecef * R_ecef_to_enu.transpose();
+        
+        // Extract horizontal (east-north) covariance
+        Eigen::Matrix2d horizontal_cov = position_cov_enu.block<2,2>(0,0);
+        
+        // Compute eigenvalues for semi-major and semi-minor axes
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eigen_solver(horizontal_cov);
+        Eigen::Vector2d eigenvalues = eigen_solver.eigenvalues();
+        double semi_major_axis = sqrt(eigenvalues(1)); // Largest eigenvalue
+        double semi_minor_axis = sqrt(eigenvalues(0)); // Smallest eigenvalue
+        
+        // Vertical component (height error)
+        double vertical_std = sqrt(position_cov_enu(2,2));
+        
+        // Get multiplier based on probability of missed detection
+        double k_md = getMultiplierForProbability(1.0 - prob_missed_detection_);
+        double k_fa = getMultiplierForProbability(1.0 - prob_false_alarm_);
+        
+        // Calculate basic protection levels
+        horizontal_protection_level = k_md * semi_major_axis;
+        vertical_protection_level = k_md * vertical_std;
+        
+        // Account for potential undetected biases using slope parameters
+        std::vector<double> horizontal_slopes;
+        std::vector<double> vertical_slopes;
+        
+        int num_sats = geometry_matrix.rows();
+        for (int i = 0; i < num_sats; ++i) {
+            // Create the sensitivity vector for this satellite
+            Eigen::Vector4d sensitivity = G_inverse_row(geometry_matrix, weight_matrix, i);
+            
+            // Transform the position part to ENU
+            Eigen::Vector3d sensitivity_pos_ecef = sensitivity.head(3);
+            Eigen::Vector3d sensitivity_pos_enu = R_ecef_to_enu * sensitivity_pos_ecef;
+            
+            // For horizontal, use the east-north components
+            double h_slope = sqrt(sensitivity_pos_enu(0)*sensitivity_pos_enu(0) + 
+                                 sensitivity_pos_enu(1)*sensitivity_pos_enu(1));
+            horizontal_slopes.push_back(h_slope);
+            
+            // For vertical, use the up component
+            double v_slope = fabs(sensitivity_pos_enu(2));
+            vertical_slopes.push_back(v_slope);
+        }
+        
+        // Find the maximum slope values
+        double max_h_slope = *std::max_element(horizontal_slopes.begin(), horizontal_slopes.end());
+        double max_v_slope = *std::max_element(vertical_slopes.begin(), vertical_slopes.end());
+        
+        // Calculate the minimum detectable bias
+        int dof = num_sats - 4;
+        double min_detectable_bias = k_fa * noise_stddev_m_ * sqrt(weight_matrix.diagonal().maxCoeff());
+        
+        // Update protection levels with slope-based calculations
+        horizontal_protection_level = std::max(horizontal_protection_level, max_h_slope * min_detectable_bias);
+        vertical_protection_level = std::max(vertical_protection_level, max_v_slope * min_detectable_bias);
+    }
+    
+    Eigen::Matrix3d createRotationMatrix(double lat, double lon) {
+        double sin_lat = sin(lat);
+        double cos_lat = cos(lat);
+        double sin_lon = sin(lon);
+        double cos_lon = cos(lon);
+        
+        Eigen::Matrix3d R;
+        // ECEF to ENU rotation matrix
+        R << -sin_lon, cos_lon, 0,
+             -sin_lat*cos_lon, -sin_lat*sin_lon, cos_lat,
+              cos_lat*cos_lon,  cos_lat*sin_lon, sin_lat;
+        
+        return R;
+    }
+    
+    Eigen::Vector4d G_inverse_row(
+            const Eigen::MatrixXd& geometry_matrix,
+            const Eigen::MatrixXd& weight_matrix,
+            int satellite_index) {
+        
+        // Calculate sensitivity vector for fault detection
+        Eigen::MatrixXd G_W_Ginv = (geometry_matrix.transpose() * weight_matrix * geometry_matrix).inverse();
+        
+        // Create unit vector for the satellite
+        Eigen::VectorXd e_i = Eigen::VectorXd::Zero(geometry_matrix.rows());
+        e_i(satellite_index) = 1.0;
+        
+        // Calculate sensitivity vector
+        Eigen::Vector4d sensitivity = G_W_Ginv * geometry_matrix.transpose() * weight_matrix * e_i;
+        
+        return sensitivity;
+    }
+    
+    double getMultiplierForProbability(double probability) {
+        // Find the closest value in the lookup table
+        double result = 0.0;
+        double min_diff = std::numeric_limits<double>::max();
+        
+        for (const auto& pair : t_distribution_values_) {
+            double diff = std::abs(probability - pair.first);
+            if (diff < min_diff) {
+                min_diff = diff;
+                result = pair.second;
+            }
+        }
+        
+        return result;
+    }
+    
+    void performFaultExclusion(
+            const std::vector<Eigen::Vector3d>& sat_positions,
+            const std::vector<double>& pseudoranges,
+            const std::vector<int>& satellite_ids,
+            const Eigen::Vector4d& initial_state) {
+        
+        ROS_INFO("Performing fault exclusion...");
+        
+        double min_test_statistic = std::numeric_limits<double>::max();
+        int excluded_sat_idx = -1;
+        
+        // Try removing each satellite and recalculate the test statistic
+        for (size_t i = 0; i < sat_positions.size(); ++i) {
+            // Create subsets without the i-th satellite
+            std::vector<Eigen::Vector3d> subset_positions;
+            std::vector<double> subset_ranges;
+            std::vector<int> subset_ids;
+            
+            for (size_t j = 0; j < sat_positions.size(); ++j) {
+                if (j != i) {
+                    subset_positions.push_back(sat_positions[j]);
+                    subset_ranges.push_back(pseudoranges[j]);
+                    subset_ids.push_back(satellite_ids[j]);
+                }
+            }
+            
+            // Re-estimate position with the subset
+            Eigen::Vector4d estimated_state;
+            Eigen::MatrixXd geometry_matrix;
+            Eigen::MatrixXd weight_matrix;
+            bool convergence = estimatePositionWeightedLeastSquares(
+                subset_positions, subset_ranges, initial_state, estimated_state, geometry_matrix, weight_matrix);
+            
+            if (!convergence) continue;
+            
+            // Calculate residuals and test statistic
+            Eigen::VectorXd residuals;
+            double test_statistic = calculateRAIMResiduals(
+                subset_positions, subset_ranges, estimated_state, geometry_matrix, weight_matrix, residuals);
+            
+            // Check if this exclusion gives a better test statistic
+            if (test_statistic < min_test_statistic) {
+                min_test_statistic = test_statistic;
+                excluded_sat_idx = i;
+            }
+        }
+        
+        // If exclusion improved the test statistic below threshold
+        if (excluded_sat_idx >= 0 && min_test_statistic < chi_square_threshold_) {
+            ROS_INFO("Satellite %d identified as faulty and excluded. New test statistic: %.2f",
+                    satellite_ids[excluded_sat_idx], min_test_statistic);
+            
+            // Mark the satellite as faulty in our visualization
+            if (excluded_sat_idx < satellites_.size()) {
+                satellites_[excluded_sat_idx].is_faulty = true;
+            }
+        } else {
+            ROS_WARN("Fault exclusion unsuccessful. Best test statistic: %.2f",
+                    min_test_statistic);
+        }
+    }
+    
+    void visualize() {
+        visualizeSatellites();
+        visualizePosition();
+        visualizeProtectionLevel();
+    }
+    
+    void visualizeSatellites() {
+        visualization_msgs::MarkerArray marker_array;
+        
+        // Get user position in geodetic for local frame
+        double user_lat, user_lon, user_alt;
+        ECEFToGeodetic(true_position_ecef_, user_lat, user_lon, user_alt);
+        
+        // Visualize each satellite
+        for (size_t i = 0; i < satellites_.size(); ++i) {
+            const auto& sat = satellites_[i];
+            
+            // Satellite marker
+            visualization_msgs::Marker sat_marker;
+            sat_marker.header.frame_id = user_frame_;  // Attach to the moving user frame
+            sat_marker.header.stamp = ros::Time::now();
+            sat_marker.ns = "satellites";
+            sat_marker.id = sat.id;
+            sat_marker.type = visualization_msgs::Marker::SPHERE;
+            sat_marker.action = visualization_msgs::Marker::ADD;
+            
+            // Convert satellite ECEF to local ENU frame centered at the user
+            Eigen::Vector3d sat_enu = ECEFToENU(sat.position_ecef, true_position_ecef_, user_lat, user_lon);
+            
+            // Scale for visualization (satellites are far away)
+            double scale_factor = 0.05; 
+            sat_marker.pose.position.x = sat_enu(0) * scale_factor;
+            sat_marker.pose.position.y = sat_enu(1) * scale_factor;
+            sat_marker.pose.position.z = sat_enu(2) * scale_factor;
+            
+            sat_marker.pose.orientation.w = 1.0;
+            sat_marker.scale.x = 5.0;
+            sat_marker.scale.y = 5.0;
+            sat_marker.scale.z = 5.0;
+            
+            // Color based on faulty status
+            if (sat.is_faulty) {
+                sat_marker.color.r = 1.0;
+                sat_marker.color.g = 0.0;
+                sat_marker.color.b = 0.0;
+            } else {
+                sat_marker.color.r = 0.0;
+                sat_marker.color.g = 1.0;
+                sat_marker.color.b = 0.0;
+            }
+            sat_marker.color.a = 0.8;
+            
+            marker_array.markers.push_back(sat_marker);
+            
+            // Line from receiver to satellite
+            visualization_msgs::Marker line_marker;
+            line_marker.header.frame_id = user_frame_;  // Attach to the moving user frame
+            line_marker.header.stamp = ros::Time::now();
+            line_marker.ns = "sat_lines";
+            line_marker.id = sat.id;
+            line_marker.type = visualization_msgs::Marker::LINE_STRIP;
+            line_marker.action = visualization_msgs::Marker::ADD;
+            
+            // Line from origin to satellite
+            geometry_msgs::Point start_point;
+            start_point.x = 0;
+            start_point.y = 0;
+            start_point.z = 0;
+            
+            geometry_msgs::Point end_point;
+            end_point.x = sat_marker.pose.position.x;
+            end_point.y = sat_marker.pose.position.y;
+            end_point.z = sat_marker.pose.position.z;
+            
+            line_marker.points.push_back(start_point);
+            line_marker.points.push_back(end_point);
+            
+            line_marker.scale.x = 0.5; // Line width
+            
+            // Line color
+            if (sat.is_faulty) {
+                line_marker.color.r = 1.0;
+                line_marker.color.g = 0.3;
+                line_marker.color.b = 0.3;
+            } else {
+                line_marker.color.r = 0.3;
+                line_marker.color.g = 0.8;
+                line_marker.color.b = 0.3;
+            }
+            line_marker.color.a = 0.6;
+            
+            marker_array.markers.push_back(line_marker);
+        }
+        
+        satellite_viz_pub_.publish(marker_array);
+    }
+    
+    void visualizePosition() {
+        visualization_msgs::Marker position_marker;
+        position_marker.header.frame_id = user_frame_;  // Attach to the moving user frame
+        position_marker.header.stamp = ros::Time::now();
+        position_marker.ns = "position";
+        position_marker.id = 0;
+        position_marker.type = visualization_msgs::Marker::SPHERE;
+        position_marker.action = visualization_msgs::Marker::ADD;
+        
+        // Position is at the origin of the user frame
+        position_marker.pose.position.x = 0;
+        position_marker.pose.position.y = 0;
+        position_marker.pose.position.z = 0;
+        
+        position_marker.pose.orientation.w = 1.0;
+        position_marker.scale.x = 2.0;
+        position_marker.scale.y = 2.0;
+        position_marker.scale.z = 2.0;
+        
+        position_marker.color.r = 0.0;
+        position_marker.color.g = 0.0;
+        position_marker.color.b = 1.0;
+        position_marker.color.a = 1.0;
+        
+        position_viz_pub_.publish(position_marker);
+    }
+    
+    void visualizeProtectionLevel() {
+        visualization_msgs::Marker protection_level_marker;
+        protection_level_marker.header.frame_id = user_frame_;  // Attach to the moving user frame
+        protection_level_marker.header.stamp = ros::Time::now();
+        protection_level_marker.ns = "protection_level";
+        protection_level_marker.id = 0;
+        protection_level_marker.type = visualization_msgs::Marker::CYLINDER;
+        protection_level_marker.action = visualization_msgs::Marker::ADD;
+        
+        protection_level_marker.pose.position.x = 0;
+        protection_level_marker.pose.position.y = 0;
+        protection_level_marker.pose.position.z = 0;
+        
+        protection_level_marker.pose.orientation.w = 1.0;
+        
+        // Scale for visualization (radius = HPL, height = 2*VPL)
+        protection_level_marker.scale.x = horizontal_protection_level_ * 2.0;
+        protection_level_marker.scale.y = horizontal_protection_level_ * 2.0;
+        protection_level_marker.scale.z = vertical_protection_level_ * 2.0;
+        
+        // Color based on alarm state
+        if (horizontal_protection_level_ > alarm_limit_ || vertical_protection_level_ > alarm_limit_) {
+            // Red if protection level exceeds alarm limit
+            protection_level_marker.color.r = 1.0;
+            protection_level_marker.color.g = 0.0;
+            protection_level_marker.color.b = 0.0;
+        } else {
+            // Blue otherwise
+            protection_level_marker.color.r = 0.0;
+            protection_level_marker.color.g = 0.5;
+            protection_level_marker.color.b = 1.0;
+        }
+        protection_level_marker.color.a = 0.3;
+        
+        protection_level_viz_pub_.publish(protection_level_marker);
+    }
+    
+    void publishPositionWithCovariance(
+            const Eigen::Vector3d& position_ecef,
+            const Eigen::MatrixXd& covariance) {
+        
+        // Publish as PoseWithCovariance message
+        geometry_msgs::PoseWithCovariance pose_msg;
+        
+        // Position is at the origin of the user frame
+        pose_msg.pose.position.x = 0.0;
+        pose_msg.pose.position.y = 0.0;
+        pose_msg.pose.position.z = 0.0;
+        
+        // Identity quaternion
+        pose_msg.pose.orientation.w = 1.0;
+        pose_msg.pose.orientation.x = 0.0;
+        pose_msg.pose.orientation.y = 0.0;
+        pose_msg.pose.orientation.z = 0.0;
+        
+        // Convert covariance to local ENU frame
+        double lat, lon, alt;
+        ECEFToGeodetic(position_ecef, lat, lon, alt);
+        Eigen::Matrix3d R = createRotationMatrix(lat, lon);
+        Eigen::Matrix3d local_cov = R * covariance.block<3,3>(0,0) * R.transpose();
+        
+        // Copy position covariance to ROS message
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                pose_msg.covariance[i*6 + j] = local_cov(i, j);
+            }
+        }
+        
+        pose_with_cov_pub_.publish(pose_msg);
+    }
+    
+    void publishGPSData() {
+        sensor_msgs::NavSatFix gps_msg;
+        gps_msg.header.stamp = ros::Time::now();
+        gps_msg.header.frame_id = user_frame_;
+        
+        // Convert true position ECEF to geodetic for the message
+        double lat, lon, alt;
+        ECEFToGeodetic(true_position_ecef_, lat, lon, alt);
+        
+        gps_msg.latitude = lat * RAD_TO_DEG;
+        gps_msg.longitude = lon * RAD_TO_DEG;
+        gps_msg.altitude = alt;
+        
+        // Status fields
+        gps_msg.status.status = sensor_msgs::NavSatStatus::STATUS_FIX;
+        gps_msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
+        
+        // Covariance
+        gps_msg.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+        
+        // Diagonal covariance from protection levels
+        gps_msg.position_covariance[0] = pow(horizontal_protection_level_ / 2.0, 2); // East
+        gps_msg.position_covariance[4] = pow(horizontal_protection_level_ / 2.0, 2); // North
+        gps_msg.position_covariance[8] = pow(vertical_protection_level_ / 2.0, 2);   // Up
+        
+        simulated_gps_pub_.publish(gps_msg);
+    }
+    
+    void broadcastTransform() {
+        // Get center coordinates in geodetic for local frame calculations
+        double center_lat, center_lon, center_alt;
+        ECEFToGeodetic(trajectory_center_ecef_, center_lat, center_lon, center_alt);
+        
+        // Convert true position to ENU relative to trajectory center
+        Eigen::Vector3d user_enu = ECEFToENU(true_position_ecef_, trajectory_center_ecef_, 
+                                            center_lat, center_lon);
+        
+        // Create transform message
+        geometry_msgs::TransformStamped transform_stamped;
+        transform_stamped.header.stamp = ros::Time::now();
+        transform_stamped.header.frame_id = fixed_frame_;
+        transform_stamped.child_frame_id = user_frame_;
+        
+        // Set translation based on ENU coordinates
+        transform_stamped.transform.translation.x = user_enu(0);
+        transform_stamped.transform.translation.y = user_enu(1);
+        transform_stamped.transform.translation.z = user_enu(2);
+        
+        // Set orientation (identity quaternion for now)
+        transform_stamped.transform.rotation.w = 1.0;
+        transform_stamped.transform.rotation.x = 0.0;
+        transform_stamped.transform.rotation.y = 0.0;
+        transform_stamped.transform.rotation.z = 0.0;
+        
+        // Broadcast the transform
+        tf_broadcaster_.sendTransform(transform_stamped);
+    }
+    
+    void updatePath() {
+        // Create a pose for the current position
+        geometry_msgs::PoseStamped current_pose;
+        current_pose.header.frame_id = fixed_frame_;
+        current_pose.header.stamp = ros::Time::now();
+        
+        // Convert true position to ENU relative to trajectory center
+        double center_lat, center_lon, center_alt;
+        ECEFToGeodetic(trajectory_center_ecef_, center_lat, center_lon, center_alt);
+        Eigen::Vector3d user_enu = ECEFToENU(true_position_ecef_, trajectory_center_ecef_, 
+                                            center_lat, center_lon);
+        
+        current_pose.pose.position.x = user_enu(0);
+        current_pose.pose.position.y = user_enu(1);
+        current_pose.pose.position.z = user_enu(2);
+        
+        // Identity orientation
+        current_pose.pose.orientation.w = 1.0;
+        
+        // Add to pose history
+        pose_history_.push_back(current_pose);
+        
+        // Limit history size
+        while (pose_history_.size() > max_path_history_) {
+            pose_history_.pop_front();
+        }
+        
+        // Update path message
+        path_.header.stamp = ros::Time::now();
+        path_.poses = std::vector<geometry_msgs::PoseStamped>(pose_history_.begin(), pose_history_.end());
+        
+        // Publish path
+        path_pub_.publish(path_);
+    }
+    
+    // Coordinate transformation utilities
+    
+    Eigen::Vector3d geodeticToECEF(double lat, double lon, double alt) {
+        // WGS84 ellipsoid parameters
+        const double a = 6378137.0;               // semi-major axis
+        const double f = 1.0 / 298.257223563;     // flattening
+        const double e_squared = f * (2.0 - f);   // eccentricity squared
+        
+        double sin_lat = sin(lat);
+        double cos_lat = cos(lat);
+        double sin_lon = sin(lon);
+        double cos_lon = cos(lon);
+        
+        double N = a / sqrt(1.0 - e_squared * sin_lat * sin_lat);
+        
+        double x = (N + alt) * cos_lat * cos_lon;
+        double y = (N + alt) * cos_lat * sin_lon;
+        double z = (N * (1.0 - e_squared) + alt) * sin_lat;
+        
+        return Eigen::Vector3d(x, y, z);
+    }
+    
+    void ECEFToGeodetic(const Eigen::Vector3d& ecef, double& lat, double& lon, double& alt) {
+        // WGS84 ellipsoid parameters
+        const double a = 6378137.0;               // semi-major axis
+        const double f = 1.0 / 298.257223563;     // flattening
+        const double b = a * (1.0 - f);           // semi-minor axis
+        const double e_squared = f * (2.0 - f);   // eccentricity squared
+        
+        double x = ecef(0);
+        double y = ecef(1);
+        double z = ecef(2);
+        
+        // Calculate longitude
+        lon = atan2(y, x);
+        
+        // Distance from Z-axis
+        double p = sqrt(x*x + y*y);
+        
+        // Initial guess for latitude
+        double lat_guess = atan2(z, p * (1.0 - e_squared));
+        double N, h;
+        
+        // Iterative calculation for latitude and height
+        for (int i = 0; i < 5; i++) {
+            double sin_lat = sin(lat_guess);
+            N = a / sqrt(1.0 - e_squared * sin_lat * sin_lat);
+            h = p / cos(lat_guess) - N;
+            lat_guess = atan2(z, p * (1.0 - e_squared * N / (N + h)));
+        }
+        
+        lat = lat_guess;
+        alt = p / cos(lat) - N;
+        
+        // Special case for poles
+        if (p < 1.0) {
+            lat = z > 0 ? M_PI/2 : -M_PI/2;
+            alt = fabs(z) - b;
+        }
+    }
+    
+    Eigen::Vector3d ECEFToENU(const Eigen::Vector3d& ecef, const Eigen::Vector3d& ref_ecef, double ref_lat, double ref_lon) {
+        // Calculate the difference in ECEF coordinates
+        Eigen::Vector3d delta_ecef = ecef - ref_ecef;
+        
+        // Use the rotation matrix
+        Eigen::Matrix3d R = createRotationMatrix(ref_lat, ref_lon);
+        
+        // Apply the rotation
+        return R * delta_ecef;
+    }
+    
+    Eigen::Vector3d ENUToECEF(const Eigen::Vector3d& enu, const Eigen::Vector3d& ref_ecef, double ref_lat, double ref_lon) {
+        // Get rotation matrix
+        Eigen::Matrix3d R = createRotationMatrix(ref_lat, ref_lon);
+        
+        // Invert (actually transpose since it's orthogonal)
+        Eigen::Matrix3d R_inv = R.transpose();
+        
+        // Apply the rotation and add reference
+        return ref_ecef + R_inv * enu;
+    }
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "gps_raim_node");
+    GPSRAIMNode raim_node;
+    ros::spin();
+    return 0;
+}

@@ -29,7 +29,6 @@ public:
         user_path_pub_ = nh_.advertise<nav_msgs::Path>("user_path", 10);
 
         pub_latest_odometry = nh_.advertise<nav_msgs::Odometry>("UWBPoistion", 1000);
-
         pub_latest_odometry_ps = nh_.advertise<geometry_msgs::PointStamped>("UWBPoistionPS", 1000);
 
         // Beacon positions (x, y, z) in meters
@@ -41,26 +40,48 @@ public:
             {0.0, 0.0, 3.0}
         };
 
-        sim_freq_ = 200;
+        // Load parameters with more realistic defaults
+        nh_.param<double>("sim_freq", sim_freq_, 200.0);
+        nh_.param<double>("omega", omega_, 0.1);  // Angular velocity of circular motion
+        nh_.param<double>("radius", radius_, 3.0); // Radius of circle in meters
+
+        // Noise parameters - more realistic values for consumer-grade IMU
+        nh_.param<double>("accel_noise_std", accel_noise_std_, 0.03);  // m/s²
+        nh_.param<double>("gyro_noise_std", gyro_noise_std_, 0.002);   // rad/s
+        nh_.param<double>("uwb_noise_std", uwb_noise_std_, 0.05);      // meters
+
+        // Bias parameters - realistic biases for consumer-grade IMU
+        nh_.param<double>("accel_bias_x", accel_bias_x_, 0.05);  // m/s²
+        nh_.param<double>("accel_bias_y", accel_bias_y_, -0.07); // m/s²
+        nh_.param<double>("accel_bias_z", accel_bias_z_, 0.1);   // m/s²
+        nh_.param<double>("gyro_bias_x", gyro_bias_x_, 0.002);   // rad/s
+        nh_.param<double>("gyro_bias_y", gyro_bias_y_, -0.003);  // rad/s
+        nh_.param<double>("gyro_bias_z", gyro_bias_z_, 0.001);   // rad/s
+
         sim_time_ = 0.0;
         dt_ = 1.0 / sim_freq_;
-        omega_ = 0.1; // 0.5
-        radius_ = 3.0;
 
-        // Initialize random generators
+        // Initialize random generators with realistic noise levels
         std::random_device rd;
         gen_.reset(new std::mt19937(rd()));
-        // accel_noise_ = std::normal_distribution<double>(0.0, 0.01);
-        // gyro_noise_ = std::normal_distribution<double>(0.0, 0.005);
-        accel_noise_ = std::normal_distribution<double>(0.0, 0.0001);
-        gyro_noise_ = std::normal_distribution<double>(0.0, 0.00005);
-        // uwb_noise_ = std::normal_distribution<double>(0.0, 0.1);
-        uwb_noise_ = std::normal_distribution<double>(0.0, 0.0001);
+        accel_noise_ = std::normal_distribution<double>(0.0, accel_noise_std_);
+        gyro_noise_ = std::normal_distribution<double>(0.0, gyro_noise_std_);
+        uwb_noise_ = std::normal_distribution<double>(0.0, uwb_noise_std_);
+
+        // Init biases as 3D vectors
+        accel_bias_ = Eigen::Vector3d(accel_bias_x_, accel_bias_y_, accel_bias_z_);
+        gyro_bias_ = Eigen::Vector3d(gyro_bias_x_, gyro_bias_y_, gyro_bias_z_);
 
         // Setup timers
         imu_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_), &SensorSimulator::publishImu, this);
         uwb_timer_ = nh_.createTimer(ros::Duration(1.0/(sim_freq_*0.1)), &SensorSimulator::publishUwb, this);
         vis_timer_ = nh_.createTimer(ros::Duration(0.1), &SensorSimulator::publishVisualization, this);
+        
+        ROS_INFO("Sensor Simulator initialized with realistic IMU parameters:");
+        ROS_INFO("Accel noise std: %.4f m/s², Gyro noise std: %.4f rad/s", accel_noise_std_, gyro_noise_std_);
+        ROS_INFO("Accel bias: [%.4f, %.4f, %.4f] m/s²", accel_bias_x_, accel_bias_y_, accel_bias_z_);
+        ROS_INFO("Gyro bias: [%.4f, %.4f, %.4f] rad/s", gyro_bias_x_, gyro_bias_y_, gyro_bias_z_);
+        ROS_INFO("UWB noise std: %.4f m", uwb_noise_std_);
     }
 
 public:
@@ -75,7 +96,6 @@ public:
             T dz = position[2] - T(anchor_.z());
             T distance = ceres::sqrt(dx*dx + dy*dy + dz*dz);
             residual[0] = distance - T(measurement_);
-            // std::cout<<"residual[0] -> " << residual[0]<<"\n";
             return true;
         }
 
@@ -89,79 +109,88 @@ private:
         imu_msg.header.stamp = ros::Time::now();
         imu_msg.header.frame_id = "map";
 
-        const double t = ros::Time::now().toSec();
-        // std::cout<<"t-> " << t <<std::endl;
-        if(0) // default version
-        {
-            // Simulate accelerometer data (m/s²)
-            imu_msg.linear_acceleration.x = 0.5 * std::sin(t) + accel_noise_(*gen_);
-            imu_msg.linear_acceleration.y = 0.2 * std::cos(0.5 * t) + accel_noise_(*gen_);
-            imu_msg.linear_acceleration.z = 9.81 + accel_noise_(*gen_);
+        // Update simulation time
+        sim_time_ += dt_;
+        double t = sim_time_;
 
-            // Simulate gyroscope data (rad/s)
-            imu_msg.angular_velocity.x = 0.1 * std::sin(0.3 * t) + gyro_noise_(*gen_);
-            imu_msg.angular_velocity.y = 0.05 * std::cos(0.2 * t) + gyro_noise_(*gen_);
-            imu_msg.angular_velocity.z = 0.2 * std::sin(0.1 * t) + gyro_noise_(*gen_);
+        // Calculate circular motion parameters
+        double theta = omega_ * t;
+
+        // Calculate velocity
+        Eigen::Vector3d velocity(
+            -radius_ * omega_ * sin(theta),
+            radius_ * omega_ * cos(theta),
+            0.0
+        );
+
+        // Calculate centripetal acceleration
+        Eigen::Vector3d acceleration(
+            -radius_ * omega_ * omega_ * cos(theta),
+            -radius_ * omega_ * omega_ * sin(theta),
+            0.0
+        );
+
+        // Calculate orientation (yaw)
+        double yaw = theta + M_PI/2; // Tangent to circle
+        Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+
+        // IMU simulation with proper bias and noise
+        // -------------------------------
+        // Calculate proper acceleration (world frame)
+        Eigen::Vector3d gravity(0.0, 0.0, 9.81);
+        Eigen::Vector3d acc_world = acceleration + gravity;
+
+        // Rotate to body frame
+        Eigen::Vector3d acc_body = q.conjugate() * acc_world;
+
+        // Add bias and noise
+        acc_body += accel_bias_;
+        acc_body.x() += accel_noise_(*gen_);
+        acc_body.y() += accel_noise_(*gen_);
+        acc_body.z() += accel_noise_(*gen_);
+
+        // Angular velocity (body frame) with bias and noise
+        Eigen::Vector3d gyro(0.0, 0.0, omega_);
+        gyro += gyro_bias_;
+        gyro.x() += gyro_noise_(*gen_);
+        gyro.y() += gyro_noise_(*gen_);
+        gyro.z() += gyro_noise_(*gen_);
+
+        // Set orientation (ground truth for reference)
+        imu_msg.orientation.w = q.w();
+        imu_msg.orientation.x = q.x();
+        imu_msg.orientation.y = q.y();
+        imu_msg.orientation.z = q.z();
+
+        // Set angular velocity
+        imu_msg.angular_velocity.x = gyro.x();
+        imu_msg.angular_velocity.y = gyro.y();
+        imu_msg.angular_velocity.z = gyro.z();
+
+        // Set linear acceleration
+        imu_msg.linear_acceleration.x = acc_body.x();
+        imu_msg.linear_acceleration.y = acc_body.y();
+        imu_msg.linear_acceleration.z = acc_body.z();
+
+        // Set covariances (diagonal) based on noise parameters
+        for (int i = 0; i < 9; i++) {
+            imu_msg.orientation_covariance[i] = 0.0;
+            imu_msg.angular_velocity_covariance[i] = 0.0;
+            imu_msg.linear_acceleration_covariance[i] = 0.0;
         }
-        else   // revised version
-        {
-
-            double theta = omega_ * t;
-
-            // Calculate velocity
-            Eigen::Vector3d velocity(
-                -radius_ * omega_ * sin(theta),
-                radius_ * omega_ * cos(theta),
-                0.0
-            );
-
-            // Calculate centripetal acceleration
-            Eigen::Vector3d acceleration(
-                -radius_ * omega_ * omega_ * cos(theta),
-                -radius_ * omega_ * omega_ * sin(theta),
-                0.0
-            );
-
-            // Calculate orientation (yaw)
-            double yaw = theta + M_PI/2; // Tangent to circle
-            Eigen::Quaterniond q(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
-
-            // IMU simulation
-            // -------------------------------
-            // Calculate proper acceleration (world frame)
-            Eigen::Vector3d gravity(0.0, 0.0, 9.81);
-            Eigen::Vector3d acc_world = acceleration + gravity;
-
-            // Rotate to body frame
-            Eigen::Vector3d acc_body = q.conjugate() * acc_world;
-
-            // Add noise
-            acc_body.x() += accel_noise_(*gen_);
-            acc_body.y() += accel_noise_(*gen_);
-            acc_body.z() += accel_noise_(*gen_);
-
-            // Angular velocity (body frame)
-            Eigen::Vector3d gyro(0.0, 0.0, omega_);
-            gyro.x() += gyro_noise_(*gen_);
-            gyro.y() += gyro_noise_(*gen_);
-            gyro.z() += gyro_noise_(*gen_);
-
-            // Set orientation (ground truth for reference)
-            imu_msg.orientation.w = q.w();
-            imu_msg.orientation.x = q.x();
-            imu_msg.orientation.y = q.y();
-            imu_msg.orientation.z = q.z();
-
-            // Set angular velocity
-            imu_msg.angular_velocity.x = gyro.x();
-            imu_msg.angular_velocity.y = gyro.y();
-            imu_msg.angular_velocity.z = gyro.z();
-
-            imu_msg.linear_acceleration.x = acc_body.x();
-            imu_msg.linear_acceleration.y = acc_body.y();
-            imu_msg.linear_acceleration.z = acc_body.z();
-
-        }
+        
+        // Diagonal elements represent variance (std^2)
+        imu_msg.orientation_covariance[0] = 0.01; // Set to non-default value
+        imu_msg.orientation_covariance[4] = 0.01;
+        imu_msg.orientation_covariance[8] = 0.01;
+        
+        imu_msg.angular_velocity_covariance[0] = gyro_noise_std_ * gyro_noise_std_;
+        imu_msg.angular_velocity_covariance[4] = gyro_noise_std_ * gyro_noise_std_;
+        imu_msg.angular_velocity_covariance[8] = gyro_noise_std_ * gyro_noise_std_;
+        
+        imu_msg.linear_acceleration_covariance[0] = accel_noise_std_ * accel_noise_std_;
+        imu_msg.linear_acceleration_covariance[4] = accel_noise_std_ * accel_noise_std_;
+        imu_msg.linear_acceleration_covariance[8] = accel_noise_std_ * accel_noise_std_;
 
         imu_pub_.publish(imu_msg);
 
@@ -182,7 +211,7 @@ private:
         pose.pose.position = current_position_;
         path_.poses.push_back(pose);
 
-        //user position based on Cere solver least square 
+        // User position based on Ceres solver least square 
         pose.pose.position.x = user_pos(0);
         pose.pose.position.y = user_pos(1);
         pose.pose.position.z = user_pos(2);
@@ -196,14 +225,6 @@ private:
         odometry.pose.pose.position.z = user_pos(2);
         pub_latest_odometry.publish(odometry);
 
-        // geometry_msgs::PointStamped est_msg;
-        // est_msg.header = odometry.header;
-        
-        // est_msg.point.x = user_pos(0);
-        // est_msg.point.y = user_pos(1);
-        // est_msg.point.z = user_pos(2);
-        // pub_latest_odometry_ps.publish(est_msg);
-
         // Keep only last 100 poses
         if(path_.poses.size() > 7200) {
             path_.poses.erase(path_.poses.begin());
@@ -211,10 +232,6 @@ private:
         path_.header.stamp = ros::Time::now();
         path_.header.frame_id = "map";
 
-        // Keep only last 100 poses ()
-        // if(path_user_position.poses.size() > 1200) {
-        //     path_user_position.poses.erase(path_user_position.poses.begin());
-        // }
         path_user_position.header.stamp = ros::Time::now();
         path_user_position.header.frame_id = "map";
     }
@@ -241,31 +258,20 @@ private:
             measurements.push_back(uwb_msg.range);
         }
 
-        // when the imu data is availble, do the least square 
+        // Perform least square to estimate position from UWB ranges
         ceres::Problem problem;
-        Eigen::Vector3d position(1,0,0); // Perturbed initial guess
-        // double positioN[3]={1,0,0};
+        Eigen::Vector3d position(1,0,0); // Initial guess
+
         for (size_t i = 0; i < beacon_positions_.size(); ++i) {
             Eigen::Vector3d anchor(beacon_positions_[i][0], beacon_positions_[i][1], beacon_positions_[i][2]);
             ceres::CostFunction* cost_function =
                 new ceres::AutoDiffCostFunction<RangeResidual, 1, 3>(
                     new RangeResidual(anchor, measurements[i]));
             
-            ceres::LossFunction* loss_function = nullptr;
-            if (use_huber_loss_) {
-                loss_function = new ceres::HuberLoss(huber_loss_threshold_);
-            }
-
-            // problem.AddResidualBlock(cost_function, new ceres::HuberLoss(0.1), position.data());
-            problem.AddResidualBlock(cost_function, NULL, position.data());
-            // problem.AddResidualBlock(cost_function, loss_function, positioN);
+            problem.AddResidualBlock(cost_function, nullptr, position.data());
         }
-        ceres::Solver::Options options;
-        // options.max_num_iterations = 20; // max_iterations_
-        // options.linear_solver_type = ceres::DENSE_QR;
-        // options.minimizer_progress_to_stdout = false;
-        // options.function_tolerance = solver_tolerance_;
 
+        ceres::Solver::Options options;
         options.use_nonmonotonic_steps = true;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
         options.trust_region_strategy_type = ceres::TrustRegionStrategyType::DOGLEG;
@@ -275,14 +281,10 @@ private:
 
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
-        // ceres::Solve(options, &problem, &summary);
 
-        ROS_DEBUG_COND(summary.termination_type != ceres::CONVERGENCE,
-                      "Optimization failed to converge: %s", 
-                      summary.FullReport().c_str());
         user_pos = position;
-        // std::cout<<"user position-> " << position <<std::endl;
 
+        // Publish UWB position as PointStamped
         geometry_msgs::PointStamped est_msg;
         est_msg.header.stamp = ros::Time::now();
         est_msg.header.frame_id = "map";
@@ -292,7 +294,6 @@ private:
         est_msg.point.z = user_pos(2);
         pub_latest_odometry_ps.publish(est_msg);
     }
-
 
     void publishVisualization(const ros::TimerEvent&) {
         // Publish beacon markers
@@ -378,27 +379,29 @@ private:
     std::normal_distribution<double> uwb_noise_;
     
     std::vector<std::vector<double>> beacon_positions_;
-    // std::vector<Eigen::Vector3d> beacon_positions_;
-    //Eigen::Vector3d
+    Eigen::Vector3d accel_bias_;  // Accelerometer bias vector (m/s²)
+    Eigen::Vector3d gyro_bias_;   // Gyroscope bias vector (rad/s)
+
+    // Simulation parameters
+    double sim_freq_;  // Simulation frequency (Hz)
+    double radius_;    // Radius of circle (m)
+    double omega_;     // Angular velocity (rad/s)
+    double sim_time_;  // Current simulation time (s)
+    double dt_;        // Time step (s)
+    
+    // Noise parameters
+    double accel_noise_std_;  // Accelerometer noise standard deviation (m/s²)
+    double gyro_noise_std_;   // Gyroscope noise standard deviation (rad/s)
+    double uwb_noise_std_;    // UWB distance noise standard deviation (m)
+    
+    // Bias parameters
+    double accel_bias_x_, accel_bias_y_, accel_bias_z_;  // Accelerometer bias (m/s²)
+    double gyro_bias_x_, gyro_bias_y_, gyro_bias_z_;     // Gyroscope bias (rad/s)
 
     geometry_msgs::Point current_position_;
     nav_msgs::Path path_;
     nav_msgs::Path path_user_position;
-
-    // Optimization parameters
-    int max_iterations_;
-    double solver_tolerance_;
-    std::string linear_solver_type_;
-    bool use_huber_loss_;
-    double huber_loss_threshold_;
     Eigen::Vector3d user_pos;
-
-    // paras for IMU data simulation: Simulation parameters
-    double radius_; // radius of circle 
-    double omega_; // angular velocity of the circle
-    double sim_freq_; // sim frequecny 
-    double sim_time_;
-    double dt_; // dt of the timer
 };
 
 int main(int argc, char** argv) {
