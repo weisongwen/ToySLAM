@@ -178,10 +178,10 @@ public:
         // Convert to rotation matrix
         Eigen::Matrix<T, 3, 3> R = q.toRotationMatrix();
         
-        // Get gravity direction in body frame (should point downward, i.e., z-axis)
+        // Get gravity direction in body frame (should point downward for planar motion)
         Eigen::Matrix<T, 3, 1> z_body = R.col(2);
         
-        // In planar motion, z_body should be close to [0,0,1] or [0,0,-1]
+        // In planar motion with ENU frame, z_body should be close to [0,0,1]
         // Penalize deviation of x and y components from zero
         residuals[0] = T(weight_) * z_body.x();
         residuals[1] = T(weight_) * z_body.y();
@@ -198,7 +198,7 @@ private:
     double weight_;
 };
 
-// New factor to directly incorporate IMU orientation
+// Factor to directly incorporate IMU orientation
 class OrientationFactor {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -346,9 +346,6 @@ public:
         // New parameter to control whether to use yaw-only from IMU orientation
         private_nh.param<bool>("use_imu_yaw_only", use_imu_yaw_only_, true);
         
-        // Handle coordinate system mismatch
-        private_nh.param<bool>("flip_uwb_z", flip_uwb_z_, true);
-        
         // Initialize with small non-zero biases to help break symmetry in the optimization
         initial_acc_bias_ = Eigen::Vector3d(0.05, 0.05, 0.05);
         initial_gyro_bias_ = Eigen::Vector3d(0.01, 0.01, 0.01);
@@ -377,10 +374,7 @@ public:
                                            &UwbImuFusion::imuPoseTimerCallback, this);
         
         ROS_INFO("UWB-IMU Fusion node initialized: Using VINS-Mono style IMU pre-integration with factor graph optimization");
-        ROS_INFO("Coordinate system handling: IMU Z pointing down, UWB Z pointing up");
-        if (flip_uwb_z_) {
-            ROS_INFO("Flipping UWB Z-axis value to match IMU coordinate system");
-        }
+        ROS_INFO("Coordinate system: ENU (East-North-Up) with Z axis pointing up");
         ROS_INFO("Roll/pitch constraint weight increased to: %.2f for better planar motion handling", roll_pitch_weight_);
         ROS_INFO("Using IMU orientation data with weight: %.2f", imu_orientation_weight_);
         if (use_imu_yaw_only_) {
@@ -423,7 +417,6 @@ private:
     double max_imu_dt_;
     double imu_orientation_weight_;
     bool use_imu_yaw_only_;
-    bool flip_uwb_z_;  // Whether to flip UWB Z-axis to match IMU coordinate system
     
     // Initial bias values to help estimation
     Eigen::Vector3d initial_acc_bias_;
@@ -561,33 +554,10 @@ private:
     // Mutex for thread safety
     std::mutex data_mutex_;
 
-    // Gravity vector in world frame (consistent definition)
-    // VINS-Mono defines gravity as pointing DOWN along the Z axis (negative Z)
+    // Gravity vector in world frame (ENU, Z-up)
     Eigen::Vector3d gravity_world_;
     
     // Helper functions
-    
-    // Convert UWB position from ENU (Z-up) to IMU frame (Z-down)
-    Eigen::Vector3d convertUwbPositionToImuFrame(const Eigen::Vector3d& uwb_position) {
-        if (flip_uwb_z_) {
-            // Keep X and Y the same, negate Z to match IMU's Z-down convention
-            return Eigen::Vector3d(uwb_position.x(), uwb_position.y(), -uwb_position.z());
-        } else {
-            // No conversion needed if frames are already aligned or for testing
-            return uwb_position;
-        }
-    }
-    
-    // Convert position from IMU frame (Z-down) back to ENU (Z-up) for publishing
-    Eigen::Vector3d convertPositionToEnuFrame(const Eigen::Vector3d& imu_position) {
-        if (flip_uwb_z_) {
-            // Keep X and Y the same, negate Z to convert back to Z-up
-            return Eigen::Vector3d(imu_position.x(), imu_position.y(), -imu_position.z());
-        } else {
-            // No conversion needed
-            return imu_position;
-        }
-    }
     
     // Compute quaternion for small angle rotation
     template <typename T>
@@ -733,8 +703,8 @@ private:
             imu_buffer_.clear();
             preintegration_map_.clear();
             
-            // Initialize gravity vector consistently - pointing down in Z
-            // This is used for world-frame calculations - VINS-Mono style
+            // Initialize gravity vector in world frame (ENU, Z points up)
+            // In ENU frame, gravity points downward along negative Z axis
             gravity_world_ = Eigen::Vector3d(0, 0, -gravity_magnitude_);
             
             // Reset timestamp tracking
@@ -800,20 +770,15 @@ private:
         try {
             std::lock_guard<std::mutex> lock(data_mutex_);
             
-            // Store UWB position measurement with coordinate system conversion
+            // Store UWB position measurement
             UwbMeasurement measurement;
-            
-            // Convert UWB position (Z-up) to IMU coordinate system (Z-down)
-            Eigen::Vector3d uwb_position_enu(msg->point.x, msg->point.y, msg->point.z);
-            Eigen::Vector3d uwb_position_imu = convertUwbPositionToImuFrame(uwb_position_enu);
-            
-            measurement.position = uwb_position_imu;
+            measurement.position = Eigen::Vector3d(msg->point.x, msg->point.y, msg->point.z);
             measurement.timestamp = msg->header.stamp.toSec();
             
             static int uwb_count = 0;
             uwb_count++;
             if (uwb_count % 20 == 0) {
-                ROS_DEBUG("Received UWB message #%d: [%.2f, %.2f, %.2f] (converted to IMU frame)", 
+                ROS_DEBUG("Received UWB message #%d: [%.2f, %.2f, %.2f]", 
                            uwb_count, measurement.position.x(), measurement.position.y(), 
                            measurement.position.z());
             }
@@ -864,8 +829,6 @@ private:
             if (state_window_.empty()) {
                 // Create initial keyframe from current state
                 State new_state = current_state_;
-                
-                // Set position from UWB - already converted to IMU frame in callback
                 new_state.position = uwb.position;
                 new_state.timestamp = uwb.timestamp;
                 
@@ -899,7 +862,7 @@ private:
             State propagated_state = propagateState(state_window_.back(), uwb.timestamp);
             
             // Set the UWB position while keeping the propagated orientation and velocity
-            propagated_state.position = uwb.position;  // UWB position already converted to IMU frame
+            propagated_state.position = uwb.position;
             propagated_state.timestamp = uwb.timestamp;
             
             // Find closest IMU measurement for orientation updating
@@ -1007,8 +970,9 @@ private:
             // based on current orientation (before the update)
             Eigen::Vector3d gravity_sensor = result.orientation.inverse() * gravity_world_;
             
-            // Remove gravity in sensor frame
-            // Since accelerometer measures gravity + acceleration, we remove gravity
+            // Remove gravity from accelerometer reading
+            // In ENU frame, accelerometer measures gravity + acceleration
+            // Since gravity is in negative Z in world frame, we need to subtract gravity from the sensor reading
             Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
             
             // Rotate to world frame using midpoint rotation
@@ -1056,7 +1020,7 @@ private:
             // VINS-Mono style: Transform gravity from world to sensor frame
             Eigen::Vector3d gravity_sensor = result.orientation.inverse() * gravity_world_;
             
-            // Remove gravity in sensor frame
+            // Remove gravity from accelerometer reading
             Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
             
             // Rotate to world frame
@@ -1176,12 +1140,10 @@ private:
             Eigen::Vector3d acc_corrected = acc - current_state_.acc_bias;
             Eigen::Vector3d gyro_corrected = gyro - current_state_.gyro_bias;
             
-            // VINS-Mono style: Transform gravity from world to sensor frame
-            // We need to use the current orientation before the update
+            // Transform gravity from world to sensor frame
             Eigen::Vector3d gravity_sensor = current_state_.orientation.inverse() * gravity_world_;
             
-            // Remove gravity in sensor frame
-            // The accelerometer measures gravity + acceleration, so we subtract gravity
+            // Remove gravity from accelerometer reading (gravity is already negative in world frame)
             Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
             
             // Rotate acceleration to world frame (current orientation already updated above)
@@ -1334,7 +1296,7 @@ private:
     void initializeFromUwb(const UwbMeasurement& uwb) {
         try {
             // Initialize state using UWB position
-            current_state_.position = uwb.position;  // UWB position already converted to IMU frame
+            current_state_.position = uwb.position;
             current_state_.orientation = Eigen::Quaterniond::Identity();
             current_state_.velocity = Eigen::Vector3d::Zero();
             current_state_.acc_bias = initial_acc_bias_;
@@ -1502,7 +1464,7 @@ private:
                 Eigen::Vector3d half_angle_axis = 0.5 * angle_axis;
                 Eigen::Quaterniond delta_q_half = preint.delta_orientation * deltaQ(half_angle_axis);
                 
-                // 4. VINS-Mono style: Transform gravity from world to current sensor frame
+                // 4. Transform gravity from world to current sensor frame
                 // We use the current global orientation estimate during integration
                 Eigen::Vector3d gravity_sensor = current_orientation.inverse() * gravity_world_;
                 
@@ -1634,7 +1596,7 @@ private:
             Eigen::Matrix<T, 3, 1> corrected_delta_q_vec = delta_bias_correction.template segment<3>(6);
             Eigen::Quaternion<T> corrected_delta_q = delta_q * deltaQ(corrected_delta_q_vec);
             
-            // Gravity vector in world frame (pointing DOWN)
+            // Gravity vector in world frame
             Eigen::Matrix<T, 3, 1> g = gravity_.cast<T>();
             
             // Compute residuals in body frame of state i
@@ -2082,13 +2044,10 @@ private:
             odom_msg.header.frame_id = world_frame_id_; // "map"
             odom_msg.child_frame_id = body_frame_id_;   // "base_link"
             
-            // Convert position back to ENU frame (Z-up) for publishing if needed
-            Eigen::Vector3d position_enu = convertPositionToEnuFrame(current_state_.position);
-            
             // Position
-            odom_msg.pose.pose.position.x = position_enu.x();
-            odom_msg.pose.pose.position.y = position_enu.y();
-            odom_msg.pose.pose.position.z = position_enu.z();
+            odom_msg.pose.pose.position.x = current_state_.position.x();
+            odom_msg.pose.pose.position.y = current_state_.position.y();
+            odom_msg.pose.pose.position.z = current_state_.position.z();
             
             // Orientation
             odom_msg.pose.pose.orientation.w = current_state_.orientation.w();
@@ -2099,13 +2058,7 @@ private:
             // Velocity
             odom_msg.twist.twist.linear.x = current_state_.velocity.x();
             odom_msg.twist.twist.linear.y = current_state_.velocity.y();
-            
-            // Flip Z velocity if we're flipping Z coordinates
-            if (flip_uwb_z_) {
-                odom_msg.twist.twist.linear.z = -current_state_.velocity.z();
-            } else {
-                odom_msg.twist.twist.linear.z = current_state_.velocity.z();
-            }
+            odom_msg.twist.twist.linear.z = current_state_.velocity.z();
             
             // Simple diagonal covariance
             odom_msg.pose.covariance[0] = 0.05;  // Higher uncertainty for IMU-only pose
@@ -2124,10 +2077,10 @@ private:
             transform_stamped.header.frame_id = world_frame_id_; // "map"
             transform_stamped.child_frame_id = body_frame_id_;   // "base_link"
             
-            // Set translation (using ENU position for visualization)
-            transform_stamped.transform.translation.x = position_enu.x();
-            transform_stamped.transform.translation.y = position_enu.y();
-            transform_stamped.transform.translation.z = position_enu.z();
+            // Set translation
+            transform_stamped.transform.translation.x = current_state_.position.x();
+            transform_stamped.transform.translation.y = current_state_.position.y();
+            transform_stamped.transform.translation.z = current_state_.position.z();
             
             // Set rotation
             transform_stamped.transform.rotation.w = current_state_.orientation.w();
@@ -2151,13 +2104,10 @@ private:
             odom_msg.header.frame_id = world_frame_id_; // "map"
             odom_msg.child_frame_id = body_frame_id_;   // "base_link"
             
-            // Convert position back to ENU frame (Z-up) for publishing if needed
-            Eigen::Vector3d position_enu = convertPositionToEnuFrame(current_state_.position);
-            
             // Position
-            odom_msg.pose.pose.position.x = position_enu.x();
-            odom_msg.pose.pose.position.y = position_enu.y();
-            odom_msg.pose.pose.position.z = position_enu.z();
+            odom_msg.pose.pose.position.x = current_state_.position.x();
+            odom_msg.pose.pose.position.y = current_state_.position.y();
+            odom_msg.pose.pose.position.z = current_state_.position.z();
             
             // Orientation
             odom_msg.pose.pose.orientation.w = current_state_.orientation.w();
@@ -2168,13 +2118,7 @@ private:
             // Velocity
             odom_msg.twist.twist.linear.x = current_state_.velocity.x();
             odom_msg.twist.twist.linear.y = current_state_.velocity.y();
-            
-            // Flip Z velocity if we're flipping Z coordinates
-            if (flip_uwb_z_) {
-                odom_msg.twist.twist.linear.z = -current_state_.velocity.z();
-            } else {
-                odom_msg.twist.twist.linear.z = current_state_.velocity.z();
-            }
+            odom_msg.twist.twist.linear.z = current_state_.velocity.z();
             
             // Simple diagonal covariance
             odom_msg.pose.covariance[0] = 0.01;  // Lower uncertainty for optimized pose
@@ -2193,10 +2137,10 @@ private:
             transform_stamped.header.frame_id = world_frame_id_; // "map"
             transform_stamped.child_frame_id = body_frame_id_;   // "base_link"
             
-            // Set translation (using ENU position for visualization)
-            transform_stamped.transform.translation.x = position_enu.x();
-            transform_stamped.transform.translation.y = position_enu.y();
-            transform_stamped.transform.translation.z = position_enu.z();
+            // Set translation
+            transform_stamped.transform.translation.x = current_state_.position.x();
+            transform_stamped.transform.translation.y = current_state_.position.y();
+            transform_stamped.transform.translation.z = current_state_.position.z();
             
             // Set rotation
             transform_stamped.transform.rotation.w = current_state_.orientation.w();
