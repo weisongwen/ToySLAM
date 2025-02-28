@@ -163,11 +163,11 @@ target_link_libraries(RangingRC ${catkin_LIBRARIES} ${CERES_LIBRARIES}
 )
 
 
-# add_executable(loam_mapping_node src/loam_mapping_node.cpp)
-# target_link_libraries(loam_mapping_node
-#   ${catkin_LIBRARIES}
-#   ${PCL_LIBRARIES}
-#   ${CERES_LIBRARIES}
-#   # pclomp
-#   OpenMP::OpenMP_CXX
-# )
+add_executable(loam_mapping_node src/loam_mapping_node.cpp)
+target_link_libraries(loam_mapping_node
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  ${CERES_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
