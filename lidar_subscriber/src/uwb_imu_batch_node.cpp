@@ -921,7 +921,6 @@ public:
         
         // Constraint weights
         private_nh.param<double>("roll_pitch_weight", roll_pitch_weight_, 300.0); // Increased from 100.0
-        private_nh.param<double>("imu_pose_pub_frequency", imu_pose_pub_frequency_, 100.0);
         private_nh.param<double>("max_imu_dt", max_imu_dt_, 0.5);
         private_nh.param<double>("imu_orientation_weight", imu_orientation_weight_, 50.0);
         private_nh.param<double>("bias_constraint_weight", bias_constraint_weight_, 1000.0);
@@ -956,11 +955,7 @@ public:
         optimization_timer_ = nh.createTimer(ros::Duration(1.0/optimization_frequency_), 
                                            &UwbImuFusion::optimizationTimerCallback, this);
         
-        // Setup high-frequency IMU pose publisher timer
-        imu_pose_pub_timer_ = nh.createTimer(ros::Duration(1.0/imu_pose_pub_frequency_), 
-                                           &UwbImuFusion::imuPoseTimerCallback, this);
-        
-        ROS_INFO("UWB-IMU Fusion node initialized (WITH FIXED MARGINALIZATION)");
+        ROS_INFO("UWB-IMU Fusion node initialized with IMU-rate pose publishing");
         ROS_INFO("IMU noise: acc=%.3f m/s², gyro=%.4f rad/s", imu_acc_noise_, imu_gyro_noise_);
         ROS_INFO("Bias parameters: max_acc=%.3f m/s², max_gyro=%.4f rad/s", 
                  acc_bias_max_, gyro_bias_max_);
@@ -987,7 +982,6 @@ private:
     ros::Publisher optimized_pose_pub_;
     ros::Publisher imu_pose_pub_;
     ros::Timer optimization_timer_;
-    ros::Timer imu_pose_pub_timer_;
     tf2_ros::TransformBroadcaster tf_broadcaster_;
 
     // Parameters
@@ -1010,7 +1004,6 @@ private:
     std::string world_frame_id_;
     std::string body_frame_id_;
     double roll_pitch_weight_;
-    double imu_pose_pub_frequency_;
     double max_imu_dt_;
     double imu_orientation_weight_;
     double bias_constraint_weight_;
@@ -1337,6 +1330,9 @@ private:
             // Process IMU data for real-time state propagation
             if (is_initialized_) {
                 propagateStateWithImu(*msg);
+                
+                // MODIFIED: Directly publish the pose at IMU rate
+                publishImuPose();
             }
             
             // Clean up old IMU messages
@@ -2354,19 +2350,6 @@ private:
         const Eigen::Vector3d measured_position_;
         const double noise_std_;
     };
-
-    // Timer callback for high-frequency IMU pose publishing
-    void imuPoseTimerCallback(const ros::TimerEvent& event) {
-        try {
-            std::lock_guard<std::mutex> lock(data_mutex_);
-            
-            if (is_initialized_ && has_imu_data_) {
-                publishImuPose();
-            }
-        } catch (const std::exception& e) {
-            ROS_ERROR("Exception in imuPoseTimerCallback: %s", e.what());
-        }
-    }
 
     void optimizationTimerCallback(const ros::TimerEvent& event) {
         try {

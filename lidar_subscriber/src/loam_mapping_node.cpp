@@ -9,7 +9,6 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <Eigen/SVD>
-#include <Eigen/Eigenvalues>
 #include <ceres/ceres.h>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
@@ -17,7 +16,6 @@
 #include <pcl/search/kdtree.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/filter.h>
-#include <pcl/filters/passthrough.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/registration/transforms.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -31,7 +29,7 @@
 #include <tf/transform_broadcaster.h>
 #include <tf/transform_datatypes.h>
 
-// NDT cell structure with proper statistics
+// NDT cell structure
 struct NDTCell {
     Eigen::Vector3d mean;
     Eigen::Matrix3d covariance;
@@ -47,7 +45,101 @@ struct NDTCell {
         point_count(0) {}
 };
 
-// Manually optimized NDT implementation for maximum accuracy
+class NDTCostFunction : public ceres::SizedCostFunction<1, 6> {
+public:
+    NDTCostFunction(const Eigen::Vector3d& point, const NDTCell& cell)
+        : point_(point), cell_(cell) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                          double* residuals,
+                          double** jacobians) const {
+        
+        // Extract transformation parameters (3 for translation, 3 for rotation in angle-axis form)
+        Eigen::Vector3d translation(parameters[0][0], parameters[0][1], parameters[0][2]);
+        Eigen::Vector3d rotation_aa(parameters[0][3], parameters[0][4], parameters[0][5]);
+        
+        // Convert angle-axis to rotation matrix
+        double angle = rotation_aa.norm();
+        Eigen::Matrix3d rotation_matrix;
+        
+        if (angle < 1e-10) {
+            rotation_matrix = Eigen::Matrix3d::Identity();
+        } else {
+            Eigen::AngleAxisd rotation(angle, rotation_aa / angle);
+            rotation_matrix = rotation.toRotationMatrix();
+        }
+        
+        // Transform the point
+        Eigen::Vector3d transformed_point = rotation_matrix * point_ + translation;
+        
+        // Compute the difference from the mean
+        Eigen::Vector3d diff = transformed_point - cell_.mean;
+        
+        // Compute the NDT score: negative log-likelihood based on Normal distribution
+        double md2 = diff.transpose() * cell_.inverse_covariance * diff;
+        
+        // Apply robust loss function
+        if (md2 > 1.0) {
+            md2 = 2.0 * sqrt(md2) - 1.0;  // Smooth L1 Loss (Huber-like)
+        }
+        
+        // We minimize the negative log-likelihood
+        residuals[0] = 0.5 * md2;
+        
+        // Compute Jacobians if requested
+        if (jacobians && jacobians[0]) {
+            // The gradient of the score with respect to the transformed point
+            Eigen::Vector3d score_gradient;
+            
+            if (md2 > 1.0) {
+                // For robust loss, adjust gradient
+                score_gradient = (cell_.inverse_covariance * diff) / sqrt(diff.transpose() * cell_.inverse_covariance * diff);
+            } else {
+                score_gradient = cell_.inverse_covariance * diff;
+            }
+            
+            // Jacobian with respect to translation (direct mapping)
+            jacobians[0][0] = score_gradient.x();
+            jacobians[0][1] = score_gradient.y();
+            jacobians[0][2] = score_gradient.z();
+            
+            // Jacobian with respect to rotation parameters
+            // Create skew-symmetric matrix for the cross product
+            Eigen::Matrix3d skew_p;
+            skew_p << 0, -point_.z(), point_.y(),
+                      point_.z(), 0, -point_.x(),
+                      -point_.y(), point_.x(), 0;
+            
+            // Compute rotation Jacobian
+            Eigen::Vector3d rot_jacobian;
+            if (angle < 1e-10) {
+                // For small angles use direct cross product
+                rot_jacobian = -skew_p.transpose() * score_gradient;
+            } else {
+                // For larger angles, the Jacobian is more complex
+                // We use rotated point in the cross product
+                Eigen::Vector3d p_rot = rotation_matrix * point_;
+                Eigen::Matrix3d skew_rot_p;
+                skew_rot_p << 0, -p_rot.z(), p_rot.y(),
+                               p_rot.z(), 0, -p_rot.x(),
+                               -p_rot.y(), p_rot.x(), 0;
+                
+                rot_jacobian = -skew_rot_p.transpose() * score_gradient;
+            }
+            
+            jacobians[0][3] = rot_jacobian.x();
+            jacobians[0][4] = rot_jacobian.y();
+            jacobians[0][5] = rot_jacobian.z();
+        }
+        
+        return true;
+    }
+
+private:
+    Eigen::Vector3d point_;
+    NDTCell cell_;
+};
+
 class HighAccuracyNDT {
 public:
     HighAccuracyNDT(ros::NodeHandle& nh) : 
@@ -57,26 +149,21 @@ public:
         frames_processed_(0),
         rng_(std::random_device()()) {
             
-        // ====== Parameters for high-accuracy NDT ======
+        // Parameters for high-accuracy NDT
+        downsample_resolution_ = 0.1;    // 10cm for downsampling
+        ndt_resolution_coarse_ = 2.0;    // 2m for coarse grid
+        ndt_resolution_fine_ = 0.5;      // 0.5m for fine grid
+        max_iterations_ = 35;            // Optimization iterations
+        min_range_ = 0.5;                // Minimum range filter
+        max_range_ = 100.0;              // Maximum range filter
+        min_points_per_voxel_ = 6;       // Minimum points per voxel
+        outlier_ratio_ = 0.55;           // Robust loss parameter
+        transformation_epsilon_ = 0.01;  // Convergence threshold
+        use_initial_guess_ = true;       // Use previous transform as initial
+        fixed_frame_ = "map";            // Fixed frame name
+        use_direct_search_ = false;      // Direct search optimization
         
-        // Load parameters from ROS parameter server with defaults
-        nh_.param<double>("downsample_resolution", downsample_resolution_, 0.1);  // 10cm voxel grid
-        nh_.param<double>("ndt_resolution_coarse", ndt_resolution_coarse_, 2.0);  // Coarse resolution
-        nh_.param<double>("ndt_resolution_fine", ndt_resolution_fine_, 1.0);      // Fine resolution
-        nh_.param<int>("max_iterations", max_iterations_, 50);                    // Optimization iterations
-        nh_.param<double>("min_range", min_range_, 0.5);                          // Min range filter
-        nh_.param<double>("max_range", max_range_, 100.0);                        // Max range filter
-        nh_.param<int>("min_points_per_voxel", min_points_per_voxel_, 6);         // Min points for covariance
-        nh_.param<bool>("use_initial_guess", use_initial_guess_, true);           // Use previous transform
-        nh_.param<double>("epsilon", epsilon_, 0.01);                             // Convergence threshold
-        nh_.param<double>("voxel_importance_coeff", voxel_importance_, 0.1);      // Importance coefficient
-        nh_.param<std::string>("fixed_frame", fixed_frame_, "map");               // Fixed frame name
-        nh_.param<double>("outlier_ratio", outlier_ratio_, 0.55);                 // Robust loss parameter
-        nh_.param<double>("trans_epsilon", transformation_epsilon_, 0.01);        // Transformation threshold
-        nh_.param<double>("step_size", step_size_, 0.1);                          // Optimization step size
-        nh_.param<bool>("use_direct_search", use_direct_search_, true);           // Use direct search optimization
-        
-        // Initialize publishers and subscribers
+        // Initialize ROS interfaces
         cloud_sub_ = nh_.subscribe("/velodyne_points", 100, &HighAccuracyNDT::cloudCallback, this);
         pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("ndt_pose", 10);
         odom_pub_ = nh_.advertise<nav_msgs::Odometry>("ndt_odom", 10);
@@ -85,11 +172,12 @@ public:
         registered_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("registered_cloud", 10);
         
         // Initialize pose
-        current_pose_ = Eigen::Matrix4f::Identity();
-        prev_transform_ = Eigen::Matrix4f::Identity();
+        current_pose_ = Eigen::Matrix4d::Identity();
+        previous_transform_ = Eigen::Matrix4d::Identity();
         
-        // Target cloud pointer initialization
+        // Initialize cloud pointers
         target_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+        keyframe_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
         
         // Start processing thread
         processing_thread_ = std::thread(&HighAccuracyNDT::processQueue, this);
@@ -98,7 +186,7 @@ public:
         status_timer_ = nh_.createTimer(ros::Duration(1.0), &HighAccuracyNDT::publishStatus, this);
         
         ROS_INFO("High-Accuracy NDT Registration initialized");
-        ROS_INFO("Downsample resolution: %.3f, NDT resolutions: [%.2f, %.2f]", 
+        ROS_INFO("Downsample: %.2fm, NDT resolutions: [%.1f, %.1f]", 
                 downsample_resolution_, ndt_resolution_coarse_, ndt_resolution_fine_);
     }
     
@@ -129,21 +217,19 @@ private:
     double min_range_;
     double max_range_;
     int min_points_per_voxel_;
-    bool use_initial_guess_;
-    double epsilon_;
-    double voxel_importance_;
-    std::string fixed_frame_;
     double outlier_ratio_;
     double transformation_epsilon_;
-    double step_size_;
+    bool use_initial_guess_;
+    std::string fixed_frame_;
     bool use_direct_search_;
     
     // State variables
     int frames_processed_;
     pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud_;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr keyframe_cloud_;
     bool has_target_cloud_;
-    Eigen::Matrix4f current_pose_;
-    Eigen::Matrix4f prev_transform_;
+    Eigen::Matrix4d current_pose_;
+    Eigen::Matrix4d previous_transform_;
     ros::Time last_cloud_time_;
     
     // Random number generator for sampling
@@ -155,12 +241,43 @@ private:
     std::thread processing_thread_;
     bool processing_thread_active_;
     
+    // NDT Grid structure
+    struct VoxelGrid {
+        double resolution;
+        std::unordered_map<uint64_t, NDTCell> cells;
+        
+        VoxelGrid(double res) : resolution(res) {}
+        
+        // Get voxel index from point coordinates
+        uint64_t getVoxelIndex(double x, double y, double z) const {
+            int i = static_cast<int>(std::floor(x / resolution));
+            int j = static_cast<int>(std::floor(y / resolution));
+            int k = static_cast<int>(std::floor(z / resolution));
+            
+            // Use spatial hashing for unique 64-bit index
+            uint64_t hash = ((static_cast<uint64_t>(i) << 20) ^ 
+                            (static_cast<uint64_t>(j) << 10) ^ 
+                            static_cast<uint64_t>(k));
+            return hash;
+        }
+        
+        // Get voxel containing a point
+        const NDTCell* getVoxel(double x, double y, double z) const {
+            uint64_t idx = getVoxelIndex(x, y, z);
+            auto it = cells.find(idx);
+            if (it != cells.end()) {
+                return &(it->second);
+            }
+            return nullptr;
+        }
+    };
+    
     void cloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud_msg) {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         
-        // Check queue size
+        // Limit queue size
         if (cloud_queue_.size() > 100) {
-            cloud_queue_.pop();  // Drop oldest message if queue too large
+            cloud_queue_.pop();
         }
         
         cloud_queue_.push(cloud_msg);
@@ -223,6 +340,7 @@ private:
                 if (!has_target_cloud_) {
                     // First frame, just store it
                     target_cloud_ = filtered_cloud;
+                    keyframe_cloud_ = filtered_cloud;
                     has_target_cloud_ = true;
                     frames_processed_++;
                     ROS_INFO("First frame stored as reference");
@@ -231,53 +349,54 @@ private:
                     publishRegisteredCloud(filtered_cloud, cloud_msg->header);
                     publishPose(cloud_msg->header);
                 } else {
-                    // Align current frame to target frame
+                    // Perform scan-to-scan registration
                     
                     // Initial guess
-                    Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+                    Eigen::Matrix4d initial_guess = Eigen::Matrix4d::Identity();
                     if (use_initial_guess_ && frames_processed_ > 0) {
-                        initial_guess = prev_transform_;
+                        initial_guess = previous_transform_;
                     }
                     
-                    // Create voxel grid for target cloud
-                    VoxelGrid target_grid = createVoxelGrid(target_cloud_, ndt_resolution_coarse_);
+                    // Multi-resolution NDT
+                    // 1. Create coarse NDT grid
+                    VoxelGrid coarse_grid = createNDTGrid(target_cloud_, ndt_resolution_coarse_);
                     
-                    // Perform coarse-to-fine alignment
-                    Eigen::Matrix4f coarse_transform = alignPointCloud(filtered_cloud, target_grid, initial_guess);
+                    // 2. Perform alignment at coarse level
+                    Eigen::Matrix4d coarse_transform = alignPointClouds(filtered_cloud, coarse_grid, initial_guess);
                     
-                    // Create fine voxel grid for target
-                    VoxelGrid fine_target_grid = createVoxelGrid(target_cloud_, ndt_resolution_fine_);
+                    // 3. Create fine NDT grid
+                    VoxelGrid fine_grid = createNDTGrid(target_cloud_, ndt_resolution_fine_);
                     
-                    // Perform fine alignment
-                    Eigen::Matrix4f transform = alignPointCloud(filtered_cloud, fine_target_grid, coarse_transform);
+                    // 4. Perform alignment at fine level
+                    Eigen::Matrix4d transform = alignPointClouds(filtered_cloud, fine_grid, coarse_transform);
                     
                     // Store transform for next frame
-                    prev_transform_ = transform;
+                    previous_transform_ = transform;
                     
                     // Update global pose
                     current_pose_ = transform * current_pose_;
                     
-                    // Transform current frame to global frame
-                    pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-                    pcl::transformPointCloud(*filtered_cloud, *transformed_cloud, current_pose_);
+                    // Transform cloud to global frame
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr registered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+                    pcl::transformPointCloud(*filtered_cloud, *registered_cloud, current_pose_);
                     
                     // Update target for next iteration
                     target_cloud_ = filtered_cloud;
                     
                     // Publish results
-                    publishRegisteredCloud(transformed_cloud, cloud_msg->header);
+                    publishRegisteredCloud(registered_cloud, cloud_msg->header);
                     publishPose(cloud_msg->header);
                     
                     frames_processed_++;
                     
                     // Display transform for debugging
-                    Eigen::Vector3f translation = transform.block<3,1>(0,3);
-                    Eigen::Matrix3f rotation = transform.block<3,3>(0,0);
-                    Eigen::AngleAxisf aaxis(rotation);
+                    Eigen::Vector3d translation = transform.block<3,1>(0,3);
+                    Eigen::Matrix3d rotation = transform.block<3,3>(0,0);
+                    Eigen::AngleAxisd aaxis(rotation);
                     
                     ROS_INFO("Transform: [%.3f, %.3f, %.3f] rot: %.2f degrees", 
                             translation.x(), translation.y(), translation.z(),
-                            aaxis.angle() * 180.0f / M_PI);
+                            aaxis.angle() * 180.0 / M_PI);
                 }
                 
                 auto end_time = std::chrono::steady_clock::now();
@@ -295,56 +414,58 @@ private:
         }
     }
     
-    struct VoxelGrid {
-        std::unordered_map<size_t, NDTCell> voxels;
-        double resolution;
+    void preProcessPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+                             pcl::PointCloud<pcl::PointXYZ>::Ptr& output) {
         
-        VoxelGrid(double res) : resolution(res) {}
+        // Remove NaN points
+        pcl::PointCloud<pcl::PointXYZ>::Ptr no_nan_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        std::vector<int> indices;
+        pcl::removeNaNFromPointCloud(*input, *no_nan_cloud, indices);
         
-        // Hash function for getting voxel index
-        size_t getVoxelIndex(double x, double y, double z) const {
-            int i = static_cast<int>(std::floor(x / resolution));
-            int j = static_cast<int>(std::floor(y / resolution));
-            int k = static_cast<int>(std::floor(z / resolution));
-            
-            // Szudzik's function for spatial hashing
-            size_t a = i >= 0 ? 2 * i : -2 * i - 1;
-            size_t b = j >= 0 ? 2 * j : -2 * j - 1;
-            size_t c = k >= 0 ? 2 * k : -2 * k - 1;
-            
-            size_t hash = ((a >= b ? a * a + a + b : a + b * b) * 3937) ^ 
-                         (c * 257);
-                
-            return hash;
-        }
+        // Filter by range
+        pcl::PointCloud<pcl::PointXYZ>::Ptr range_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+        range_filtered->reserve(no_nan_cloud->size());
         
-        // Find the cell containing point (x,y,z)
-        NDTCell* getCell(double x, double y, double z) {
-            size_t idx = getVoxelIndex(x, y, z);
-            auto it = voxels.find(idx);
-            if (it != voxels.end()) {
-                return &(it->second);
+        for (const auto& point : no_nan_cloud->points) {
+            double range = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+            if (range >= min_range_ && range <= max_range_) {
+                range_filtered->push_back(point);
             }
-            return nullptr;
         }
-    };
+        
+        // Remove statistical outliers
+        pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_outliers(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+        sor.setInputCloud(range_filtered);
+        sor.setMeanK(50);
+        sor.setStddevMulThresh(1.0);
+        sor.filter(*filtered_outliers);
+        
+        // Downsample with voxel grid
+        pcl::VoxelGrid<pcl::PointXYZ> voxel_grid;
+        voxel_grid.setInputCloud(filtered_outliers);
+        voxel_grid.setLeafSize(downsample_resolution_, downsample_resolution_, downsample_resolution_);
+        voxel_grid.filter(*output);
+        
+        ROS_INFO("Pre-processing: %ld -> %ld points", input->size(), output->size());
+    }
     
-    VoxelGrid createVoxelGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, double resolution) {
+    // Create NDT grid from point cloud
+    VoxelGrid createNDTGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, double resolution) {
         VoxelGrid grid(resolution);
         
-        // First pass: collect points per voxel
-        std::unordered_map<size_t, std::vector<Eigen::Vector3f>> voxel_points;
+        // First pass: collect points for each voxel
+        std::unordered_map<uint64_t, std::vector<Eigen::Vector3d>> voxel_points;
         
         for (const auto& point : cloud->points) {
-            size_t idx = grid.getVoxelIndex(point.x, point.y, point.z);
-            voxel_points[idx].push_back(Eigen::Vector3f(point.x, point.y, point.z));
+            uint64_t idx = grid.getVoxelIndex(point.x, point.y, point.z);
+            voxel_points[idx].push_back(Eigen::Vector3d(point.x, point.y, point.z));
         }
         
-        // Second pass: compute statistics for each voxel
+        // Second pass: compute NDT cells
         for (const auto& [idx, points] : voxel_points) {
-            // Need enough points for good statistics
             if (points.size() < min_points_per_voxel_) {
-                continue;
+                continue;  // Skip cells with too few points
             }
             
             NDTCell cell;
@@ -353,15 +474,15 @@ private:
             // Compute mean
             Eigen::Vector3d mean = Eigen::Vector3d::Zero();
             for (const auto& p : points) {
-                mean += p.cast<double>();
+                mean += p;
             }
-            mean /= static_cast<double>(points.size());
+            mean /= points.size();
             cell.mean = mean;
             
             // Compute covariance
             Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
             for (const auto& p : points) {
-                Eigen::Vector3d diff = p.cast<double>() - mean;
+                Eigen::Vector3d diff = p - mean;
                 covariance += diff * diff.transpose();
             }
             
@@ -370,12 +491,12 @@ private:
                 covariance /= (points.size() - 1);
             }
             
-            // Condition the covariance matrix - regularization
+            // Regularize covariance matrix
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(covariance);
             Eigen::Vector3d eigenvalues = solver.eigenvalues();
             Eigen::Matrix3d eigenvectors = solver.eigenvectors();
             
-            // Apply minimum eigenvalue constraint - addresses degenerate cases
+            // Apply minimum eigenvalue constraint
             double max_eigenvalue = eigenvalues.maxCoeff();
             double min_allowed = std::max(0.01 * max_eigenvalue, 0.001);
             
@@ -385,389 +506,127 @@ private:
                 }
             }
             
-            // Reconstruct with conditioned eigenvalues
+            // Reconstruct covariance
             cell.covariance = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
             
             // Compute inverse and determinant
             cell.inverse_covariance = cell.covariance.inverse();
             cell.det_covariance = cell.covariance.determinant();
             
-            // Make sure matrix is valid
+            // Only add if valid
             if (cell.det_covariance > 0 && 
                 std::isfinite(cell.inverse_covariance.sum()) &&
                 std::isfinite(cell.det_covariance)) {
                 
-                grid.voxels[idx] = cell;
+                grid.cells[idx] = cell;
             }
         }
         
-        ROS_INFO("Created voxel grid with %zu cells (res=%.2f)", grid.voxels.size(), resolution);
+        ROS_INFO("Created NDT grid with %zu cells (res=%.2f)", grid.cells.size(), resolution);
         return grid;
     }
     
-    void preProcessPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
-                             pcl::PointCloud<pcl::PointXYZ>::Ptr& output) {
+    // Align a point cloud using Ceres
+    Eigen::Matrix4d alignPointClouds(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source,
+                                    const VoxelGrid& target_grid,
+                                    const Eigen::Matrix4d& initial_guess) {
         
-        // 1. Remove NaN points
-        pcl::PointCloud<pcl::PointXYZ>::Ptr no_nan_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-        std::vector<int> indices;
-        pcl::removeNaNFromPointCloud(*input, *no_nan_cloud, indices);
+        // Set up Ceres problem
+        ceres::Problem problem;
         
-        // 2. Filter points by range
-        pcl::PointCloud<pcl::PointXYZ>::Ptr range_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-        range_filtered->reserve(no_nan_cloud->size());
+        // Extract transformation parameters from initial guess
+        Eigen::Matrix3d init_rotation = initial_guess.block<3, 3>(0, 0);
+        Eigen::Vector3d init_translation = initial_guess.block<3, 1>(0, 3);
         
-        for (const auto& point : no_nan_cloud->points) {
-            float range = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
-            if (range >= min_range_ && range <= max_range_) {
-                range_filtered->push_back(point);
+        // Convert rotation matrix to angle-axis
+        Eigen::AngleAxisd angle_axis(init_rotation);
+        double angle = angle_axis.angle();
+        Eigen::Vector3d axis = angle_axis.axis();
+        Eigen::Vector3d rotation_aa = angle * axis;
+        
+        // Parameters: tx, ty, tz, rx, ry, rz (angle-axis)
+        double transform_params[6] = {
+            init_translation.x(), init_translation.y(), init_translation.z(),
+            rotation_aa.x(), rotation_aa.y(), rotation_aa.z()
+        };
+        
+        // Add cost functions for point-to-distribution matches
+        int num_residuals = 0;
+        
+        // Select random subset of points for efficiency
+        std::vector<int> indices(source->size());
+        for (size_t i = 0; i < source->size(); i++) {
+            indices[i] = i;
+        }
+        
+        // Shuffle indices for uniform sampling
+        std::shuffle(indices.begin(), indices.end(), rng_);
+        
+        // Use a limited number of points for efficiency
+        int max_points = std::min(static_cast<int>(source->size()), 2000);
+        
+        for (int i = 0; i < max_points; i++) {
+            const auto& point = source->points[indices[i]];
+            
+            // Create point vector
+            Eigen::Vector3d p_src(point.x, point.y, point.z);
+            
+            // Find corresponding voxel 
+            // First transform using initial guess for better matches
+            Eigen::Vector3d p_init = init_rotation * p_src + init_translation;
+            
+            // Find corresponding cell in target grid
+            const NDTCell* cell = target_grid.getVoxel(p_init.x(), p_init.y(), p_init.z());
+            
+            if (cell) {
+                // Add cost function for this match
+                ceres::CostFunction* cost_fn = new NDTCostFunction(p_src, *cell);
+                problem.AddResidualBlock(cost_fn, new ceres::HuberLoss(0.1), transform_params);
+                num_residuals++;
             }
         }
         
-        // 3. Remove statistical outliers
-        pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_outliers(new pcl::PointCloud<pcl::PointXYZ>);
-        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
-        sor.setInputCloud(range_filtered);
-        sor.setMeanK(50);
-        sor.setStddevMulThresh(1.0);
-        sor.filter(*filtered_outliers);
-        
-        // 4. Downsample with voxel grid
-        pcl::VoxelGrid<pcl::PointXYZ> voxel_grid;
-        voxel_grid.setInputCloud(filtered_outliers);
-        voxel_grid.setLeafSize(downsample_resolution_, downsample_resolution_, downsample_resolution_);
-        voxel_grid.filter(*output);
-        
-        ROS_INFO("Pre-processing: %ld -> %ld points", input->size(), output->size());
-    }
-    
-    // Core NDT function implementation - manual optimization for highest accuracy
-    double computeNDTScore(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source_cloud,
-                           const VoxelGrid& target_grid,
-                           const Eigen::Matrix4f& transform,
-                           Eigen::Vector<float, 6>* score_gradient = nullptr,
-                           Eigen::Matrix<float, 6, 6>* hessian = nullptr) {
-        
-        // Initialize score, gradient, and hessian if needed
-        double score = 0.0;
-        if (score_gradient) {
-            score_gradient->setZero();
-        }
-        if (hessian) {
-            hessian->setZero();
+        if (num_residuals < 10) {
+            ROS_WARN("Not enough matches (%d), returning initial guess", num_residuals);
+            return initial_guess;
         }
         
-        // Extract rotation and translation
-        Eigen::Matrix3f R = transform.block<3, 3>(0, 0);
-        Eigen::Vector3f t = transform.block<3, 1>(0, 3);
+        // Configure the solver
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.minimizer_progress_to_stdout = false;
+        options.max_num_iterations = max_iterations_;
+        options.function_tolerance = 1e-6;
+        options.gradient_tolerance = 1e-10;
+        options.parameter_tolerance = 1e-8;
         
-        // Number of points with valid voxel associations
-        int valid_points = 0;
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
         
-        // Loop through source cloud points
-        for (const auto& point : source_cloud->points) {
-            // Transform the point
-            Eigen::Vector3f p_src(point.x, point.y, point.z);
-            Eigen::Vector3f p_trans = R * p_src + t;
-            
-            // Find target voxel for this point
-            NDTCell* target_cell = target_grid.getCell(p_trans.x(), p_trans.y(), p_trans.z());
-            
-            if (!target_cell) {
-                continue;  // No valid target voxel
-            }
-            
-            // Calculate the difference between the transformed point and voxel mean
-            Eigen::Vector3d p_trans_d = p_trans.cast<double>();
-            Eigen::Vector3d diff = p_trans_d - target_cell->mean;
-            
-            // Calculate Mahalanobis distance and score contribution
-            double md2 = diff.transpose() * target_cell->inverse_covariance * diff;
-            
-            // Apply robust loss function to handle outliers
-            if (md2 > outlier_ratio_) {
-                // If distance is too large, apply constant penalty
-                md2 = outlier_ratio_;
-            }
-            
-            // Accumulate score - negative because we want to maximize likelihood
-            double cell_score = -0.5 * md2;
-            score += cell_score;
-            
-            // If gradient or hessian are requested, compute derivatives
-            if (score_gradient || hessian) {
-                // Convert to float for gradient/hessian computation
-                Eigen::Vector3f diff_f = diff.cast<float>();
-                Eigen::Matrix3f inv_cov_f = target_cell->inverse_covariance.cast<float>();
-                
-                // Avoid computing for outliers
-                if (md2 <= outlier_ratio_) {
-                    // Score gradient w.r.t. transformation parameters
-                    Eigen::Vector3f grad_trans = -inv_cov_f * diff_f;
-                    
-                    // Compute partial derivatives
-                    if (score_gradient) {
-                        // Translation part - directly use the gradient
-                        score_gradient->head<3>() += grad_trans;
-                        
-                        // Rotation part - use cross product
-                        Eigen::Vector3f p_cross = p_src.cross(R.transpose() * grad_trans);
-                        score_gradient->tail<3>() += p_cross;
-                    }
-                    
-                    // Compute Hessian if needed
-                    if (hessian) {
-                        // Translation-translation block
-                        hessian->block<3, 3>(0, 0) += inv_cov_f;
-                        
-                        // Rotation-translation and translation-rotation blocks
-                        Eigen::Matrix3f skew_p;
-                        skew_p << 0, -p_src.z(), p_src.y(),
-                                p_src.z(), 0, -p_src.x(),
-                                -p_src.y(), p_src.x(), 0;
-                        
-                        Eigen::Matrix3f rot_trans_hessian = -skew_p * inv_cov_f;
-                        hessian->block<3, 3>(3, 0) += rot_trans_hessian;
-                        hessian->block<3, 3>(0, 3) += rot_trans_hessian.transpose();
-                        
-                        // Rotation-rotation block
-                        Eigen::Matrix3f p_hat_squared = skew_p * skew_p;
-                        hessian->block<3, 3>(3, 3) += p_hat_squared * inv_cov_f.trace();
-                    }
-                }
-            }
-            
-            valid_points++;
+        // Extract the optimized transform
+        Eigen::Vector3d translation(transform_params[0], transform_params[1], transform_params[2]);
+        Eigen::Vector3d rot_aa(transform_params[3], transform_params[4], transform_params[5]);
+        
+        Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+        
+        // Set translation
+        result.block<3, 1>(0, 3) = translation;
+        
+        // Set rotation
+        double rot_angle = rot_aa.norm();
+        if (rot_angle > 1e-10) {
+            Eigen::AngleAxisd rotation(rot_angle, rot_aa / rot_angle);
+            result.block<3, 3>(0, 0) = rotation.toRotationMatrix();
         }
         
-        // Return average score
-        if (valid_points > 0) {
-            double avg_score = score / valid_points;
-            
-            // Scale gradient and Hessian if computed
-            if (score_gradient) {
-                *score_gradient /= valid_points;
-            }
-            if (hessian) {
-                *hessian /= valid_points;
-                
-                // Ensure Hessian is positive definite
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<float, 6, 6>> eig(*hessian);
-                Eigen::Matrix<float, 6, 1> eigenvalues = eig.eigenvalues();
-                Eigen::Matrix<float, 6, 6> eigenvectors = eig.eigenvectors();
-                
-                for (int i = 0; i < 6; i++) {
-                    if (eigenvalues(i) < 1e-5) {
-                        eigenvalues(i) = 1e-5;
-                    }
-                }
-                
-                *hessian = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
-            }
-            
-            return avg_score;
-        }
+        ROS_INFO("NDT alignment with %d matches converged after %d iterations", 
+                 num_residuals, summary.iterations.size());
         
-        return -std::numeric_limits<double>::max(); // No valid points
-    }
-    
-    // Newton's method for optimization
-    Eigen::Matrix4f optimizeTransformNewton(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source_cloud,
-                                          const VoxelGrid& target_grid,
-                                          const Eigen::Matrix4f& initial_guess) {
-        
-        Eigen::Matrix4f current_transform = initial_guess;
-        
-        // Optimization variables
-        Eigen::Vector<float, 6> step;
-        Eigen::Vector<float, 6> gradient;
-        Eigen::Matrix<float, 6, 6> hessian;
-        
-        double score = computeNDTScore(source_cloud, target_grid, current_transform, &gradient, &hessian);
-        double previous_score = -std::numeric_limits<double>::max();
-        
-        // Newton optimization
-        for (int iter = 0; iter < max_iterations_; iter++) {
-            // Break if score isn't improving significantly
-            if (iter > 0 && std::abs(score - previous_score) < epsilon_) {
-                ROS_INFO("Converged at iteration %d: score diff = %.10f < %.10f", 
-                        iter, std::abs(score - previous_score), epsilon_);
-                break;
-            }
-            
-            // Compute update step: solve H * step = -g
-            Eigen::JacobiSVD<Eigen::Matrix<float, 6, 6>> svd(hessian, Eigen::ComputeFullU | Eigen::ComputeFullV);
-            step = -svd.solve(gradient);
-            
-            // Apply step size constraint
-            float step_norm = step.norm();
-            if (step_norm > step_size_) {
-                step *= step_size_ / step_norm;
-            }
-            
-            // Convert to transformation matrix
-            Eigen::Matrix4f step_transform = Eigen::Matrix4f::Identity();
-            
-            // Apply translation part
-            step_transform.block<3, 1>(0, 3) = step.head<3>();
-            
-            // Apply rotation part
-            Eigen::Vector3f rot_vec = step.tail<3>();
-            float rot_angle = rot_vec.norm();
-            
-            if (rot_angle > 1e-10) {
-                Eigen::Vector3f rot_axis = rot_vec / rot_angle;
-                Eigen::AngleAxisf rot(rot_angle, rot_axis);
-                step_transform.block<3, 3>(0, 0) = rot.toRotationMatrix();
-            }
-            
-            // Apply step: T_new = T_step * T_old
-            Eigen::Matrix4f new_transform = step_transform * current_transform;
-            
-            // Evaluate new score
-            previous_score = score;
-            score = computeNDTScore(source_cloud, target_grid, new_transform, &gradient, &hessian);
-            
-            // Update if better
-            if (score > previous_score) {
-                current_transform = new_transform;
-            } else {
-                // If not better, try with half the step size
-                step *= 0.5;
-                
-                // Apply smaller step
-                step_transform = Eigen::Matrix4f::Identity();
-                step_transform.block<3, 1>(0, 3) = step.head<3>();
-                
-                rot_vec = step.tail<3>();
-                rot_angle = rot_vec.norm();
-                
-                if (rot_angle > 1e-10) {
-                    Eigen::Vector3f rot_axis = rot_vec / rot_angle;
-                    Eigen::AngleAxisf rot(rot_angle, rot_axis);
-                    step_transform.block<3, 3>(0, 0) = rot.toRotationMatrix();
-                }
-                
-                new_transform = step_transform * current_transform;
-                score = computeNDTScore(source_cloud, target_grid, new_transform, &gradient, &hessian);
-                
-                if (score > previous_score) {
-                    current_transform = new_transform;
-                } else {
-                    // Stuck in local minimum or numerical issues
-                    break;
-                }
-            }
-            
-            // Check if transformation is small enough to indicate convergence
-            if (step_norm < transformation_epsilon_) {
-                ROS_INFO("Converged at iteration %d: step norm = %.10f < %.10f", 
-                        iter, step_norm, transformation_epsilon_);
-                break;
-            }
-        }
-        
-        return current_transform;
-    }
-    
-    // Direct search algorithm for robustness against local minima
-    Eigen::Matrix4f directSearchOptimization(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source_cloud,
-                                           const VoxelGrid& target_grid,
-                                           const Eigen::Matrix4f& initial_guess) {
-        
-        Eigen::Matrix4f best_transform = initial_guess;
-        double best_score = computeNDTScore(source_cloud, target_grid, best_transform);
-        
-        // Parameters for search
-        const int num_directions = 26;  // 3D neighborhood
-        
-        // Define search directions
-        std::vector<Eigen::Vector<float, 6>> directions(num_directions);
-        int dir_idx = 0;
-        
-        // Create search pattern for translations and rotations
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
-                    
-                    // Create a direction vector
-                    Eigen::Vector<float, 6> dir;
-                    dir << 0.05f * dx, 0.05f * dy, 0.05f * dz, 0.02f * dx, 0.02f * dy, 0.02f * dz;
-                    directions[dir_idx++] = dir;
-                }
-            }
-        }
-        
-        // Direct search iterations
-        for (int iter = 0; iter < max_iterations_; iter++) {
-            bool improved = false;
-            
-            // Try each direction
-            for (const auto& dir : directions) {
-                // Convert direction to transformation
-                Eigen::Matrix4f dir_transform = Eigen::Matrix4f::Identity();
-                
-                // Apply translation
-                dir_transform.block<3, 1>(0, 3) = dir.head<3>();
-                
-                // Apply rotation
-                Eigen::Vector3f rot_vec = dir.tail<3>();
-                float rot_angle = rot_vec.norm();
-                
-                if (rot_angle > 1e-10) {
-                    Eigen::Vector3f rot_axis = rot_vec / rot_angle;
-                    Eigen::AngleAxisf rot(rot_angle, rot_axis);
-                    dir_transform.block<3, 3>(0, 0) = rot.toRotationMatrix();
-                }
-                
-                // Apply to current best
-                Eigen::Matrix4f candidate = dir_transform * best_transform;
-                
-                // Evaluate score
-                double score = computeNDTScore(source_cloud, target_grid, candidate);
-                
-                // Update if better
-                if (score > best_score) {
-                    best_score = score;
-                    best_transform = candidate;
-                    improved = true;
-                }
-            }
-            
-            // Stop if no improvement
-            if (!improved) {
-                break;
-            }
-        }
-        
-        return best_transform;
-    }
-    
-    // Main alignment function that calls appropriate optimization
-    Eigen::Matrix4f alignPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source_cloud,
-                                  const VoxelGrid& target_grid,
-                                  const Eigen::Matrix4f& initial_guess) {
-        
-        Eigen::Matrix4f final_transform;
-        
-        // If direct search is enabled, use it for robustness first
-        if (use_direct_search_) {
-            ROS_INFO("Using direct search optimization...");
-            final_transform = directSearchOptimization(source_cloud, target_grid, initial_guess);
-        } else {
-            final_transform = initial_guess;
-        }
-        
-        // Then refine with Newton's method
-        ROS_INFO("Refining with Newton optimization...");
-        final_transform = optimizeTransformNewton(source_cloud, target_grid, final_transform);
-        
-        return final_transform;
+        return result;
     }
     
     void publishRegisteredCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
-                             const std_msgs::Header& header) {
+                              const std_msgs::Header& header) {
         if (registered_cloud_pub_.getNumSubscribers() > 0) {
             sensor_msgs::PointCloud2 cloud_msg;
             pcl::toROSMsg(*cloud, cloud_msg);
@@ -779,11 +638,11 @@ private:
     
     void publishPose(const std_msgs::Header& header) {
         // Extract translation and rotation
-        Eigen::Vector3f translation = current_pose_.block<3, 1>(0, 3);
-        Eigen::Matrix3f rotation_matrix = current_pose_.block<3, 3>(0, 0);
+        Eigen::Vector3d translation = current_pose_.block<3, 1>(0, 3);
+        Eigen::Matrix3d rotation_matrix = current_pose_.block<3, 3>(0, 0);
         
         // Convert to quaternion
-        Eigen::Quaternionf quaternion(rotation_matrix);
+        Eigen::Quaterniond quaternion(rotation_matrix);
         quaternion.normalize();
         
         // Create pose message
