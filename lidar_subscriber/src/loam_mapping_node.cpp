@@ -1,2146 +1,1336 @@
-/**
- * ROS Node for FAST-LOAM: Direct Scan-to-Map LiDAR Odometry and Mapping
- * Optimized for 32-channel Velodyne LiDAR (HDL-32E, VLP-32C)
- * With improved accuracy and pose output
- */
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+#include <ceres/ceres.h>
+#include <pcl/point_types.h>
+#include <pcl/point_cloud.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/filters/filter.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/radius_outlier_removal.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/registration/transforms.h>
+#include <pcl/registration/icp.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl_conversions/pcl_conversions.h>
 
- #include <ros/ros.h>
- #include <sensor_msgs/PointCloud2.h>
- #include <nav_msgs/Odometry.h>
- #include <nav_msgs/Path.h>
- #include <tf2_ros/transform_broadcaster.h>
- #include <tf2_ros/transform_listener.h>
- #include <tf2_eigen/tf2_eigen.h>
- #include <geometry_msgs/TransformStamped.h>
- #include <pcl_conversions/pcl_conversions.h>
- #include <pcl/point_cloud.h>
- #include <pcl/point_types.h>
- #include <pcl/filters/voxel_grid.h>
- #include <pcl/kdtree/kdtree_flann.h>
- #include <pcl/common/transforms.h>
- #include <pcl/filters/extract_indices.h>
- #include <pcl/filters/approximate_voxel_grid.h>
- #include <pcl/sample_consensus/method_types.h>
- #include <pcl/sample_consensus/model_types.h>
- #include <pcl/segmentation/sac_segmentation.h>
- #include <pcl/filters/crop_box.h>
- #include <pcl/filters/radius_outlier_removal.h>
- #include <pcl/filters/statistical_outlier_removal.h>
- #include <pcl/io/pcd_io.h>
- #include <Eigen/Dense>
- #include <ceres/ceres.h>
- #include <mutex>
- #include <thread>
- #include <atomic>
- #include <deque>
- #include <vector>
- #include <cmath>
- #include <chrono>
- #include <string>
- #include <iostream>
- #include <fstream>
- #include <ctime>
- #include <unordered_map>
- #include <memory>
- #include <algorithm>
- #include <iomanip>
- 
- // Define custom point types for Velodyne 32 LiDAR
- struct PointXYZIR {
-     PCL_ADD_POINT4D;
-     float intensity;
-     uint16_t ring;
-     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
- } EIGEN_ALIGN16;
- 
- POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIR,
-     (float, x, x) (float, y, y) (float, z, z) 
-     (float, intensity, intensity) (uint16_t, ring, ring)
- )
- 
- // More comprehensive custom point type for Velodyne 32
- struct VelodynePoint {
-     PCL_ADD_POINT4D;
-     float intensity;
-     uint16_t ring;
-     float time;
-     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
- } EIGEN_ALIGN16;
- 
- POINT_CLOUD_REGISTER_POINT_STRUCT(VelodynePoint,
-     (float, x, x) (float, y, y) (float, z, z) 
-     (float, intensity, intensity) (uint16_t, ring, ring) (float, time, time)
- )
- 
- // Default point type for backward compatibility
- typedef pcl::PointXYZI PointType;
- 
- // Improved LidarEdgeFactor with enhanced numerical stability
- class LidarEdgeFactor {
- private:
-     Eigen::Vector3d curr_point_;
-     Eigen::Vector3d last_point_a_;
-     Eigen::Vector3d last_point_b_;
-     double s_;
- 
- public:
-     LidarEdgeFactor(const Eigen::Vector3d& curr_point, const Eigen::Vector3d& last_point_a,
-                     const Eigen::Vector3d& last_point_b, double s = 1.0)
-         : curr_point_(curr_point), last_point_a_(last_point_a), last_point_b_(last_point_b), s_(s) {}
- 
-     template <typename T>
-     bool operator()(const T* q, const T* t, T* residual) const {
-         Eigen::Matrix<T, 3, 1> cp{T(curr_point_.x()), T(curr_point_.y()), T(curr_point_.z())};
-         Eigen::Matrix<T, 3, 1> lpa{T(last_point_a_.x()), T(last_point_a_.y()), T(last_point_a_.z())};
-         Eigen::Matrix<T, 3, 1> lpb{T(last_point_b_.x()), T(last_point_b_.y()), T(last_point_b_.z())};
- 
-         // Ensure normalized quaternion
-         T qnorm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-         Eigen::Quaternion<T> q_eigen(q[3]/qnorm, q[0]/qnorm, q[1]/qnorm, q[2]/qnorm);
-         Eigen::Matrix<T, 3, 3> R = q_eigen.toRotationMatrix();
-         Eigen::Matrix<T, 3, 1> t_eigen(t[0], t[1], t[2]);
- 
-         // Transform current point to map frame
-         Eigen::Matrix<T, 3, 1> cp_transformed = R * cp + t_eigen;
- 
-         // Compute line direction and length
-         Eigen::Matrix<T, 3, 1> line_direction = lpb - lpa;
-         T line_length_sq = line_direction.squaredNorm();
-         
-         // Check for degenerate line (close to zero length)
-         if (line_length_sq < T(1e-8)) {
-             // Fall back to point-to-point distance
-             residual[0] = T(s_) * (cp_transformed - lpa).norm();
-             return true;
-         }
-         
-         // Project point onto line
-         Eigen::Matrix<T, 3, 1> ap = cp_transformed - lpa;
-         T t_proj = ap.dot(line_direction) / line_length_sq;
-         t_proj = t_proj < T(0) ? T(0) : (t_proj > T(1) ? T(1) : t_proj);
-         
-         // Find closest point on line segment
-         Eigen::Matrix<T, 3, 1> closest_point = lpa + t_proj * line_direction;
-         
-         // Calculate distance (more numerically stable)
-         T distance = (cp_transformed - closest_point).norm();
-         
-         // Apply robust weighting based on distance
-         T scaled_distance = distance / T(0.1);  // Scale by 10cm
-         if (scaled_distance > T(5.0)) {  // If more than 50cm, cap the influence
-             distance = T(0.5);
-         }
- 
-         // Compute residual with weight
-         residual[0] = T(s_) * distance;
- 
-         return true;
-     }
- 
-     static ceres::CostFunction* Create(const Eigen::Vector3d& curr_point, const Eigen::Vector3d& last_point_a,
-                                        const Eigen::Vector3d& last_point_b, double s = 1.0) {
-         return new ceres::AutoDiffCostFunction<LidarEdgeFactor, 1, 4, 3>(
-             new LidarEdgeFactor(curr_point, last_point_a, last_point_b, s));
-     }
- };
- 
- // Improved LidarPlaneFactor with enhanced numerical stability
- class LidarPlaneFactor {
- private:
-     Eigen::Vector3d curr_point_;
-     Eigen::Vector3d plane_unit_normal_;
-     double negative_plane_d_;
-     double s_;
- 
- public:
-     LidarPlaneFactor(const Eigen::Vector3d& curr_point, const Eigen::Vector3d& plane_unit_normal,
-                     double negative_plane_d, double s = 1.0)
-         : curr_point_(curr_point), plane_unit_normal_(plane_unit_normal), 
-           negative_plane_d_(negative_plane_d), s_(s) {}
- 
-     template <typename T>
-     bool operator()(const T* q, const T* t, T* residual) const {
-         Eigen::Matrix<T, 3, 1> cp{T(curr_point_.x()), T(curr_point_.y()), T(curr_point_.z())};
-         Eigen::Matrix<T, 3, 1> plane_normal{T(plane_unit_normal_.x()), 
-                                           T(plane_unit_normal_.y()), 
-                                           T(plane_unit_normal_.z())};
-         T nd = T(negative_plane_d_);
- 
-         // Ensure normalized quaternion
-         T qnorm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-         Eigen::Quaternion<T> q_eigen(q[3]/qnorm, q[0]/qnorm, q[1]/qnorm, q[2]/qnorm);
-         Eigen::Matrix<T, 3, 3> R = q_eigen.toRotationMatrix();
-         Eigen::Matrix<T, 3, 1> t_eigen(t[0], t[1], t[2]);
- 
-         // Transform current point to map frame
-         Eigen::Matrix<T, 3, 1> cp_transformed = R * cp + t_eigen;
- 
-         // Compute point to plane distance (numerically stable)
-         T distance = ceres::abs(plane_normal.dot(cp_transformed) + nd);
-         
-         // Apply robust weighting based on distance
-         T scaled_distance = distance / T(0.05);  // Scale by 5cm
-         if (scaled_distance > T(5.0)) {  // If more than 25cm, cap the influence
-             distance = T(0.25);
-         }
- 
-         // Compute residual with weight
-         residual[0] = T(s_) * distance;
- 
-         return true;
-     }
- 
-     static ceres::CostFunction* Create(const Eigen::Vector3d& curr_point, 
-                                      const Eigen::Vector3d& plane_unit_normal,
-                                      double negative_plane_d, double s = 1.0) {
-         return new ceres::AutoDiffCostFunction<LidarPlaneFactor, 1, 4, 3>(
-             new LidarPlaneFactor(curr_point, plane_unit_normal, negative_plane_d, s));
-     }
- };
- 
- // Efficient ring buffer for point cloud management
- template <typename PointT>
- class CloudRingBuffer {
- private:
-     std::vector<typename pcl::PointCloud<PointT>::Ptr> clouds_;
-     size_t capacity_;
-     size_t current_idx_;
-     size_t size_;
-     
-     pcl::VoxelGrid<PointT> voxel_filter_;
-     
-     // Combined cloud stored in memory for efficient access
-     typename pcl::PointCloud<PointT>::Ptr combined_cloud_;
-     bool combined_cloud_updated_;
-     
- public:
-     // Default constructor
-     CloudRingBuffer() : capacity_(0), current_idx_(0), size_(0), combined_cloud_updated_(false) {
-         combined_cloud_.reset(new pcl::PointCloud<PointT>());
-     }
-     
-     CloudRingBuffer(size_t capacity, float leaf_size) 
-         : capacity_(capacity), current_idx_(0), size_(0), combined_cloud_updated_(false) {
-         clouds_.resize(capacity);
-         for (size_t i = 0; i < capacity; ++i) {
-             clouds_[i].reset(new pcl::PointCloud<PointT>());
-         }
-         
-         combined_cloud_.reset(new pcl::PointCloud<PointT>());
-         
-         voxel_filter_.setLeafSize(leaf_size, leaf_size, leaf_size);
-     }
-     
-     void push(const typename pcl::PointCloud<PointT>::Ptr& cloud) {
-         // Replace the oldest cloud with the new one
-         *clouds_[current_idx_] = *cloud;
-         
-         // Update indices
-         current_idx_ = (current_idx_ + 1) % capacity_;
-         if (size_ < capacity_) {
-             size_++;
-         }
-         
-         combined_cloud_updated_ = false;
-     }
-     
-     typename pcl::PointCloud<PointT>::Ptr getCombinedCloud() {
-         if (!combined_cloud_updated_) {
-             // Regenerate the combined cloud
-             combined_cloud_->clear();
-             
-             for (size_t i = 0; i < size_; ++i) {
-                 *combined_cloud_ += *clouds_[(current_idx_ + capacity_ - i - 1) % capacity_];
-             }
-             
-             // Downsample the combined cloud to maintain reasonable density
-             if (combined_cloud_->size() > 20000) {  // Increased threshold for 32-channel
-                 typename pcl::PointCloud<PointT>::Ptr filtered_cloud(new pcl::PointCloud<PointT>());
-                 voxel_filter_.setInputCloud(combined_cloud_);
-                 voxel_filter_.filter(*filtered_cloud);
-                 combined_cloud_ = filtered_cloud;
-             }
-             
-             combined_cloud_updated_ = true;
-         }
-         
-         return combined_cloud_;
-     }
-     
-     size_t size() const {
-         return size_;
-     }
-     
-     bool empty() const {
-         return size_ == 0;
-     }
-     
-     void clear() {
-         for (auto& cloud : clouds_) {
-             cloud->clear();
-         }
-         combined_cloud_->clear();
-         current_idx_ = 0;
-         size_ = 0;
-         combined_cloud_updated_ = true;
-     }
- };
- 
- // Enhanced motion predictor with robust dynamics modeling for 32-channel data
- class MotionPredictor {
- private:
-     Eigen::Quaterniond last_q_;
-     Eigen::Vector3d last_t_;
-     Eigen::Quaterniond last_delta_q_;
-     Eigen::Vector3d last_delta_t_;
-     double last_timestamp_;
-     bool has_previous_estimate_;
-     
-     // Motion statistics for adaptive filtering
-     double avg_linear_velocity_;
-     double avg_angular_velocity_;
-     int sample_count_;
-     
- public:
-     MotionPredictor() : 
-         last_q_(1, 0, 0, 0), 
-         last_t_(0, 0, 0), 
-         last_delta_q_(1, 0, 0, 0), 
-         last_delta_t_(0, 0, 0), 
-         last_timestamp_(0), 
-         has_previous_estimate_(false),
-         avg_linear_velocity_(0),
-         avg_angular_velocity_(0),
-         sample_count_(0) {}
-     
-     void reset() {
-         has_previous_estimate_ = false;
-         avg_linear_velocity_ = 0;
-         avg_angular_velocity_ = 0;
-         sample_count_ = 0;
-     }
-     
-     // Update the predictor with a new pose estimate
-     void update(const Eigen::Quaterniond& q, const Eigen::Vector3d& t, double timestamp) {
-         if (has_previous_estimate_) {
-             // Calculate time difference
-             double dt = timestamp - last_timestamp_;
-             if (dt <= 0) dt = 0.1;  // Safeguard
-             
-             // Calculate motion between last two poses
-             last_delta_q_ = last_q_.inverse() * q;
-             last_delta_t_ = t - last_t_;
-             
-             // Calculate velocities
-             double linear_vel = last_delta_t_.norm() / dt;
-             double angle = 2.0 * acos(std::min(1.0, std::abs(last_delta_q_.w())));
-             double angular_vel = angle / dt;
-             
-             // Update running averages
-             if (sample_count_ < 10) {
-                 // During initial phase, simple averaging
-                 avg_linear_velocity_ = (avg_linear_velocity_ * sample_count_ + linear_vel) / (sample_count_ + 1);
-                 avg_angular_velocity_ = (avg_angular_velocity_ * sample_count_ + angular_vel) / (sample_count_ + 1);
-                 sample_count_++;
-             } else {
-                 // After initialization, use exponential moving average
-                 double alpha = 0.3;  // Weighting factor for new samples
-                 avg_linear_velocity_ = (1 - alpha) * avg_linear_velocity_ + alpha * linear_vel;
-                 avg_angular_velocity_ = (1 - alpha) * avg_angular_velocity_ + alpha * angular_vel;
-             }
-         }
-         
-         // Store current pose
-         last_q_ = q;
-         last_t_ = t;
-         last_timestamp_ = timestamp;
-         has_previous_estimate_ = true;
-     }
-     
-     // Predict the next pose based on enhanced motion model
-     void predict(Eigen::Quaterniond& q_pred, Eigen::Vector3d& t_pred, double timestamp) {
-         if (!has_previous_estimate_) {
-             // No previous data, return identity
-             q_pred = Eigen::Quaterniond(1, 0, 0, 0);
-             t_pred = Eigen::Vector3d(0, 0, 0);
-             return;
-         }
-         
-         // Calculate time difference
-         double dt = timestamp - last_timestamp_;
-         if (dt <= 0) dt = 0.1;  // Safeguard
-         
-         // Detect if motion is too large (potential outlier)
-         double expected_translation = avg_linear_velocity_ * dt;
-         double max_allowed_translation = expected_translation * 3.0;  // 3x average is max
-         
-         double translation_scale = 1.0;
-         if (last_delta_t_.norm() > max_allowed_translation && max_allowed_translation > 0) {
-             // Scale down to reasonable range
-             translation_scale = max_allowed_translation / last_delta_t_.norm();
-         }
-         
-         // Predict translation with scaled velocity
-         t_pred = last_t_ + translation_scale * last_delta_t_ * (dt / 0.1);  // Normalize by typical frame interval (0.1s)
-         
-         // Predict rotation using slerp for smoother interpolation
-         double angle = 2.0 * acos(std::min(1.0, std::abs(last_delta_q_.w())));
-         double expected_angle = avg_angular_velocity_ * dt;
-         double max_allowed_angle = expected_angle * 3.0;  // 3x average is max
-         
-         if (angle > max_allowed_angle && max_allowed_angle > 0) {
-             // Limit rotation to reasonable range
-             double scale = max_allowed_angle / angle;
-             Eigen::Quaterniond limited_q;
-             limited_q.w() = 1.0;
-             limited_q.x() = last_delta_q_.x() * scale;
-             limited_q.y() = last_delta_q_.y() * scale;
-             limited_q.z() = last_delta_q_.z() * scale;
-             limited_q.normalize();
-             
-             q_pred = last_q_ * limited_q;
-         } else {
-             // Normal prediction
-             q_pred = last_q_ * last_delta_q_;
-         }
-         
-         // Ensure the quaternion is normalized
-         q_pred.normalize();
-     }
-     
-     // Get the quality of the motion model (higher is better)
-     double getModelQuality() const {
-         if (sample_count_ < 5) {
-             return 0.5;  // Medium confidence during initialization
-         }
-         
-         // Calculate confidence based on consistency of motion
-         // If standard deviations are low, confidence is high
-         return std::min(1.0, 5.0 / sample_count_);
-     }
- };
- 
- // Helper function to detect and get ring field in Velodyne point cloud
- bool detectVelodyneRingField(const pcl::PointCloud<PointType>& cloud, bool& is_velodyne32, uint8_t& ring_offset) {
-     // Check if using custom Velodyne point type (ideal case)
-     std::vector<pcl::PCLPointField> fields;
-     
-     // First try to get fields directly from PCL
-     pcl::getFields<PointType>(fields);
-     
-     // Check for ring field
-     bool has_ring = false;
-     
-     for (const auto& field : fields) {
-         if (field.name == "ring") {
-             has_ring = true;
-             ring_offset = field.offset;
-             break;
-         }
-     }
-     
-     // Try to determine if it's a Velodyne 32 by checking point distribution
-     if (has_ring) {
-         // Sample points to check ring distribution
-         std::vector<bool> ring_presence(64, false);  // Up to 64 possible rings
-         int max_ring = 0;
-         
-         // Check up to 1000 points
-         int check_count = std::min(1000, static_cast<int>(cloud.size()));
-         for (int i = 0; i < check_count; i++) {
-             const PointType& pt = cloud[i];
-             const uint8_t* pt_data = reinterpret_cast<const uint8_t*>(&pt);
-             uint16_t ring = *reinterpret_cast<const uint16_t*>(pt_data + ring_offset);
-             
-             if (ring < 64) {
-                 ring_presence[ring] = true;
-                 max_ring = std::max(max_ring, static_cast<int>(ring));
-             }
-         }
-         
-         // Count how many different rings we saw
-         int ring_count = 0;
-         for (bool present : ring_presence) {
-             if (present) ring_count++;
-         }
-         
-         // If we detected around 32 rings and max ring is approximately 31, it's likely Velodyne 32
-         is_velodyne32 = (ring_count >= 30 && ring_count <= 34 && max_ring <= 32);
-         return has_ring;
-     }
-     
-     return false;
- }
- 
- // Convert quaternion to Euler angles in degrees
- Eigen::Vector3d quaternionToEulerDegrees(const Eigen::Quaterniond& q) {
-     Eigen::Vector3d euler = q.toRotationMatrix().eulerAngles(2, 1, 0);  // ZYX order (yaw, pitch, roll)
-     return Eigen::Vector3d(euler[2] * 180.0 / M_PI,  // Roll
-                            euler[1] * 180.0 / M_PI,  // Pitch
-                            euler[0] * 180.0 / M_PI); // Yaw
- }
- 
- class Fast32Loam {
- public:
-     Fast32Loam() : nh_("~"), tf_listener_(tf_buffer_) {
-         // Initialize parameters with defaults for 32-channel LiDAR
-         initializeParameters();
- 
-         // Setup subscribers and publishers
-         setupROSFramework();
- 
-         // Initialize variables and data structures
-         initialize();
-         
-         ROS_INFO("FAST-32-LOAM node initialized with %d vertical scans and %d horizontal points", 
-                  vertical_scans_, horizontal_scans_);
-     }
- 
-     ~Fast32Loam() {
-         // Signal threads to stop
-         running_ = false;
-         
-         if (save_map_) {
-             saveGlobalMap();
-         }
-     }
- 
- private:
-     // ROS
-     ros::NodeHandle nh_;
-     ros::Subscriber cloud_sub_;
-     ros::Publisher cloud_edge_pub_;
-     ros::Publisher cloud_surf_pub_;
-     ros::Publisher cloud_full_pub_;
-     ros::Publisher odom_pub_;
-     ros::Publisher path_pub_;
-     ros::Publisher map_pub_;
-     tf2_ros::TransformBroadcaster tf_broadcaster_;
-     tf2_ros::Buffer tf_buffer_;
-     tf2_ros::TransformListener tf_listener_;
-     
-     std::string fixed_frame_id_;
-     std::string lidar_frame_id_;
- 
-     // Parameters - optimized defaults for Velodyne 32
-     double scan_period_;
-     int vertical_scans_;
-     int horizontal_scans_;
-     double vertical_angle_top_;
-     double vertical_angle_bottom_;
-     double edge_threshold_;
-     double surf_threshold_;
-     double nearest_feature_dist_sq_;
-     int edge_feature_min_valid_num_;
-     int surf_feature_min_valid_num_;
-     double filter_corner_leaf_size_;
-     double filter_surf_leaf_size_;
-     double filter_map_leaf_size_;
-     bool save_map_;
-     std::string map_save_path_;
-     double edge_correspondence_threshold_;
-     double plane_correspondence_threshold_;
-     int max_iterations_;
-     bool undistortion_flag_;
-     int local_map_size_;
-     
-     // Multi-resolution parameters
-     bool use_multi_resolution_;
-     double high_res_leaf_size_;
-     double low_res_leaf_size_;
-     
-     // Hierarchical registration parameters
-     bool use_hierarchical_registration_;
-     int hierarchical_levels_;
-     
-     // Motion prediction parameters
-     bool use_motion_prediction_;
-     double motion_prediction_weight_;
- 
-     // Data structures
-     using CloudPtr = pcl::PointCloud<PointType>::Ptr;
-     using CloudConstPtr = pcl::PointCloud<PointType>::ConstPtr;
-     
-     // Feature map management using ring buffers for efficient updates
-     CloudRingBuffer<PointType> corner_map_buffer_;
-     CloudRingBuffer<PointType> surf_map_buffer_;
-     
-     CloudPtr global_map_;
-     
-     // Voxel grid filters
-     pcl::VoxelGrid<PointType> downsize_filter_corner_;
-     pcl::VoxelGrid<PointType> downsize_filter_surf_;
-     pcl::VoxelGrid<PointType> downsize_filter_map_;
-     
-     // More efficient approximate voxel grid for high-speed filtering
-     pcl::ApproximateVoxelGrid<PointType> approx_filter_corner_;
-     pcl::ApproximateVoxelGrid<PointType> approx_filter_surf_;
-     
-     // KD-trees
-     pcl::KdTreeFLANN<PointType>::Ptr kdtree_corner_map_;
-     pcl::KdTreeFLANN<PointType>::Ptr kdtree_surf_map_;
-     bool kdtree_needs_update_;
- 
-     // Current scan data
-     pcl::PointCloud<PointType> laser_cloud_in_;
-     pcl::PointCloud<PointType> corner_points_sharp_;
-     pcl::PointCloud<PointType> corner_points_less_sharp_;
-     pcl::PointCloud<PointType> surface_points_flat_;
-     pcl::PointCloud<PointType> surface_points_less_flat_;
-     
-     // Multi-resolution versions
-     pcl::PointCloud<PointType> corner_points_high_res_;
-     pcl::PointCloud<PointType> corner_points_low_res_;
-     pcl::PointCloud<PointType> surf_points_high_res_;
-     pcl::PointCloud<PointType> surf_points_low_res_;
- 
-     // Navigation data
-     nav_msgs::Path path_;
- 
-     // Transformation
-     Eigen::Quaterniond q_w_curr_;  // World to current orientation
-     Eigen::Vector3d t_w_curr_;     // World to current position
-     
-     // Motion prediction
-     MotionPredictor motion_predictor_;
- 
-     // Thread management
-     std::atomic<bool> running_;
-     
-     // Mutex for thread safety
-     std::mutex map_mutex_;
- 
-     // Timing
-     double time_laser_cloud_last_;
-     double time_laser_cloud_curr_;
-     bool system_initialized_;
-     bool first_scan_;
-     int frame_count_;
-     
-     // LiDAR type detection
-     bool is_velodyne32_;
-     bool has_ring_data_;
-     uint8_t ring_field_offset_;
-     
-     // Pose output
-     std::ofstream pose_file_;
-     bool write_poses_to_file_;
-     std::string pose_file_path_;
-     
-     // Performance tracking
-     struct TimerEntry {
-         std::chrono::high_resolution_clock::time_point start;
-         std::string name;
-         
-         TimerEntry(const std::string& n) : name(n), start(std::chrono::high_resolution_clock::now()) {}
-         
-         double elapsed() const {
-             auto end = std::chrono::high_resolution_clock::now();
-             return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
-         }
-     };
-     std::vector<TimerEntry> timers_;
-     
-     // Debug
-     bool debug_output_;
-     bool timing_output_;
-     bool pose_output_;
- 
-     // Methods
-     void initializeParameters() {
-         // 32-channel specific defaults
-         nh_.param<double>("scan_period", scan_period_, 0.1);
-         nh_.param<int>("vertical_scans", vertical_scans_, 32);  // Default for 32-channel LiDAR
-         nh_.param<int>("horizontal_scans", horizontal_scans_, 2048);  // Higher horizontal resolution
-         nh_.param<double>("vertical_angle_top", vertical_angle_top_, 10.67);  // Velodyne 32E defaults
-         nh_.param<double>("vertical_angle_bottom", vertical_angle_bottom_, -30.67);  // Velodyne 32E defaults
-         nh_.param<double>("edge_threshold", edge_threshold_, 0.15);  // Slightly higher for 32-channel
-         nh_.param<double>("surf_threshold", surf_threshold_, 0.08);  // Adjusted for 32-channel
-         nh_.param<double>("nearest_feature_dist_sq", nearest_feature_dist_sq_, 36.0);  // Increased radius
-         nh_.param<int>("edge_feature_min_valid_num", edge_feature_min_valid_num_, 10);
-         nh_.param<int>("surf_feature_min_valid_num", surf_feature_min_valid_num_, 100);
-         nh_.param<double>("filter_corner_leaf_size", filter_corner_leaf_size_, 0.3);  // Larger for 32-channel
-         nh_.param<double>("filter_surf_leaf_size", filter_surf_leaf_size_, 0.6);  // Larger for 32-channel
-         nh_.param<double>("filter_map_leaf_size", filter_map_leaf_size_, 0.8);  // Larger for 32-channel
-         nh_.param<bool>("save_map", save_map_, true);
-         nh_.param<std::string>("map_save_path", map_save_path_, "/tmp/loam_map.pcd");
-         nh_.param<std::string>("fixed_frame_id", fixed_frame_id_, "map");
-         nh_.param<std::string>("lidar_frame_id", lidar_frame_id_, "lidar_link");
-         nh_.param<int>("max_iterations", max_iterations_, 6);  // Increased for better accuracy
-         nh_.param<bool>("undistortion_flag", undistortion_flag_, true);
-         nh_.param<bool>("debug_output", debug_output_, false);
-         nh_.param<bool>("timing_output", timing_output_, false);
-         nh_.param<bool>("pose_output", pose_output_, true);  // Enable pose output by default
-         nh_.param<int>("local_map_size", local_map_size_, 30);  // Larger for 32-channel
-         
-         // File output
-         nh_.param<bool>("write_poses_to_file", write_poses_to_file_, false);
-         nh_.param<std::string>("pose_file_path", pose_file_path_, "/tmp/loam_poses.txt");
-         
-         // Multi-resolution parameters
-         nh_.param<bool>("use_multi_resolution", use_multi_resolution_, true);
-         nh_.param<double>("high_res_leaf_size", high_res_leaf_size_, 0.3);  // Adjusted for 32-channel
-         nh_.param<double>("low_res_leaf_size", low_res_leaf_size_, 1.0);  // Adjusted for 32-channel
-         
-         // Hierarchical registration parameters
-         nh_.param<bool>("use_hierarchical_registration", use_hierarchical_registration_, true);
-         nh_.param<int>("hierarchical_levels", hierarchical_levels_, 3);
-         
-         // Motion prediction parameters
-         nh_.param<bool>("use_motion_prediction", use_motion_prediction_, true);
-         nh_.param<double>("motion_prediction_weight", motion_prediction_weight_, 0.6);  // Increased weight for smoother motion
- 
-         system_initialized_ = false;
-         first_scan_ = true;
-         frame_count_ = 0;
-         running_ = true;
-         kdtree_needs_update_ = true;
-         is_velodyne32_ = false;
-         has_ring_data_ = false;
-         ring_field_offset_ = 16;  // Default guess for ring field offset
-         
-         // Open pose file if needed
-         if (write_poses_to_file_) {
-             pose_file_.open(pose_file_path_);
-             if (pose_file_.is_open()) {
-                 pose_file_ << "# timestamp tx ty tz qx qy qz qw roll pitch yaw" << std::endl;
-                 ROS_INFO("Saving poses to: %s", pose_file_path_.c_str());
-             } else {
-                 ROS_WARN("Failed to open pose file for writing: %s", pose_file_path_.c_str());
-                 write_poses_to_file_ = false;
-             }
-         }
-     }
- 
-     void setupROSFramework() {
-         cloud_sub_ = nh_.subscribe<sensor_msgs::PointCloud2>("/velodyne_points", 5, &Fast32Loam::cloudCallback, this);
-         cloud_edge_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/loam/edge_points", 1);
-         cloud_surf_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/loam/surf_points", 1);
-         cloud_full_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/loam/full_points", 1);
-         odom_pub_ = nh_.advertise<nav_msgs::Odometry>("/loam/odometry", 1);
-         path_pub_ = nh_.advertise<nav_msgs::Path>("/loam/path", 1);
-         map_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("/loam/map", 1);
-     }
-     
-     void initialize() {
-         // Initialize transformation values
-         q_w_curr_ = Eigen::Quaterniond(1, 0, 0, 0);  // identity quaternion
-         t_w_curr_ = Eigen::Vector3d(0, 0, 0);        // zero translation
-         
-         // Initialize point cloud containers with ring buffers for efficient management
-         corner_map_buffer_ = CloudRingBuffer<PointType>(local_map_size_, filter_corner_leaf_size_);
-         surf_map_buffer_ = CloudRingBuffer<PointType>(local_map_size_, filter_surf_leaf_size_);
-         
-         // Initialize global map
-         global_map_.reset(new pcl::PointCloud<PointType>());
-         
-         // Initialize KD-trees
-         kdtree_corner_map_.reset(new pcl::KdTreeFLANN<PointType>());
-         kdtree_surf_map_.reset(new pcl::KdTreeFLANN<PointType>());
-         
-         // Set up voxel grid filters
-         downsize_filter_corner_.setLeafSize(filter_corner_leaf_size_, filter_corner_leaf_size_, filter_corner_leaf_size_);
-         downsize_filter_surf_.setLeafSize(filter_surf_leaf_size_, filter_surf_leaf_size_, filter_surf_leaf_size_);
-         downsize_filter_map_.setLeafSize(filter_map_leaf_size_, filter_map_leaf_size_, filter_map_leaf_size_);
-         
-         // Set up approximate voxel grid filters for faster processing
-         approx_filter_corner_.setLeafSize(filter_corner_leaf_size_, filter_corner_leaf_size_, filter_corner_leaf_size_);
-         approx_filter_surf_.setLeafSize(filter_surf_leaf_size_, filter_surf_leaf_size_, filter_surf_leaf_size_);
-         
-         // Initialize timing variables
-         time_laser_cloud_last_ = 0;
-         time_laser_cloud_curr_ = 0;
-         
-         // Initialize threshold values
-         edge_correspondence_threshold_ = 0.1;  // 10cm
-         plane_correspondence_threshold_ = 0.05;  // 5cm
-         
-         // Initialize path message
-         path_.header.frame_id = fixed_frame_id_;
-     }
- 
-     void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
-         startTimer("cloudCallback");
-         
-         time_laser_cloud_curr_ = cloud_msg->header.stamp.toSec();
- 
-         // Convert ROS message to PCL point cloud
-         startTimer("cloudConversion");
-         pcl::PointCloud<PointType> laser_cloud_in;
-         pcl::fromROSMsg(*cloud_msg, laser_cloud_in);
-         stopTimer();
- 
-         // Skip if point cloud is empty
-         if (laser_cloud_in.empty()) {
-             ROS_WARN("Received empty point cloud! Skipping.");
-             stopTimer(); // Stop the cloudCallback timer
-             return;
-         }
-         
-         // Preprocess point cloud to remove outliers
-         startTimer("cloudPreprocessing");
-         preprocessPointCloud(laser_cloud_in);
-         stopTimer();
-         
-         // Detect Velodyne LiDAR type and ring field on first scan
-         if (first_scan_) {
-             startTimer("detectLidarType");
-             has_ring_data_ = detectVelodyneRingField(laser_cloud_in, is_velodyne32_, ring_field_offset_);
-             
-             if (is_velodyne32_) {
-                 ROS_INFO("Detected Velodyne 32-channel LiDAR with ring field.");
-                 
-                 // Adjust parameters if auto-detected
-                 if (vertical_scans_ != 32) {
-                     vertical_scans_ = 32;
-                     ROS_INFO("Automatically adjusted vertical_scans to 32.");
-                 }
-             } else if (has_ring_data_) {
-                 ROS_INFO("Detected LiDAR with ring field, but not identified as Velodyne 32-channel.");
-             } else {
-                 ROS_WARN("No ring field detected. Using angle-based ring estimation.");
-             }
-             stopTimer();
-         }
- 
-         // Extract features
-         startTimer("featureExtraction");
-         extractFeatures(laser_cloud_in);
-         stopTimer();
- 
-         if (first_scan_) {
-             // Initialize the system with the first scan
-             initializeSystem();
-             first_scan_ = false;
-             stopTimer(); // Stop the cloudCallback timer
-             return;
-         }
- 
-         // FAST-LOAM approach: direct scan-to-map matching
-         startTimer("scanToMapMatching");
-         scanToMapMatching();
-         stopTimer();
-         
-         // Update maps with current scan
-         startTimer("updateMaps");
-         updateMaps();
-         stopTimer();
- 
-         // Publish results
-         startTimer("publishResults");
-         publishResults(cloud_msg->header.stamp);
-         stopTimer();
-         
-         // Output pose information
-         if (pose_output_) {
-             printCurrentPose();
-         }
-         
-         // Write pose to file if enabled
-         if (write_poses_to_file_ && pose_file_.is_open()) {
-             writePoseToFile(cloud_msg->header.stamp);
-         }
-         
-         // Update motion predictor with the new pose
-         if (use_motion_prediction_) {
-             motion_predictor_.update(q_w_curr_, t_w_curr_, time_laser_cloud_curr_);
-         }
-         
-         time_laser_cloud_last_ = time_laser_cloud_curr_;
-         frame_count_++;
-         
-         stopTimer(); // Stop the cloudCallback timer
-         
-         if (timing_output_) {
-             printTimers();
-         }
-     }
-     
-     void preprocessPointCloud(pcl::PointCloud<PointType>& cloud) {
-         if (cloud.empty()) {
-             return;
-         }
-         
-         // Basic distance filtering to remove very close or far points
-         CloudPtr filtered_cloud(new pcl::PointCloud<PointType>());
-         for (const auto& point : cloud) {
-             float range_sq = point.x * point.x + point.y * point.y + point.z * point.z;
-             // Keep points between 0.5m and 100m
-             if (range_sq > 0.25 && range_sq < 10000.0) {
-                 filtered_cloud->push_back(point);
-             }
-         }
-         
-         if (filtered_cloud->empty()) {
-             ROS_WARN("All points filtered out by distance filter!");
-             return;
-         }
-         
-         // Statistical outlier removal for more robust feature extraction
-         if (is_velodyne32_ && filtered_cloud->size() > 1000) {
-             pcl::StatisticalOutlierRemoval<PointType> sor;
-             sor.setInputCloud(filtered_cloud);
-             sor.setMeanK(20);           // Consider 20 neighbors
-             sor.setStddevMulThresh(1.5); // Threshold: 1.5 standard deviations
-             
-             pcl::PointCloud<PointType> cloud_filtered;
-             sor.filter(cloud_filtered);
-             
-             // Only use the filter if it doesn't remove too many points
-             if (cloud_filtered.size() > filtered_cloud->size() * 0.5) {
-                 cloud = cloud_filtered;
-                 return;
-             }
-         }
-         
-         // If no statistical filtering applied, still use the distance-filtered cloud
-         cloud = *filtered_cloud;
-     }
-     
-     void initializeSystem() {
-         // Create initial feature maps
-         CloudPtr initial_corner_cloud(new pcl::PointCloud<PointType>(corner_points_less_sharp_));
-         CloudPtr initial_surf_cloud(new pcl::PointCloud<PointType>(surface_points_less_flat_));
-         CloudPtr initial_full_cloud(new pcl::PointCloud<PointType>(laser_cloud_in_));
-         
-         // Add to the ring buffers
-         corner_map_buffer_.push(initial_corner_cloud);
-         surf_map_buffer_.push(initial_surf_cloud);
-         
-         // Add to global map
-         *global_map_ += laser_cloud_in_;
-         
-         // Initialize KD-trees with the first scan
-         kdtree_corner_map_->setInputCloud(corner_map_buffer_.getCombinedCloud());
-         kdtree_surf_map_->setInputCloud(surf_map_buffer_.getCombinedCloud());
-         
-         // Set the initial scan timestamp
-         time_laser_cloud_last_ = time_laser_cloud_curr_;
-         
-         // Mark system as initialized
-         system_initialized_ = true;
-         
-         ROS_INFO("FAST-32-LOAM system initialized with %zu corner and %zu surface points.",
-                 corner_points_less_sharp_.size(), surface_points_less_flat_.size());
-     }
- 
-     void extractFeatures(const pcl::PointCloud<PointType>& laser_cloud_in) {
-         // Clear feature clouds
-         corner_points_sharp_.clear();
-         corner_points_less_sharp_.clear();
-         surface_points_flat_.clear();
-         surface_points_less_flat_.clear();
-         
-         // Store input cloud
-         laser_cloud_in_ = laser_cloud_in;
-         
-         // Organize points by scan ring
-         std::vector<pcl::PointCloud<PointType>> laser_cloud_scan_ring(vertical_scans_);
-         
-         // Distribute points to scan rings
-         for (const auto& pt : laser_cloud_in) {
-             // Skip invalid points
-             if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
-                 continue;
-             }
-             
-             int scan_id;
-             if (has_ring_data_) {
-                 // Extract ring ID directly from point data
-                 // This accesses the ring field at the appropriate offset
-                 const uint8_t* pt_data = reinterpret_cast<const uint8_t*>(&pt);
-                 uint16_t ring = *reinterpret_cast<const uint16_t*>(pt_data + ring_field_offset_);
-                 
-                 // Ensure the ring ID is in valid range for our processing
-                 // For Velodyne 32, map 0-31 to 0-31 directly
-                 scan_id = ring;
-                 
-                 if (scan_id < 0 || scan_id >= vertical_scans_) {
-                     continue;
-                 }
-             } else {
-                 // Calculate scan ring from point coordinates (fallback method)
-                 float vertical_angle = std::atan2(pt.z, std::sqrt(pt.x * pt.x + pt.y * pt.y)) * 180.0f / M_PI;
-                 
-                 // Map angle to scan ring
-                 scan_id = std::round((vertical_angle - vertical_angle_bottom_) / 
-                                     (vertical_angle_top_ - vertical_angle_bottom_) * 
-                                     (vertical_scans_ - 1));
-                 
-                 if (scan_id < 0 || scan_id >= vertical_scans_) {
-                     continue;
-                 }
-             }
-             
-             // Add point to corresponding scan ring
-             laser_cloud_scan_ring[scan_id].push_back(pt);
-         }
-         
-         // Temporary storage for feature points
-         std::vector<PointType> sharp_points;
-         std::vector<PointType> less_sharp_points;
-         std::vector<PointType> flat_points;
-         std::vector<PointType> less_flat_points;
-         
-         // Enhanced feature extraction for 32-channel LiDAR
-         // Process each scan ring for feature extraction
-         for (int i = 0; i < vertical_scans_; i++) {
-             pcl::PointCloud<PointType>& cloud_scan = laser_cloud_scan_ring[i];
-             
-             if (cloud_scan.size() < 30) {  // Require more points for 32-channel
-                 continue;  // Skip if scan has too few points
-             }
-             
-             // Calculate curvature for each point with increased neighborhood
-             std::vector<float> cloud_curvature(cloud_scan.size(), 0);
-             std::vector<int> cloud_sort_idx(cloud_scan.size());
-             std::vector<int> cloud_neighbor_picked(cloud_scan.size(), 0);
-             
-             int window_size = is_velodyne32_ ? 7 : 5;  // Larger window for 32-channel LiDAR
-             
-             // Calculate curvature with larger window for 32-channel data
-             for (size_t j = window_size; j < cloud_scan.size() - window_size; j++) {
-                 float diff_x = 0, diff_y = 0, diff_z = 0;
-                 
-                 // Use a small neighborhood for curvature calculation
-                 for (int k = -window_size; k <= window_size; k++) {
-                     if (k == 0) continue;
-                     diff_x += cloud_scan[j + k].x - cloud_scan[j].x;
-                     diff_y += cloud_scan[j + k].y - cloud_scan[j].y;
-                     diff_z += cloud_scan[j + k].z - cloud_scan[j].z;
-                 }
-                 
-                 // Normalize curvature by point distance for more consistent feature detection
-                 float dist_sq = cloud_scan[j].x * cloud_scan[j].x + 
-                                cloud_scan[j].y * cloud_scan[j].y + 
-                                cloud_scan[j].z * cloud_scan[j].z;
-                 
-                 // Avoid division by zero or very small values
-                 float norm_factor = std::max(1.0f, dist_sq * 0.01f);  // Adjusted scale factor
-                 
-                 // Store normalized curvature
-                 cloud_curvature[j] = (diff_x * diff_x + diff_y * diff_y + diff_z * diff_z) / norm_factor;
-                 cloud_sort_idx[j] = j;
-             }
-             
-             // Divide the scan into segments for better feature distribution
-             // More segments for 32-channel LiDAR to capture more details
-             int total_points = cloud_scan.size() - window_size * 2;
-             const int num_sectors = is_velodyne32_ ? 8 : 6;  // More sectors for 32-channel
-             
-             for (int j = 0; j < num_sectors; j++) {
-                 int start_idx = j * total_points / num_sectors + window_size;
-                 int end_idx = (j + 1) * total_points / num_sectors + window_size - 1;
-                 
-                 // Sort points by curvature within each segment
-                 std::sort(cloud_sort_idx.begin() + start_idx, cloud_sort_idx.begin() + end_idx + 1,
-                          [&cloud_curvature](int a, int b) { return cloud_curvature[a] < cloud_curvature[b]; });
-                 
-                 // Select surface (flat) features - low curvature points
-                 int flat_count = 0;
-                 for (int k = start_idx; k <= end_idx && flat_count < 4; k++) {
-                     int idx = cloud_sort_idx[k];
-                     
-                     if (cloud_curvature[idx] < surf_threshold_ && cloud_neighbor_picked[idx] == 0) {
-                         flat_count++;
-                         cloud_neighbor_picked[idx] = 1;
-                         flat_points.push_back(cloud_scan[idx]);
-                         
-                         // Mark nearby points as picked to ensure feature distribution
-                         for (int l = 1; l <= window_size; l++) {
-                             if (idx + l >= cloud_scan.size()) break;
-                             float dx = cloud_scan[idx + l].x - cloud_scan[idx].x;
-                             float dy = cloud_scan[idx + l].y - cloud_scan[idx].y;
-                             float dz = cloud_scan[idx + l].z - cloud_scan[idx].z;
-                             if (dx * dx + dy * dy + dz * dz > 0.05) break;
-                             cloud_neighbor_picked[idx + l] = 1;
-                         }
-                         for (int l = -1; l >= -window_size; l--) {
-                             if (idx + l < 0) break;
-                             float dx = cloud_scan[idx + l].x - cloud_scan[idx].x;
-                             float dy = cloud_scan[idx + l].y - cloud_scan[idx].y;
-                             float dz = cloud_scan[idx + l].z - cloud_scan[idx].z;
-                             if (dx * dx + dy * dy + dz * dz > 0.05) break;
-                             cloud_neighbor_picked[idx + l] = 1;
-                         }
-                     }
-                 }
-                 
-                 // Select more less-flat features
-                 for (int k = start_idx; k <= end_idx; k++) {
-                     int idx = cloud_sort_idx[k];
-                     
-                     if (cloud_curvature[idx] < surf_threshold_ * 2 && cloud_neighbor_picked[idx] == 0) {
-                         cloud_neighbor_picked[idx] = 1;
-                         less_flat_points.push_back(cloud_scan[idx]);
-                     }
-                 }
-                 
-                 // Select edge (sharp) features - high curvature points
-                 // Resort in descending order for edge features
-                 std::sort(cloud_sort_idx.begin() + start_idx, cloud_sort_idx.begin() + end_idx + 1,
-                          [&cloud_curvature](int a, int b) { return cloud_curvature[a] > cloud_curvature[b]; });
-                 
-                 int sharp_count = 0;
-                 for (int k = start_idx; k <= end_idx && sharp_count < 2; k++) {
-                     int idx = cloud_sort_idx[k];
-                     
-                     if (cloud_curvature[idx] > edge_threshold_ && cloud_neighbor_picked[idx] == 0) {
-                         sharp_count++;
-                         cloud_neighbor_picked[idx] = 1;
-                         sharp_points.push_back(cloud_scan[idx]);
-                         
-                         // Mark nearby points as picked to ensure feature distribution
-                         for (int l = 1; l <= window_size; l++) {
-                             if (idx + l >= cloud_scan.size()) break;
-                             float dx = cloud_scan[idx + l].x - cloud_scan[idx].x;
-                             float dy = cloud_scan[idx + l].y - cloud_scan[idx].y;
-                             float dz = cloud_scan[idx + l].z - cloud_scan[idx].z;
-                             if (dx * dx + dy * dy + dz * dz > 0.05) break;
-                             cloud_neighbor_picked[idx + l] = 1;
-                         }
-                         for (int l = -1; l >= -window_size; l--) {
-                             if (idx + l < 0) break;
-                             float dx = cloud_scan[idx + l].x - cloud_scan[idx].x;
-                             float dy = cloud_scan[idx + l].y - cloud_scan[idx].y;
-                             float dz = cloud_scan[idx + l].z - cloud_scan[idx].z;
-                             if (dx * dx + dy * dy + dz * dz > 0.05) break;
-                             cloud_neighbor_picked[idx + l] = 1;
-                         }
-                     }
-                 }
-                 
-                 // Select more less-sharp edge features
-                 for (int k = start_idx; k <= end_idx; k++) {
-                     int idx = cloud_sort_idx[k];
-                     
-                     if (cloud_curvature[idx] > edge_threshold_ * 0.5 && cloud_neighbor_picked[idx] == 0) {
-                         cloud_neighbor_picked[idx] = 1;
-                         less_sharp_points.push_back(cloud_scan[idx]);
-                     }
-                 }
-             }
-         }
-         
-         // Copy to output clouds
-         corner_points_sharp_.insert(corner_points_sharp_.end(), sharp_points.begin(), sharp_points.end());
-         corner_points_less_sharp_.insert(corner_points_less_sharp_.end(), sharp_points.begin(), sharp_points.end());
-         corner_points_less_sharp_.insert(corner_points_less_sharp_.end(), less_sharp_points.begin(), less_sharp_points.end());
-         surface_points_flat_.insert(surface_points_flat_.end(), flat_points.begin(), flat_points.end());
-         
-         // Downsample less-flat surface points using voxel grid filter
-         pcl::PointCloud<PointType> less_flat_cloud;
-         less_flat_cloud.insert(less_flat_cloud.end(), less_flat_points.begin(), less_flat_points.end());
-         
-         pcl::VoxelGrid<PointType> downsize_filter;
-         downsize_filter.setLeafSize(filter_surf_leaf_size_, filter_surf_leaf_size_, filter_surf_leaf_size_);
-         downsize_filter.setInputCloud(less_flat_cloud.makeShared());
-         downsize_filter.filter(surface_points_less_flat_);
-         
-         // Add flat points to less-flat cloud
-         surface_points_less_flat_.insert(surface_points_less_flat_.end(), flat_points.begin(), flat_points.end());
-         
-         // More aggressive downsampling for 32-channel LiDAR to manage the larger point count
-         if (is_velodyne32_ && surface_points_less_flat_.size() > 8000) {
-             pcl::PointCloud<PointType> temp_cloud = surface_points_less_flat_;
-             pcl::VoxelGrid<PointType> secondary_filter;
-             secondary_filter.setLeafSize(filter_surf_leaf_size_ * 1.2, filter_surf_leaf_size_ * 1.2, filter_surf_leaf_size_ * 1.2);
-             secondary_filter.setInputCloud(temp_cloud.makeShared());
-             secondary_filter.filter(surface_points_less_flat_);
-         }
-         
-         if (debug_output_) {
-             ROS_INFO("Feature extraction: %zu sharp edge, %zu less sharp edge, %zu flat surface, %zu less flat surface",
-                     corner_points_sharp_.size(), corner_points_less_sharp_.size(), 
-                     surface_points_flat_.size(), surface_points_less_flat_.size());
-         }
-     }
-     
-     void createMultiResolutionFeatures() {
-         // Create high-resolution and low-resolution versions of the feature clouds
-         // High resolution for fine alignment
-         corner_points_high_res_.clear();
-         surf_points_high_res_.clear();
-         
-         // Low resolution for coarse alignment
-         corner_points_low_res_.clear();
-         surf_points_low_res_.clear();
-         
-         // Downsample to high resolution
-         pcl::VoxelGrid<PointType> high_res_filter;
-         high_res_filter.setLeafSize(high_res_leaf_size_, high_res_leaf_size_, high_res_leaf_size_);
-         
-         // Downsample to low resolution (use faster approximate voxel grid)
-         pcl::ApproximateVoxelGrid<PointType> low_res_filter;
-         low_res_filter.setLeafSize(low_res_leaf_size_, low_res_leaf_size_, low_res_leaf_size_);
-         
-         // Process corner points
-         if (!corner_points_less_sharp_.empty()) {
-             high_res_filter.setInputCloud(corner_points_less_sharp_.makeShared());
-             high_res_filter.filter(corner_points_high_res_);
-             
-             low_res_filter.setInputCloud(corner_points_less_sharp_.makeShared());
-             low_res_filter.filter(corner_points_low_res_);
-         }
-         
-         // Process surface points
-         if (!surface_points_less_flat_.empty()) {
-             high_res_filter.setInputCloud(surface_points_less_flat_.makeShared());
-             high_res_filter.filter(surf_points_high_res_);
-             
-             low_res_filter.setInputCloud(surface_points_less_flat_.makeShared());
-             low_res_filter.filter(surf_points_low_res_);
-         }
-     }
-     
-     void scanToMapMatching() {
-         std::lock_guard<std::mutex> lock(map_mutex_);
-         
-         if (corner_map_buffer_.empty() || surf_map_buffer_.empty()) {
-             ROS_WARN_THROTTLE(1, "Feature maps are empty, skipping scan-to-map matching");
-             return;
-         }
-         
-         // Get combined feature maps
-         CloudPtr corner_map = corner_map_buffer_.getCombinedCloud();
-         CloudPtr surf_map = surf_map_buffer_.getCombinedCloud();
-         
-         // Update KD-trees only when needed (not in every frame)
-         if (kdtree_needs_update_) {
-             if (!corner_map->empty()) {
-                 kdtree_corner_map_->setInputCloud(corner_map);
-             }
-             
-             if (!surf_map->empty()) {
-                 kdtree_surf_map_->setInputCloud(surf_map);
-             }
-             
-             kdtree_needs_update_ = false;
-         }
-         
-         // Predict initial pose using motion model
-         Eigen::Quaterniond q_pred;
-         Eigen::Vector3d t_pred;
-         
-         if (use_motion_prediction_ && system_initialized_) {
-             motion_predictor_.predict(q_pred, t_pred, time_laser_cloud_curr_);
-             
-             // Use a weighted combination of the last pose and the predicted pose
-             q_pred = q_w_curr_.slerp(motion_prediction_weight_, q_pred);
-             t_pred = (1 - motion_prediction_weight_) * t_w_curr_ + motion_prediction_weight_ * t_pred;
-         } else {
-             // If no motion prediction, use the last pose
-             q_pred = q_w_curr_;
-             t_pred = t_w_curr_;
-         }
-         
-         // Create multi-resolution feature point clouds
-         if (use_multi_resolution_ || use_hierarchical_registration_) {
-             createMultiResolutionFeatures();
-         }
-         
-         // Hierarchical registration (from coarse to fine)
-         if (use_hierarchical_registration_) {
-             hierarchicalRegistration(q_pred, t_pred, corner_map, surf_map);
-         } else {
-             // Standard registration
-             singleLevelRegistration(q_pred, t_pred, corner_map, surf_map);
-         }
-         
-         // Update the global pose
-         q_w_curr_ = q_pred;
-         t_w_curr_ = t_pred;
-     }
-     
-     void hierarchicalRegistration(Eigen::Quaterniond& q, Eigen::Vector3d& t, 
-                                  CloudPtr& corner_map, CloudPtr& surf_map) {
-         // Multi-level registration from coarse to fine
-         // Adjusted leaf sizes for 32-channel LiDAR (larger for performance)
-         std::vector<double> leaf_sizes = {1.5, 0.8, 0.3};  // Adjusted for 32-channel
-         std::vector<int> max_iterations = {5, 10, 20};     // More iterations for 32-channel
-         std::vector<double> convergence_thresholds = {0.08, 0.03, 0.01};
-         
-         // Adjust based on parameter
-         int levels = std::min(hierarchical_levels_, static_cast<int>(leaf_sizes.size()));
-         
-         // Store initial pose for fallback
-         Eigen::Quaterniond q_initial = q;
-         Eigen::Vector3d t_initial = t;
-         bool optimization_success = false;
-         
-         for (int level = 0; level < levels; level++) {
-             // Downsample clouds for this level
-             pcl::PointCloud<PointType> corner_cloud_level;
-             pcl::PointCloud<PointType> surf_cloud_level;
-             
-             pcl::VoxelGrid<PointType> downsample_filter;
-             downsample_filter.setLeafSize(leaf_sizes[level], leaf_sizes[level], leaf_sizes[level]);
-             
-             // Downsample feature clouds for this level
-             if (!corner_points_less_sharp_.empty()) {
-                 downsample_filter.setInputCloud(corner_points_less_sharp_.makeShared());
-                 downsample_filter.filter(corner_cloud_level);
-             }
-             
-             if (!surface_points_less_flat_.empty()) {
-                 downsample_filter.setInputCloud(surface_points_less_flat_.makeShared());
-                 downsample_filter.filter(surf_cloud_level);
-             }
-             
-             // Keep track of the previous pose for convergence check
-             Eigen::Quaterniond q_prev = q;
-             Eigen::Vector3d t_prev = t;
-             
-             // Initialize optimization parameters with current pose
-             double parameters[7] = {
-                 q.x(), q.y(), q.z(), q.w(),
-                 t.x(), t.y(), t.z()
-             };
-             
-             // Setup ceres problem
-             ceres::Problem problem;
-             ceres::LossFunction* loss_function = new ceres::HuberLoss(leaf_sizes[level] * 0.1);  // Scale with level
-             ceres::LocalParameterization* quaternion_parameterization = new ceres::QuaternionParameterization();
-             
-             // Add parameter blocks with appropriate parameterization
-             problem.AddParameterBlock(parameters, 4, quaternion_parameterization);
-             problem.AddParameterBlock(parameters + 4, 3);
-             
-             // Add factors from the downsampled clouds
-             int edge_factor_count = addEdgeFactorsToOptimization(problem, loss_function, parameters, 
-                                                              corner_cloud_level, corner_map, level > 0);
-             
-             int plane_factor_count = addPlaneFactorsToOptimization(problem, loss_function, parameters, 
-                                                                surf_cloud_level, surf_map, level > 0);
-             
-             // Solve optimization if we have enough constraints
-             if (edge_factor_count + plane_factor_count >= 10) {
-                 ceres::Solver::Options options;
-                 options.linear_solver_type = ceres::DENSE_QR;
-                 options.max_num_iterations = max_iterations[level];
-                 options.function_tolerance = 1e-7;  // Tightened tolerance
-                 options.gradient_tolerance = 1e-11;  // Tightened tolerance
-                 options.parameter_tolerance = 1e-9;  // Tightened tolerance
-                 options.minimizer_progress_to_stdout = debug_output_;
-                 
-                 ceres::Solver::Summary summary;
-                 ceres::Solve(options, &problem, &summary);
-                 
-                 if (debug_output_) {
-                     ROS_INFO("Level %d optimization: %d factors, cost %.5f -> %.5f, iterations: %ld", 
-                             level, edge_factor_count + plane_factor_count, 
-                             summary.initial_cost, summary.final_cost, 
-                             static_cast<long>(summary.iterations.size()));
-                 }
-                 
-                 // Update pose for next level
-                 q = Eigen::Quaterniond(parameters[3], parameters[0], parameters[1], parameters[2]).normalized();
-                 t = Eigen::Vector3d(parameters[4], parameters[5], parameters[6]);
-                 
-                 // Check for convergence
-                 double rot_diff = 2.0 * acos(std::min(1.0, std::abs(q.dot(q_prev))));
-                 double trans_diff = (t - t_prev).norm();
-                 
-                 if (rot_diff < convergence_thresholds[level] && trans_diff < convergence_thresholds[level]) {
-                     if (debug_output_) {
-                         ROS_INFO("Early convergence at level %d: rot_diff=%.6f, trans_diff=%.6f",
-                                 level, rot_diff, trans_diff);
-                     }
-                     optimization_success = true;
-                     break;  // Early termination if converged
-                 }
-                 
-                 // Check if the optimization made reasonable progress
-                 if (summary.final_cost < summary.initial_cost * 0.8) {
-                     optimization_success = true;
-                 } else {
-                     // If the cost didn't decrease significantly, the optimization might be stuck
-                     if (level > 0) {
-                         ROS_WARN("Level %d optimization did not make sufficient progress.", level);
-                     }
-                 }
-             } else {
-                 ROS_WARN_THROTTLE(1, "Level %d: Not enough constraints for optimization! Edge: %d, Plane: %d", 
-                             level, edge_factor_count, plane_factor_count);
-                 
-                 // Use previous level's result if available
-                 if (level > 0) {
-                     q = q_prev;
-                     t = t_prev;
-                 }
-             }
-         }
-         
-         // Sanity check on final pose - if too far from initial prediction, fall back
-         double translation_diff = (t - t_initial).norm();
-         double rotation_diff = 2.0 * acos(std::min(1.0, std::abs(q.dot(q_initial))));
-         
-         if (!optimization_success || translation_diff > 2.0 || rotation_diff > M_PI / 4) {
-             ROS_WARN("Registration result looks suspicious (%.2fm, %.2f°), using motion prediction instead.",
-                   translation_diff, rotation_diff * 180 / M_PI);
-             
-             // Fall back to motion prediction
-             q = q_initial;
-             t = t_initial;
-         }
-     }
-     
-     void singleLevelRegistration(Eigen::Quaterniond& q, Eigen::Vector3d& t, 
-                                 CloudPtr& corner_map, CloudPtr& surf_map) {
-         // Initialize optimization parameters with current pose
-         double parameters[7] = {
-             q.x(), q.y(), q.z(), q.w(),
-             t.x(), t.y(), t.z()
-         };
-         
-         // Store initial pose for fallback
-         Eigen::Quaterniond q_initial = q;
-         Eigen::Vector3d t_initial = t;
-         bool optimization_success = false;
-         
-         // Multi-resolution approach
-         int edge_factor_count = 0;
-         int plane_factor_count = 0;
-         
-         if (use_multi_resolution_) {
-             // First use low-resolution features for coarse alignment
-             {
-                 // Setup ceres problem in its own scope to ensure cleanup
-                 ceres::Problem problem;
-                 ceres::LossFunction* loss_function = new ceres::HuberLoss(0.2);  // Increased robustness
-                 ceres::LocalParameterization* quaternion_parameterization = new ceres::QuaternionParameterization();
-                 
-                 // Add parameter blocks with appropriate parameterization
-                 problem.AddParameterBlock(parameters, 4, quaternion_parameterization);
-                 problem.AddParameterBlock(parameters + 4, 3);
-                 
-                 edge_factor_count = addEdgeFactorsToOptimization(problem, loss_function, parameters, 
-                                                              corner_points_low_res_, corner_map, true);
-                 
-                 plane_factor_count = addPlaneFactorsToOptimization(problem, loss_function, parameters, 
-                                                                surf_points_low_res_, surf_map, true);
-                 
-                 // Solve optimization if we have enough constraints
-                 if (edge_factor_count + plane_factor_count >= 10) {
-                     ceres::Solver::Options options;
-                     options.linear_solver_type = ceres::DENSE_QR;
-                     options.max_num_iterations = max_iterations_ / 2;  // Fewer iterations for coarse alignment
-                     options.minimizer_progress_to_stdout = debug_output_;
-                     
-                     ceres::Solver::Summary summary;
-                     ceres::Solve(options, &problem, &summary);
-                     
-                     if (debug_output_) {
-                         ROS_INFO("Coarse optimization: %d factors, cost %.5f -> %.5f", 
-                                 edge_factor_count + plane_factor_count, 
-                                 summary.initial_cost, summary.final_cost);
-                     }
-                     
-                     // Update parameters for fine alignment
-                     q = Eigen::Quaterniond(parameters[3], parameters[0], parameters[1], parameters[2]).normalized();
-                     t = Eigen::Vector3d(parameters[4], parameters[5], parameters[6]);
-                     
-                     parameters[0] = q.x();
-                     parameters[1] = q.y();
-                     parameters[2] = q.z();
-                     parameters[3] = q.w();
-                     parameters[4] = t.x();
-                     parameters[5] = t.y();
-                     parameters[6] = t.z();
-                     
-                     // Check if coarse optimization made reasonable progress
-                     if (summary.final_cost < summary.initial_cost * 0.8) {
-                         optimization_success = true;
-                     }
-                 }
-             }
-             
-             // Then use high-resolution features for fine alignment with a new problem instance
-             {
-                 ceres::Problem problem;
-                 ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1);
-                 ceres::LocalParameterization* quaternion_parameterization = new ceres::QuaternionParameterization();
-                 
-                 problem.AddParameterBlock(parameters, 4, quaternion_parameterization);
-                 problem.AddParameterBlock(parameters + 4, 3);
-                 
-                 edge_factor_count = addEdgeFactorsToOptimization(problem, loss_function, parameters, 
-                                                              corner_points_high_res_, corner_map, false);
-                 
-                 plane_factor_count = addPlaneFactorsToOptimization(problem, loss_function, parameters, 
-                                                                surf_points_high_res_, surf_map, false);
-                 
-                 // Solve optimization if we have enough constraints
-                 if (edge_factor_count + plane_factor_count >= 10) {
-                     ceres::Solver::Options options;
-                     options.linear_solver_type = ceres::DENSE_QR;
-                     options.max_num_iterations = max_iterations_;
-                     options.minimizer_progress_to_stdout = debug_output_;
-                     
-                     ceres::Solver::Summary summary;
-                     ceres::Solve(options, &problem, &summary);
-                     
-                     if (debug_output_) {
-                         ROS_INFO("Fine optimization: %d factors, cost %.5f -> %.5f", 
-                                 edge_factor_count + plane_factor_count, 
-                                 summary.initial_cost, summary.final_cost);
-                     }
-                     
-                     // Update the pose with the optimization result
-                     q = Eigen::Quaterniond(parameters[3], parameters[0], parameters[1], parameters[2]).normalized();
-                     t = Eigen::Vector3d(parameters[4], parameters[5], parameters[6]);
-                     
-                     // Check if fine optimization made reasonable progress
-                     if (summary.final_cost < summary.initial_cost * 0.9) {
-                         optimization_success = true;
-                     }
-                 }
-             }
-         } else {
-             // Standard single-resolution approach
-             ceres::Problem problem;
-             ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1);
-             ceres::LocalParameterization* quaternion_parameterization = new ceres::QuaternionParameterization();
-             
-             // Add parameter blocks with appropriate parameterization
-             problem.AddParameterBlock(parameters, 4, quaternion_parameterization);
-             problem.AddParameterBlock(parameters + 4, 3);
-             
-             edge_factor_count = addEdgeFactorsToOptimization(problem, loss_function, parameters, 
-                                                          corner_points_less_sharp_, corner_map, false);
-             
-             plane_factor_count = addPlaneFactorsToOptimization(problem, loss_function, parameters, 
-                                                            surface_points_less_flat_, surf_map, false);
-             
-             // Solve optimization if we have enough constraints
-             if (edge_factor_count + plane_factor_count >= 10) {
-                 ceres::Solver::Options options;
-                 options.linear_solver_type = ceres::DENSE_QR;
-                 options.max_num_iterations = max_iterations_;
-                 options.minimizer_progress_to_stdout = debug_output_;
-                 
-                 ceres::Solver::Summary summary;
-                 ceres::Solve(options, &problem, &summary);
-                 
-                 if (debug_output_) {
-                     ROS_INFO("Scan-to-map optimization: %d factors, cost %.5f -> %.5f", 
-                             edge_factor_count + plane_factor_count, 
-                             summary.initial_cost, summary.final_cost);
-                 }
-                 
-                 // Update the pose with the optimization result
-                 q = Eigen::Quaterniond(parameters[3], parameters[0], parameters[1], parameters[2]).normalized();
-                 t = Eigen::Vector3d(parameters[4], parameters[5], parameters[6]);
-                 
-                 // Check if optimization made reasonable progress
-                 if (summary.final_cost < summary.initial_cost * 0.8) {
-                     optimization_success = true;
-                 }
-             } else {
-                 ROS_WARN_THROTTLE(1, "Not enough constraints for scan-to-map optimization! Edge: %d, Plane: %d", 
-                             edge_factor_count, plane_factor_count);
-             }
-         }
-         
-         // Sanity check on final pose - if too far from initial prediction, fall back
-         double translation_diff = (t - t_initial).norm();
-         double rotation_diff = 2.0 * acos(std::min(1.0, std::abs(q.dot(q_initial))));
-         
-         if (!optimization_success || translation_diff > 1.0 || rotation_diff > M_PI / 6) {
-             ROS_WARN("Registration result looks suspicious (%.2fm, %.2f°), using motion prediction instead.",
-                   translation_diff, rotation_diff * 180 / M_PI);
-             
-             // Fall back to motion prediction
-             q = q_initial;
-             t = t_initial;
-         }
-     }
-     
-     // Improved line fitting function
-     bool fitLine(const pcl::PointCloud<PointType>& points, const std::vector<int>& indices,
-                Eigen::Vector3d& line_point, Eigen::Vector3d& line_direction, double& fit_error) {
-         if (indices.size() < 2) {
-             return false;
-         }
-         
-         // Compute centroid
-         Eigen::Vector3d centroid(0, 0, 0);
-         for (const auto& idx : indices) {
-             centroid += Eigen::Vector3d(points[idx].x, points[idx].y, points[idx].z);
-         }
-         centroid /= indices.size();
-         
-         // Compute covariance matrix
-         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-         for (const auto& idx : indices) {
-             Eigen::Vector3d pt(points[idx].x, points[idx].y, points[idx].z);
-             Eigen::Vector3d diff = pt - centroid;
-             cov += diff * diff.transpose();
-         }
-         
-         // Perform eigen decomposition
-         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(cov);
-         if (eigensolver.info() != Eigen::Success) {
-             return false;
-         }
-         
-         // The line direction is the eigenvector with the largest eigenvalue
-         line_direction = eigensolver.eigenvectors().col(2).normalized();
-         line_point = centroid;
-         
-         // Check if the eigenvalues indicate a line structure
-         double e1 = eigensolver.eigenvalues()[0];
-         double e2 = eigensolver.eigenvalues()[1];
-         double e3 = eigensolver.eigenvalues()[2];
-         
-         // Check planarity and linearity metrics
-         double planarity = (e2 - e1) / e3;
-         double linearity = (e3 - e2) / e3;
-         
-         if (linearity < 0.5 || planarity > 0.5) {
-             return false;  // Not a strong line structure
-         }
-         
-         // Compute fitting error
-         fit_error = 0;
-         for (const auto& idx : indices) {
-             Eigen::Vector3d pt(points[idx].x, points[idx].y, points[idx].z);
-             Eigen::Vector3d diff = pt - centroid;
-             Eigen::Vector3d cross = diff.cross(line_direction);
-             double dist_sq = cross.squaredNorm();
-             fit_error += dist_sq;
-         }
-         fit_error = sqrt(fit_error / indices.size());
-         
-         // Reject if error is too large
-         if (fit_error > 0.2) {  // 20cm max error
-             return false;
-         }
-         
-         return true;
-     }
-     
-     // Improved plane fitting function
-     bool fitPlane(const pcl::PointCloud<PointType>& points, const std::vector<int>& indices,
-                  Eigen::Vector3d& plane_normal, double& plane_d, double& fit_error) {
-         if (indices.size() < 3) {
-             return false;
-         }
-         
-         // Compute centroid
-         Eigen::Vector3d centroid(0, 0, 0);
-         for (const auto& idx : indices) {
-             centroid += Eigen::Vector3d(points[idx].x, points[idx].y, points[idx].z);
-         }
-         centroid /= indices.size();
-         
-         // Compute covariance matrix
-         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-         for (const auto& idx : indices) {
-             Eigen::Vector3d pt(points[idx].x, points[idx].y, points[idx].z);
-             Eigen::Vector3d diff = pt - centroid;
-             cov += diff * diff.transpose();
-         }
-         
-         // Perform eigen decomposition
-         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(cov);
-         if (eigensolver.info() != Eigen::Success) {
-             return false;
-         }
-         
-         // The normal is the eigenvector corresponding to the smallest eigenvalue
-         plane_normal = eigensolver.eigenvectors().col(0).normalized();
-         
-         // Compute plane equation: ax + by + cz + d = 0
-         plane_d = -plane_normal.dot(centroid);
-         
-         // Check if the eigenvalues indicate a plane structure
-         double e1 = eigensolver.eigenvalues()[0];
-         double e2 = eigensolver.eigenvalues()[1];
-         double e3 = eigensolver.eigenvalues()[2];
-         
-         // Compute planarity metric (how planar the points are)
-         double planarity = (e2 - e1) / e3;
-         
-         // Require strong planarity
-         if (planarity < 0.6) {
-             return false;
-         }
-         
-         // Compute fitting error
-         fit_error = 0;
-         for (const auto& idx : indices) {
-             Eigen::Vector3d pt(points[idx].x, points[idx].y, points[idx].z);
-             double dist = std::abs(plane_normal.dot(pt) + plane_d);
-             fit_error += dist * dist;
-         }
-         fit_error = sqrt(fit_error / indices.size());
-         
-         // Reject if error is too large
-         if (fit_error > 0.1) {  // 10cm max error
-             return false;
-         }
-         
-         return true;
-     }
-     
-     // Improved edge factors addition optimized for 32-channel LiDAR
-     int addEdgeFactorsToOptimization(ceres::Problem& problem, ceres::LossFunction* loss_function,
-                                     double* parameters, const pcl::PointCloud<PointType>& corner_cloud, 
-                                     const CloudPtr& corner_map, bool use_low_res = false) {
-         int factor_count = 0;
-         
-         // Parameters adjusted for 32-channel LiDAR
-         int max_points = use_low_res ? 150 : 300;  // Increased for 32-channel
-         int step = std::max(1, static_cast<int>(corner_cloud.size() / max_points));
-         
-         // Track the quality of each factor to select the best ones
-         std::vector<std::pair<double, size_t>> factor_errors;
-         factor_errors.reserve(corner_cloud.size() / step + 1);
-         
-         for (size_t i = 0; i < corner_cloud.size(); i += step) {
-             const auto& point = corner_cloud[i];
-             
-             // Skip points that are too close or too far (common with 32-channel LiDARs)
-             float range_sq = point.x * point.x + point.y * point.y + point.z * point.z;
-             if (range_sq < 1.0 || range_sq > 10000.0) {  // 1m to 100m range check
-                 continue;
-             }
-             
-             // Transform point to map frame for search
-             PointType point_transformed;
-             transformPointToMap(point, point_transformed, parameters);
-             
-             std::vector<int> point_search_idx;
-             std::vector<float> point_search_dist;
-             
-             // Search for correspondence in the map (use adaptive search radius)
-             double search_radius = use_low_res ? 1.2 : 0.6;  // Larger radius for low resolution
-             kdtree_corner_map_->radiusSearch(point_transformed, search_radius, point_search_idx, point_search_dist);
-             
-             if (point_search_idx.size() < 5) {
-                 // Not enough points, try nearest neighbor search
-                 kdtree_corner_map_->nearestKSearch(point_transformed, 5, point_search_idx, point_search_dist);
-                 
-                 if (point_search_idx.size() < 5 || point_search_dist[4] > nearest_feature_dist_sq_) {
-                     continue;  // Still not enough good points
-                 }
-             }
-             
-             // Fit line to the neighborhood points
-             Eigen::Vector3d line_point, line_direction;
-             double fit_error;
-             
-             if (!fitLine(*corner_map, point_search_idx, line_point, line_direction, fit_error)) {
-                 continue;  // Failed to fit a good line
-             }
-             
-             // Store fit error and point index
-             factor_errors.push_back(std::make_pair(fit_error, i));
-         }
-         
-         // Sort factors by increasing error (best first)
-         std::sort(factor_errors.begin(), factor_errors.end());
-         
-         // Select best factors up to a limit - bias toward higher quality matches
-         int max_factors = use_low_res ? 150 : 300;  // Increased for 32-channel
-         for (size_t i = 0; i < std::min(max_factors, static_cast<int>(factor_errors.size())); i++) {
-             const auto& error_pair = factor_errors[i];
-             double error = error_pair.first;
-             size_t point_idx = error_pair.second;
-             
-             // Skip lower quality matches at the end of the list
-             if (i > max_factors * 0.8 && error > 0.1) {
-                 continue;
-             }
-             
-             const auto& point = corner_cloud[point_idx];
-             
-             // Re-process the point to get correspondence and line
-             PointType point_transformed;
-             transformPointToMap(point, point_transformed, parameters);
-             
-             std::vector<int> point_search_idx;
-             std::vector<float> point_search_dist;
-             
-             // We know this will succeed because we already checked during the first pass
-             kdtree_corner_map_->nearestKSearch(point_transformed, 5, point_search_idx, point_search_dist);
-             
-             Eigen::Vector3d line_point, line_direction;
-             double fit_error;
-             
-             if (!fitLine(*corner_map, point_search_idx, line_point, line_direction, fit_error)) {
-                 continue;  // Just in case, this shouldn't happen
-             }
-             
-             // Use line endpoints that are a reasonable distance from center
-             Eigen::Vector3d point_a = line_point + 0.1 * line_direction;
-             Eigen::Vector3d point_b = line_point - 0.1 * line_direction;
-             
-             // Weight inversely proportional to error and distance from center
-             double range = point.x * point.x + point.y * point.y + point.z * point.z;
-             double range_weight = 1.0 / (1.0 + range * 0.01);  // Favor closer points slightly
-             double weight = (1.0 / (1.0 + error * 10.0)) * range_weight;
-             
-             // Create current point vector
-             Eigen::Vector3d curr_point(point.x, point.y, point.z);
-             
-             ceres::CostFunction* cost_function = LidarEdgeFactor::Create(curr_point, point_a, point_b, weight);
-             problem.AddResidualBlock(cost_function, loss_function, parameters, parameters + 4);
-             factor_count++;
-         }
-         
-         return factor_count;
-     }
-     
-     // Improved plane factors addition optimized for 32-channel LiDAR
-     int addPlaneFactorsToOptimization(ceres::Problem& problem, ceres::LossFunction* loss_function,
-                                      double* parameters, const pcl::PointCloud<PointType>& surf_cloud, 
-                                      const CloudPtr& surf_map, bool use_low_res = false) {
-         int factor_count = 0;
-         
-         // Parameters adjusted for 32-channel LiDAR
-         int max_points = use_low_res ? 300 : 600;  // Increased for 32-channel
-         int step = std::max(1, static_cast<int>(surf_cloud.size() / max_points));
-         
-         // Track the quality of each factor to select the best ones
-         std::vector<std::pair<double, size_t>> factor_errors;
-         factor_errors.reserve(surf_cloud.size() / step + 1);
-         
-         for (size_t i = 0; i < surf_cloud.size(); i += step) {
-             const auto& point = surf_cloud[i];
-             
-             // Skip points that are too close or too far (common with 32-channel LiDARs)
-             float range_sq = point.x * point.x + point.y * point.y + point.z * point.z;
-             if (range_sq < 1.0 || range_sq > 10000.0) {  // 1m to 100m range check
-                 continue;
-             }
-             
-             // Transform point to map frame for search
-             PointType point_transformed;
-             transformPointToMap(point, point_transformed, parameters);
-             
-             std::vector<int> point_search_idx;
-             std::vector<float> point_search_dist;
-             
-             // Search for correspondences in the map (use adaptive search radius)
-             double search_radius = use_low_res ? 1.2 : 0.6;  // Larger radius for low resolution
-             kdtree_surf_map_->radiusSearch(point_transformed, search_radius, point_search_idx, point_search_dist);
-             
-             if (point_search_idx.size() < 5) {
-                 // Not enough points, try nearest neighbor search
-                 kdtree_surf_map_->nearestKSearch(point_transformed, 5, point_search_idx, point_search_dist);
-                 
-                 if (point_search_idx.size() < 5 || point_search_dist[4] > nearest_feature_dist_sq_) {
-                     continue;  // Still not enough good points
-                 }
-             }
-             
-             // Fit plane to the neighborhood points
-             Eigen::Vector3d plane_normal;
-             double plane_d, fit_error;
-             
-             if (!fitPlane(*surf_map, point_search_idx, plane_normal, plane_d, fit_error)) {
-                 continue;  // Failed to fit a good plane
-             }
-             
-             // Store fit error and point index
-             factor_errors.push_back(std::make_pair(fit_error, i));
-         }
-         
-         // Sort factors by increasing error (best first)
-         std::sort(factor_errors.begin(), factor_errors.end());
-         
-         // Select best factors up to a limit - bias toward higher quality matches
-         int max_factors = use_low_res ? 300 : 600;  // Increased for 32-channel
-         for (size_t i = 0; i < std::min(max_factors, static_cast<int>(factor_errors.size())); i++) {
-             const auto& error_pair = factor_errors[i];
-             double error = error_pair.first;
-             size_t point_idx = error_pair.second;
-             
-             // Skip lower quality matches at the end of the list
-             if (i > max_factors * 0.8 && error > 0.05) {
-                 continue;
-             }
-             
-             const auto& point = surf_cloud[point_idx];
-             
-             // Re-process the point to get correspondence and plane
-             PointType point_transformed;
-             transformPointToMap(point, point_transformed, parameters);
-             
-             std::vector<int> point_search_idx;
-             std::vector<float> point_search_dist;
-             
-             // We know this will succeed because we already checked during the first pass
-             kdtree_surf_map_->nearestKSearch(point_transformed, 5, point_search_idx, point_search_dist);
-             
-             Eigen::Vector3d plane_normal;
-             double plane_d, fit_error;
-             
-             if (!fitPlane(*surf_map, point_search_idx, plane_normal, plane_d, fit_error)) {
-                 continue;  // Just in case, this shouldn't happen
-             }
-             
-             // Weight inversely proportional to error and distance from center
-             double range = point.x * point.x + point.y * point.y + point.z * point.z;
-             double range_weight = 1.0 / (1.0 + range * 0.01);  // Favor closer points slightly
-             double weight = (1.0 / (1.0 + error * 20.0)) * range_weight;
-             
-             // Create current point vector
-             Eigen::Vector3d curr_point(point.x, point.y, point.z);
-             
-             ceres::CostFunction* cost_function = 
-                 LidarPlaneFactor::Create(curr_point, plane_normal, plane_d, weight);
-             problem.AddResidualBlock(cost_function, loss_function, parameters, parameters + 4);
-             factor_count++;
-         }
-         
-         return factor_count;
-     }
-     
-     void transformPointToMap(const PointType& point_in, PointType& point_out, const double* parameters) {
-         // Extract transformation parameters
-         Eigen::Quaterniond q(parameters[3], parameters[0], parameters[1], parameters[2]);
-         Eigen::Vector3d t(parameters[4], parameters[5], parameters[6]);
-         
-         // Transform point from LiDAR frame to map frame
-         Eigen::Vector3d p_lidar(point_in.x, point_in.y, point_in.z);
-         Eigen::Vector3d p_map = q * p_lidar + t;
-         
-         point_out.x = p_map.x();
-         point_out.y = p_map.y();
-         point_out.z = p_map.z();
-         point_out.intensity = point_in.intensity;
-     }
-     
-     void updateMaps() {
-         std::lock_guard<std::mutex> lock(map_mutex_);
-         
-         // Add the optimized clouds to the feature maps
-         CloudPtr corner_cloud_map(new pcl::PointCloud<PointType>());
-         CloudPtr surf_cloud_map(new pcl::PointCloud<PointType>());
-         CloudPtr full_cloud_map(new pcl::PointCloud<PointType>());
-         
-         // Transform the clouds to map frame
-         pcl::transformPointCloud(corner_points_less_sharp_, *corner_cloud_map, 
-                                t_w_curr_.cast<float>(), q_w_curr_.cast<float>());
-         
-         pcl::transformPointCloud(surface_points_less_flat_, *surf_cloud_map, 
-                                t_w_curr_.cast<float>(), q_w_curr_.cast<float>());
-         
-         pcl::transformPointCloud(laser_cloud_in_, *full_cloud_map, 
-                                t_w_curr_.cast<float>(), q_w_curr_.cast<float>());
-         
-         // Downsample before adding to maps - more aggressive for 32-channel
-         CloudPtr corner_cloud_downsampled(new pcl::PointCloud<PointType>());
-         CloudPtr surf_cloud_downsampled(new pcl::PointCloud<PointType>());
-         
-         downsize_filter_corner_.setInputCloud(corner_cloud_map);
-         downsize_filter_corner_.filter(*corner_cloud_downsampled);
-         
-         downsize_filter_surf_.setInputCloud(surf_cloud_map);
-         downsize_filter_surf_.filter(*surf_cloud_downsampled);
-         
-         // Add to ring buffers
-         corner_map_buffer_.push(corner_cloud_downsampled);
-         surf_map_buffer_.push(surf_cloud_downsampled);
-         
-         // Handle global map more efficiently for 32-channel LiDAR
-         // Randomly sample points to add to global map to prevent excessive growth
-         if (is_velodyne32_) {
-             // Add only a subset of points to global map
-             CloudPtr sampled_cloud(new pcl::PointCloud<PointType>());
-             int sample_step = 5;  // Add only every 5th point
-             
-             for (size_t i = 0; i < full_cloud_map->size(); i += sample_step) {
-                 sampled_cloud->push_back((*full_cloud_map)[i]);
-             }
-             
-             *global_map_ += *sampled_cloud;
-         } else {
-             *global_map_ += *full_cloud_map;
-         }
-         
-         // Control global map size by occasional downsampling - more frequent for 32-channel
-         static int map_update_counter = 0;
-         int downsample_frequency = is_velodyne32_ ? 5 : 10;  // More frequent for 32-channel
-         
-         if (map_update_counter++ % downsample_frequency == 0 && global_map_->size() > 100000) {
-             CloudPtr global_map_downsampled(new pcl::PointCloud<PointType>());
-             downsize_filter_map_.setInputCloud(global_map_);
-             downsize_filter_map_.filter(*global_map_downsampled);
-             global_map_ = global_map_downsampled;
-         }
-         
-         // Mark KD-trees for update
-         kdtree_needs_update_ = true;
-     }
-     
-     void publishResults(const ros::Time& stamp) {
-         // Publish odometry
-         nav_msgs::Odometry odom;
-         odom.header.stamp = stamp;
-         odom.header.frame_id = fixed_frame_id_;
-         odom.child_frame_id = lidar_frame_id_;
-         
-         // Set odometry pose
-         odom.pose.pose.orientation.x = q_w_curr_.x();
-         odom.pose.pose.orientation.y = q_w_curr_.y();
-         odom.pose.pose.orientation.z = q_w_curr_.z();
-         odom.pose.pose.orientation.w = q_w_curr_.w();
-         odom.pose.pose.position.x = t_w_curr_.x();
-         odom.pose.pose.position.y = t_w_curr_.y();
-         odom.pose.pose.position.z = t_w_curr_.z();
-         
-         // Velocity is not computed in direct scan-to-map approach
-         odom_pub_.publish(odom);
-         
-         // Publish TF transform using tf2
-         geometry_msgs::TransformStamped transform_stamped;
-         transform_stamped.header.stamp = stamp;
-         transform_stamped.header.frame_id = fixed_frame_id_;
-         transform_stamped.child_frame_id = lidar_frame_id_;
-         
-         transform_stamped.transform.translation.x = t_w_curr_.x();
-         transform_stamped.transform.translation.y = t_w_curr_.y();
-         transform_stamped.transform.translation.z = t_w_curr_.z();
-         
-         transform_stamped.transform.rotation.w = q_w_curr_.w();
-         transform_stamped.transform.rotation.x = q_w_curr_.x();
-         transform_stamped.transform.rotation.y = q_w_curr_.y();
-         transform_stamped.transform.rotation.z = q_w_curr_.z();
-         
-         tf_broadcaster_.sendTransform(transform_stamped);
-         
-         // Publish path
-         geometry_msgs::PoseStamped pose_stamped;
-         pose_stamped.header.stamp = stamp;
-         pose_stamped.header.frame_id = fixed_frame_id_;
-         pose_stamped.pose.orientation.x = q_w_curr_.x();
-         pose_stamped.pose.orientation.y = q_w_curr_.y();
-         pose_stamped.pose.orientation.z = q_w_curr_.z();
-         pose_stamped.pose.orientation.w = q_w_curr_.w();
-         pose_stamped.pose.position.x = t_w_curr_.x();
-         pose_stamped.pose.position.y = t_w_curr_.y();
-         pose_stamped.pose.position.z = t_w_curr_.z();
-         
-         path_.header.stamp = stamp;
-         path_.header.frame_id = fixed_frame_id_;
-         path_.poses.push_back(pose_stamped);
-         
-         // Limit path size for efficiency
-         if (path_.poses.size() > 1000) {
-             path_.poses.erase(path_.poses.begin());
-         }
-         
-         path_pub_.publish(path_);
-         
-         // Publish feature clouds
-         publishCloud(cloud_edge_pub_, corner_points_sharp_, stamp, lidar_frame_id_);
-         publishCloud(cloud_surf_pub_, surface_points_flat_, stamp, lidar_frame_id_);
-         publishCloud(cloud_full_pub_, laser_cloud_in_, stamp, lidar_frame_id_);
-         
-         // Publish map occasionally for visualization - less frequent for 32-channel
-         static int map_publish_counter = 0;
-         int publish_frequency = is_velodyne32_ ? 20 : 10;  // Less frequent for 32-channel
-         
-         if (map_publish_counter++ % publish_frequency == 0 && map_pub_.getNumSubscribers() > 0) {
-             CloudPtr map_cloud_ds(new pcl::PointCloud<PointType>());
-             // More aggressive downsampling for visualization
-             pcl::VoxelGrid<PointType> vis_filter;
-             vis_filter.setLeafSize(filter_map_leaf_size_ * 1.5, filter_map_leaf_size_ * 1.5, filter_map_leaf_size_ * 1.5);
-             vis_filter.setInputCloud(global_map_);
-             vis_filter.filter(*map_cloud_ds);
-             publishCloud(map_pub_, *map_cloud_ds, stamp, fixed_frame_id_);
-         }
-     }
- 
-     void publishCloud(const ros::Publisher& publisher, const pcl::PointCloud<PointType>& cloud, 
-                      const ros::Time& stamp, const std::string& frame_id) {
-         if (cloud.empty() || publisher.getNumSubscribers() == 0) {
-             return;
-         }
-         
-         sensor_msgs::PointCloud2 cloud_msg;
-         pcl::toROSMsg(cloud, cloud_msg);
-         cloud_msg.header.stamp = stamp;
-         cloud_msg.header.frame_id = frame_id;
-         publisher.publish(cloud_msg);
-     }
- 
-     void saveGlobalMap() {
-         if (global_map_->empty()) {
-             ROS_WARN("Global map is empty, not saving.");
-             return;
-         }
-         
-         // Downsample the global map for saving
-         CloudPtr global_map_filtered(new pcl::PointCloud<PointType>());
-         pcl::VoxelGrid<PointType> downsize_filter_save;
-         downsize_filter_save.setLeafSize(filter_map_leaf_size_ * 2, filter_map_leaf_size_ * 2, filter_map_leaf_size_ * 2);
-         downsize_filter_save.setInputCloud(global_map_);
-         downsize_filter_save.filter(*global_map_filtered);
-         
-         // Save to PCD file
-         pcl::io::savePCDFileBinary(map_save_path_, *global_map_filtered);
-         ROS_INFO("Global map saved to %s with %zu points.", map_save_path_.c_str(), global_map_filtered->size());
-     }
-     
-     // Print current pose to terminal
-     void printCurrentPose() {
-         // Get Euler angles in degrees
-         Eigen::Vector3d euler_angles = quaternionToEulerDegrees(q_w_curr_);
-         
-         // Print to terminal with fixed formatting
-         std::stringstream ss;
-         ss << std::fixed << std::setprecision(3);
-         ss << "Position [x,y,z]: [" << t_w_curr_.x() << ", " << t_w_curr_.y() << ", " << t_w_curr_.z() << "] m, ";
-         ss << "Orientation [roll,pitch,yaw]: [" << euler_angles.x() << ", " << euler_angles.y() << ", " << euler_angles.z() << "] deg";
-         
-         std::cout << "\r" << ss.str() << std::flush;
-     }
-     
-     // Write pose to file
-     void writePoseToFile(const ros::Time& stamp) {
-         if (!pose_file_.is_open()) return;
-         
-         Eigen::Vector3d euler = quaternionToEulerDegrees(q_w_curr_);
-         
-         pose_file_ << std::fixed << std::setprecision(9)
-                   << stamp.toSec() << " "
-                   << std::setprecision(6) 
-                   << t_w_curr_.x() << " " << t_w_curr_.y() << " " << t_w_curr_.z() << " "
-                   << q_w_curr_.x() << " " << q_w_curr_.y() << " " << q_w_curr_.z() << " " << q_w_curr_.w() << " "
-                   << euler.x() << " " << euler.y() << " " << euler.z() << std::endl;
-     }
-     
-     // Timer utilities
-     void startTimer(const std::string& name) {
-         if (!timing_output_) return;
-         timers_.emplace_back(name);
-     }
-     
-     void stopTimer() {
-         if (!timing_output_ || timers_.empty()) return;
-         timers_.pop_back();
-     }
-     
-     void printTimers() {
-         if (!timing_output_ || timers_.empty()) return;
-         
-         std::stringstream ss;
-         ss << "Timing: ";
-         for (const auto& timer : timers_) {
-             ss << timer.name << "=" << timer.elapsed() << "ms ";
-         }
-         ROS_INFO_STREAM(ss.str());
-     }
- };
- 
- int main(int argc, char** argv) {
-     ros::init(argc, argv, "fast32_loam");
-     Fast32Loam fast32_loam;
-     ros::spin();
-     return 0;
- }
+// ROS headers
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Odometry.h>
+#include <std_msgs/Int32.h>
+#include <std_msgs/Float64.h>
+#include <tf/transform_broadcaster.h>
+#include <tf/transform_datatypes.h>
+
+// NDT cell structure to store statistics
+struct NDTCell {
+    Eigen::Vector3d mean;
+    Eigen::Matrix3d covariance;
+    Eigen::Matrix3d inverse_covariance;
+    double det_covariance;
+    int point_count;
+
+    NDTCell() : mean(Eigen::Vector3d::Zero()), 
+                covariance(Eigen::Matrix3d::Identity()),
+                inverse_covariance(Eigen::Matrix3d::Identity()),
+                det_covariance(1.0), 
+                point_count(0) {}
+};
+
+// Ceres cost function for NDT registration
+class NDTCostFunction : public ceres::SizedCostFunction<1, 6> {
+public:
+    NDTCostFunction(const Eigen::Vector3d& point, const NDTCell& cell, double weight = 1.0)
+        : point_(point), cell_(cell), weight_(weight) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                         double* residuals,
+                         double** jacobians) const {
+        
+        // Extract transformation parameters (3 for translation, 3 for rotation in angle-axis form)
+        Eigen::Vector3d translation(parameters[0][0], parameters[0][1], parameters[0][2]);
+        Eigen::Vector3d rotation_aa(parameters[0][3], parameters[0][4], parameters[0][5]);
+        
+        // Handle zero rotation case to avoid divide-by-zero
+        double angle = rotation_aa.norm();
+        Eigen::Matrix3d rotation_matrix;
+        
+        if (angle < 1e-10) {
+            rotation_matrix = Eigen::Matrix3d::Identity();
+        } else {
+            Eigen::AngleAxisd rotation(angle, rotation_aa / angle);
+            rotation_matrix = rotation.toRotationMatrix();
+        }
+        
+        // Transform the point
+        Eigen::Vector3d transformed_point = rotation_matrix * point_ + translation;
+        
+        // Compute the difference from the mean
+        Eigen::Vector3d d = transformed_point - cell_.mean;
+        
+        // Compute the NDT score (negative log-likelihood)
+        double exp_term = -0.5 * d.transpose() * cell_.inverse_covariance * d;
+        
+        // Residual is negative to maximize the likelihood, weighted by confidence
+        residuals[0] = -weight_ * exp(exp_term);
+        
+        // Compute jacobians if needed
+        if (jacobians && jacobians[0]) {
+            Eigen::Matrix<double, 1, 3> gradient_translation = 
+                -residuals[0] * d.transpose() * cell_.inverse_covariance;
+            
+            // Jacobian for translation part (first 3 elements)
+            jacobians[0][0] = gradient_translation(0);
+            jacobians[0][1] = gradient_translation(1);
+            jacobians[0][2] = gradient_translation(2);
+            
+            // Jacobian for rotation part (last 3 elements)
+            Eigen::Matrix3d skew_point;
+            skew_point << 0, -point_(2), point_(1),
+                          point_(2), 0, -point_(0),
+                          -point_(1), point_(0), 0;
+            
+            Eigen::Matrix<double, 3, 3> jacobian_rotation = -rotation_matrix * skew_point;
+            Eigen::Matrix<double, 1, 3> gradient_rotation = 
+                gradient_translation * jacobian_rotation;
+            
+            jacobians[0][3] = gradient_rotation(0);
+            jacobians[0][4] = gradient_rotation(1);
+            jacobians[0][5] = gradient_rotation(2);
+        }
+        
+        return true;
+    }
+
+private:
+    Eigen::Vector3d point_;
+    NDTCell cell_;
+    double weight_; // Weight for this point-to-cell correspondence
+};
+
+// Regularization cost function to limit transformation magnitude
+class TransformationRegularizationCostFunction : public ceres::SizedCostFunction<6, 6> {
+public:
+    TransformationRegularizationCostFunction(double translation_weight = 0.1, double rotation_weight = 0.1)
+        : translation_weight_(translation_weight), rotation_weight_(rotation_weight) {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                         double* residuals,
+                         double** jacobians) const {
+        
+        // Extract parameters
+        Eigen::Vector3d translation(parameters[0][0], parameters[0][1], parameters[0][2]);
+        Eigen::Vector3d rotation_aa(parameters[0][3], parameters[0][4], parameters[0][5]);
+        
+        // Regularize translation
+        residuals[0] = translation_weight_ * translation.x();
+        residuals[1] = translation_weight_ * translation.y();
+        residuals[2] = translation_weight_ * translation.z();
+        
+        // Regularize rotation
+        residuals[3] = rotation_weight_ * rotation_aa.x();
+        residuals[4] = rotation_weight_ * rotation_aa.y();
+        residuals[5] = rotation_weight_ * rotation_aa.z();
+        
+        if (jacobians && jacobians[0]) {
+            // Set Jacobian to identity matrix with weights
+            for (int i = 0; i < 6; ++i) {
+                for (int j = 0; j < 6; ++j) {
+                    jacobians[0][i * 6 + j] = 0.0;
+                }
+                
+                double weight = (i < 3) ? translation_weight_ : rotation_weight_;
+                jacobians[0][i * 6 + i] = weight;
+            }
+        }
+        
+        return true;
+    }
+
+private:
+    double translation_weight_;
+    double rotation_weight_;
+};
+
+class HighAccuracyNDTRegistration {
+public:
+    HighAccuracyNDTRegistration(ros::NodeHandle& nh) : 
+        nh_(nh), 
+        has_target_cloud_(false), 
+        processing_thread_active_(true),
+        frames_processed_(0),
+        accumulated_error_(0.0),
+        use_motion_undistortion_(true),
+        use_keyframe_strategy_(true),
+        use_icp_refinement_(true),
+        use_adaptive_parameters_(true) {
+            
+        // Load parameters (hardcoded for higher accuracy)
+        // NDT parameters - refined for higher accuracy
+        voxel_size_ = 0.3;                   // Decreased for more detailed matching
+        downsample_resolution_ = 0.05;       // Finer resolution to preserve details
+        max_queue_size_ = 1000;              // Large queue for offline processing
+        fixed_frame_ = "map";
+        publish_tf_ = true;
+        outlier_radius_ = 0.3;               // Decreased to remove fewer points
+        outlier_min_neighbors_ = 3;          // Lower threshold to keep more points
+        max_iterations_ = 300;               // More iterations for better convergence
+        reg_translation_weight_ = 0.001;     // Lower regularization to allow more freedom
+        reg_rotation_weight_ = 0.001;        // Lower regularization for rotation
+        multi_res_size_1_ = 0.3;             // Fine resolution
+        multi_res_size_2_ = 0.6;             // Medium resolution
+        multi_res_size_3_ = 1.2;             // Coarse resolution
+        
+        // Segmentation parameters
+        use_ground_segmentation_ = true;     // Keep ground segmentation on
+        ground_z_threshold_ = -1.5;          // For VLP-32 on car, ground is below
+        max_z_value_ = 5.0;                  // Max height for points (remove sky points)
+        distance_weight_factor_ = 0.2;       // Slightly increased weight factor
+        
+        // Motion compensation
+        scan_period_ = 0.1;                  // 100ms for a typical Velodyne scan
+        min_scan_range_ = 1.0;               // Min range to filter out near points
+        max_scan_range_ = 100.0;             // Max range for point filtering
+        
+        // Keyframe-based strategy
+        keyframe_trans_threshold_ = 0.5;     // meters
+        keyframe_rot_threshold_ = 0.1;       // radians (about 5.7 degrees)
+        keyframe_overlap_factor_ = 0.7;      // Percentage of overlap required
+        
+        // ICP refinement
+        icp_max_iterations_ = 50;
+        icp_max_correspondence_distance_ = 0.1;
+        icp_transformation_epsilon_ = 1e-8;
+        
+        // Adaptive parameters
+        velocity_threshold_slow_ = 0.5;      // m/s
+        velocity_threshold_fast_ = 2.0;      // m/s
+        
+        // Status reporting
+        status_publish_rate_ = 1;            // Hz
+        
+        // Initialize publishers and subscribers
+        cloud_sub_ = nh_.subscribe("/velodyne_points", 100, &HighAccuracyNDTRegistration::cloudCallback, this);
+        pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("ndt_pose", 10);
+        odom_pub_ = nh_.advertise<nav_msgs::Odometry>("ndt_odom", 10);
+        registered_cloud_pub_ = nh_.advertise<sensor_msgs::PointCloud2>("registered_cloud", 10);
+        queue_size_pub_ = nh_.advertise<std_msgs::Int32>("queue_size", 10);
+        frames_processed_pub_ = nh_.advertise<std_msgs::Int32>("frames_processed", 10);
+        error_pub_ = nh_.advertise<std_msgs::Float64>("registration_error", 10);
+        
+        // Initialize position
+        current_pose_ = Eigen::Matrix4d::Identity();
+        last_odom_pose_ = Eigen::Matrix4d::Identity();
+        
+        // Initialize point clouds
+        global_map_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>);
+        keyframe_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>);
+        
+        // Start processing thread
+        processing_thread_ = std::thread(&HighAccuracyNDTRegistration::processQueue, this);
+        
+        // Start status publisher timer
+        status_timer_ = nh_.createTimer(ros::Duration(1.0/status_publish_rate_), 
+                                      &HighAccuracyNDTRegistration::publishStatus, this);
+        
+        ROS_INFO("High Accuracy NDT Registration node initialized");
+        ROS_INFO("Parameters: voxel_size=%.2f, downsample_resolution=%.3f", voxel_size_, downsample_resolution_);
+        ROS_INFO("Using multi-resolution NDT with sizes: %.2f, %.2f, %.2f", 
+                multi_res_size_1_, multi_res_size_2_, multi_res_size_3_);
+        ROS_INFO("Keyframe-based strategy: %s", use_keyframe_strategy_ ? "enabled" : "disabled");
+        ROS_INFO("ICP refinement: %s", use_icp_refinement_ ? "enabled" : "disabled");
+        ROS_INFO("Motion undistortion: %s", use_motion_undistortion_ ? "enabled" : "disabled");
+    }
+    
+    ~HighAccuracyNDTRegistration() {
+        processing_thread_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+    }
+
+private:
+    // ROS related
+    ros::NodeHandle nh_;
+    ros::Subscriber cloud_sub_;
+    ros::Publisher pose_pub_;
+    ros::Publisher odom_pub_;
+    ros::Publisher registered_cloud_pub_;
+    ros::Publisher queue_size_pub_;
+    ros::Publisher frames_processed_pub_;
+    ros::Publisher error_pub_;
+    ros::Timer status_timer_;
+    tf::TransformBroadcaster tf_broadcaster_;
+    
+    // Parameters
+    double voxel_size_;
+    double downsample_resolution_;
+    int max_queue_size_;
+    std::string fixed_frame_;
+    bool publish_tf_;
+    double outlier_radius_;
+    int outlier_min_neighbors_;
+    int max_iterations_;
+    double reg_translation_weight_;
+    double reg_rotation_weight_;
+    double multi_res_size_1_;
+    double multi_res_size_2_;
+    double multi_res_size_3_;
+    bool use_ground_segmentation_;
+    double ground_z_threshold_;
+    double max_z_value_;
+    double distance_weight_factor_;
+    int status_publish_rate_;
+    
+    // Motion compensation parameters
+    bool use_motion_undistortion_;
+    double scan_period_;
+    double min_scan_range_;
+    double max_scan_range_;
+    
+    // Keyframe strategy parameters
+    bool use_keyframe_strategy_;
+    double keyframe_trans_threshold_;
+    double keyframe_rot_threshold_;
+    double keyframe_overlap_factor_;
+    
+    // ICP refinement parameters
+    bool use_icp_refinement_;
+    int icp_max_iterations_;
+    double icp_max_correspondence_distance_;
+    double icp_transformation_epsilon_;
+    
+    // Adaptive parameters
+    bool use_adaptive_parameters_;
+    double velocity_threshold_slow_;
+    double velocity_threshold_fast_;
+    
+    // Statistics
+    int frames_processed_;
+    std::map<int, double> frame_times_; // frame_id -> processing time
+    double accumulated_error_;
+    
+    // Point cloud processing
+    pcl::PointCloud<pcl::PointXYZ>::Ptr target_cloud_;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr keyframe_cloud_;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr global_map_cloud_;
+    bool has_target_cloud_;
+    Eigen::Matrix4d current_pose_;
+    Eigen::Matrix4d last_odom_pose_;
+    ros::Time last_cloud_time_;
+    Eigen::Vector3d current_velocity_;
+    
+    // Thread-related
+    std::queue<sensor_msgs::PointCloud2::ConstPtr> cloud_queue_;
+    std::mutex queue_mutex_;
+    std::thread processing_thread_;
+    bool processing_thread_active_;
+    
+    void cloudCallback(const sensor_msgs::PointCloud2::ConstPtr& cloud_msg) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        
+        // Limit queue size but allow large queues for offline processing
+        if (cloud_queue_.size() >= max_queue_size_) {
+            ROS_WARN_THROTTLE(5, "NDT registration queue has %zu messages, dropping oldest", cloud_queue_.size());
+            cloud_queue_.pop();
+        }
+        
+        cloud_queue_.push(cloud_msg);
+        
+        // Output queue size for monitoring
+        ROS_INFO_THROTTLE(2, "Queue status: %zu frames waiting to be processed", cloud_queue_.size());
+    }
+    
+    void publishStatus(const ros::TimerEvent&) {
+        std_msgs::Int32 queue_size_msg;
+        std_msgs::Int32 frames_processed_msg;
+        std_msgs::Float64 error_msg;
+        
+        // Get current queue size
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            queue_size_msg.data = cloud_queue_.size();
+        }
+        
+        frames_processed_msg.data = frames_processed_;
+        error_msg.data = accumulated_error_ / std::max(1, frames_processed_);
+        
+        // Publish statistics
+        queue_size_pub_.publish(queue_size_msg);
+        frames_processed_pub_.publish(frames_processed_msg);
+        error_pub_.publish(error_msg);
+        
+        // Log status information
+        ROS_INFO("Status: %d frames processed, %d frames in queue, avg error: %.6f", 
+                frames_processed_, queue_size_msg.data, error_msg.data);
+    }
+    
+    void processQueue() {
+        while (processing_thread_active_ && ros::ok()) {
+            sensor_msgs::PointCloud2::ConstPtr cloud_msg;
+            
+            // Get next cloud from queue
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                if (!cloud_queue_.empty()) {
+                    cloud_msg = cloud_queue_.front();
+                    cloud_queue_.pop();
+                }
+            }
+            
+            // Process cloud if available
+            if (cloud_msg) {
+                // Start tracking processing time for this frame
+                auto process_start_time = std::chrono::steady_clock::now();
+                
+                // Convert from ROS to PCL
+                pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+                pcl::fromROSMsg(*cloud_msg, *cloud);
+                
+                ROS_INFO("Processing frame %d with %ld points", frames_processed_ + 1, cloud->size());
+                
+                // Apply motion undistortion if enabled
+                if (use_motion_undistortion_ && has_target_cloud_) {
+                    pcl::PointCloud<pcl::PointXYZ>::Ptr undistorted_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+                    undistortPointCloud(cloud, undistorted_cloud, current_velocity_, cloud_msg->header.stamp);
+                    cloud = undistorted_cloud;
+                }
+                
+                // Basic pre-filtering: remove NaN points and range filtering
+                pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+                preFilterCloud(cloud, filtered_cloud);
+                
+                // Process filtered point cloud
+                processPointCloud(filtered_cloud, cloud_msg->header);
+                
+                // Update velocity estimate
+                if (last_cloud_time_.toSec() > 0 && cloud_msg->header.stamp > last_cloud_time_) {
+                    double dt = (cloud_msg->header.stamp - last_cloud_time_).toSec();
+                    if (dt > 0) {
+                        // Simple velocity estimate from position change
+                        Eigen::Vector3d position_change = current_pose_.block<3, 1>(0, 3) - 
+                                                         last_odom_pose_.block<3, 1>(0, 3);
+                        current_velocity_ = position_change / dt;
+                        
+                        // Adjust parameters based on velocity if adaptive mode is enabled
+                        if (use_adaptive_parameters_) {
+                            adjustParametersByVelocity(current_velocity_.norm());
+                        }
+                    }
+                }
+                
+                // Update time stamp
+                last_cloud_time_ = cloud_msg->header.stamp;
+                last_odom_pose_ = current_pose_;
+                
+                // Calculate total processing time
+                auto process_end_time = std::chrono::steady_clock::now();
+                double total_processing_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    process_end_time - process_start_time).count() / 1000.0;
+                
+                // Update statistics
+                frames_processed_++;
+                frame_times_[frames_processed_] = total_processing_time;
+                
+                // Output timing information
+                ROS_INFO("Frame %d processed in %.3f seconds, velocity: %.2f m/s",
+                        frames_processed_, total_processing_time, current_velocity_.norm());
+                
+                // Output queue size after processing
+                {
+                    std::lock_guard<std::mutex> lock(queue_mutex_);
+                    ROS_INFO("Queue status: %zu frames remaining to be processed", cloud_queue_.size());
+                }
+            }
+            
+            // Sleep a bit to avoid consuming all CPU and to allow status updates
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    
+    // New function to adjust parameters based on vehicle velocity
+    void adjustParametersByVelocity(double velocity) {
+        if (velocity < velocity_threshold_slow_) {
+            // Slow motion - more accurate registration
+            multi_res_size_1_ = 0.2;  // Finer resolution
+            max_iterations_ = 300;    // More iterations
+            outlier_radius_ = 0.2;    // Stricter outlier rejection
+            reg_translation_weight_ = 0.0005; // Lower regularization
+            reg_rotation_weight_ = 0.0005;    // Lower regularization
+        }
+        else if (velocity > velocity_threshold_fast_) {
+            // Fast motion - more robust registration
+            multi_res_size_1_ = 0.4;  // Coarser resolution
+            max_iterations_ = 200;    // Fewer iterations for speed
+            outlier_radius_ = 0.4;    // More relaxed outlier rejection
+            reg_translation_weight_ = 0.002; // Higher regularization
+            reg_rotation_weight_ = 0.002;    // Higher regularization
+        }
+        else {
+            // Normal motion - balanced parameters
+            multi_res_size_1_ = 0.3;
+            max_iterations_ = 250;
+            outlier_radius_ = 0.3;
+            reg_translation_weight_ = 0.001;
+            reg_rotation_weight_ = 0.001;
+        }
+        
+        // Adjust multi-resolution parameters accordingly
+        multi_res_size_2_ = multi_res_size_1_ * 2.0;
+        multi_res_size_3_ = multi_res_size_1_ * 4.0;
+    }
+    
+    // Pre-filtering for point clouds
+    void preFilterCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, 
+                       pcl::PointCloud<pcl::PointXYZ>::Ptr& output) {
+        // Remove NaN points
+        std::vector<int> indices;
+        pcl::removeNaNFromPointCloud(*input, *output, indices);
+        
+        // Apply range filtering
+        pcl::PointCloud<pcl::PointXYZ>::Ptr range_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+        range_filtered->reserve(output->size());
+        
+        for (const auto& point : output->points) {
+            float range = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+            if (range >= min_scan_range_ && range <= max_scan_range_) {
+                range_filtered->push_back(point);
+            }
+        }
+        
+        output = range_filtered;
+    }
+    
+    // Motion undistortion for point clouds
+    void undistortPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, 
+                           pcl::PointCloud<pcl::PointXYZ>::Ptr& output,
+                           const Eigen::Vector3d& velocity,
+                           const ros::Time& cloud_time) {
+        output->clear();
+        output->reserve(input->size());
+        
+        // If no motion or this is the first cloud, return input unchanged
+        if (!has_target_cloud_ || velocity.norm() < 0.1 || scan_period_ <= 0) {
+            *output = *input;
+            return;
+        }
+        
+        // Calculate time since last frame
+        double dt = 0;
+        if (last_cloud_time_.toSec() > 0) {
+            dt = (cloud_time - last_cloud_time_).toSec();
+        }
+        
+        if (dt <= 0) {
+            *output = *input;
+            return;
+        }
+        
+        // Extract rotation from current pose
+        Eigen::Matrix3d current_rotation = current_pose_.block<3, 3>(0, 0);
+        
+        // For each point, apply motion compensation based on estimated time within scan
+        for (size_t i = 0; i < input->size(); ++i) {
+            const auto& point = input->points[i];
+            
+            // Estimate relative time within scan (0.0 to 1.0) based on point index
+            // This assumes points are roughly in order of scan time
+            double point_time_ratio = static_cast<double>(i) / input->size();
+            
+            // Extrapolate position at point's scan time
+            Eigen::Vector3d compensation = velocity * (point_time_ratio * scan_period_);
+            
+            // Transform compensation to world frame
+            Eigen::Vector3d world_compensation = current_rotation * compensation;
+            
+            // Apply compensation
+            pcl::PointXYZ corrected_point;
+            corrected_point.x = point.x + world_compensation.x();
+            corrected_point.y = point.y + world_compensation.y();
+            corrected_point.z = point.z + world_compensation.z();
+            
+            output->push_back(corrected_point);
+        }
+        
+        output->width = output->size();
+        output->height = 1;
+        output->is_dense = false;
+    }
+    
+    // Process a point cloud for registration
+    void processPointCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input_cloud,
+                         const std_msgs::Header& header) {
+        // Filter points above max height (sky/noise) and optionally segment ground
+        pcl::PointCloud<pcl::PointXYZ>::Ptr height_filtered_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::PointCloud<pcl::PointXYZ>::Ptr non_ground_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        
+        // Height-based filtering
+        filterCloudByHeight(input_cloud, height_filtered_cloud, ground_z_threshold_, max_z_value_);
+        
+        // Ground segmentation if enabled
+        if (use_ground_segmentation_) {
+            segmentGroundPoints(height_filtered_cloud, non_ground_cloud);
+            height_filtered_cloud = non_ground_cloud;
+        }
+        
+        // Remove outliers for more robust registration
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_no_outliers(new pcl::PointCloud<pcl::PointXYZ>);
+        removeOutliers(height_filtered_cloud, cloud_no_outliers);
+        
+        // Downsample the filtered point cloud
+        pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        downsampleCloud(cloud_no_outliers, downsampled_cloud, downsample_resolution_);
+        
+        ROS_INFO("After preprocessing: %ld points", downsampled_cloud->size());
+        
+        // If this is the first cloud, use it as target and skip alignment
+        if (!has_target_cloud_) {
+            target_cloud_ = downsampled_cloud;
+            keyframe_cloud_ = downsampled_cloud;
+            
+            // Initialize global map
+            *global_map_cloud_ = *downsampled_cloud;
+            
+            has_target_cloud_ = true;
+            ROS_INFO("Received first point cloud, using as reference");
+            return;
+        }
+        
+        // Determine whether to use keyframe or last frame as reference
+        pcl::PointCloud<pcl::PointXYZ>::Ptr reference_cloud;
+        
+        if (use_keyframe_strategy_) {
+            reference_cloud = keyframe_cloud_;
+        } else {
+            reference_cloud = target_cloud_;
+        }
+        
+        // Perform multi-resolution NDT registration
+        auto ndt_start_time = std::chrono::steady_clock::now();
+        
+        Eigen::Matrix4d initial_guess = Eigen::Matrix4d::Identity();
+        
+        // Multi-resolution alignment, from coarse to fine
+        ROS_INFO("Starting coarse-to-fine NDT registration");
+        
+        auto coarse_start = std::chrono::steady_clock::now();
+        Eigen::Matrix4d transform_1 = ndtRegistrationCeres(downsampled_cloud, reference_cloud, initial_guess, multi_res_size_3_);
+        auto coarse_end = std::chrono::steady_clock::now();
+        
+        auto medium_start = std::chrono::steady_clock::now();
+        Eigen::Matrix4d transform_2 = ndtRegistrationCeres(downsampled_cloud, reference_cloud, transform_1, multi_res_size_2_);
+        auto medium_end = std::chrono::steady_clock::now();
+        
+        auto fine_start = std::chrono::steady_clock::now();
+        Eigen::Matrix4d transform_3 = ndtRegistrationCeres(downsampled_cloud, reference_cloud, transform_2, multi_res_size_1_);
+        auto fine_end = std::chrono::steady_clock::now();
+        
+        // Final transform
+        Eigen::Matrix4d final_transform = transform_3;
+        
+        // Refine with ICP if enabled
+        if (use_icp_refinement_) {
+            auto icp_start = std::chrono::steady_clock::now();
+            
+            // Prepare ICP
+            pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+            icp.setMaximumIterations(icp_max_iterations_);
+            icp.setMaxCorrespondenceDistance(icp_max_correspondence_distance_);
+            icp.setTransformationEpsilon(icp_transformation_epsilon_);
+            
+            // Apply NDT transform to create initial alignment for ICP
+            pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::transformPointCloud(*downsampled_cloud, *transformed_cloud, final_transform);
+            
+            // Set up ICP
+            icp.setInputSource(transformed_cloud);
+            icp.setInputTarget(reference_cloud);
+            
+            pcl::PointCloud<pcl::PointXYZ>::Ptr icp_aligned(new pcl::PointCloud<pcl::PointXYZ>);
+            icp.align(*icp_aligned);
+            
+            if (icp.hasConverged()) {
+                // Convert ICP result to Eigen matrix
+                Eigen::Matrix4f icp_transform = icp.getFinalTransformation();
+                Eigen::Matrix4d icp_transform_d = icp_transform.cast<double>();
+                
+                // Combine NDT and ICP transformations
+                final_transform = icp_transform_d * final_transform;
+                
+                ROS_INFO("ICP refinement converged with fitness score: %f", icp.getFitnessScore());
+            } else {
+                ROS_WARN("ICP refinement did not converge, using NDT result only");
+            }
+            
+            auto icp_end = std::chrono::steady_clock::now();
+            double icp_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                icp_end - icp_start).count() / 1000.0;
+            
+            ROS_INFO("ICP refinement took %.3f seconds", icp_time);
+        }
+        
+        auto ndt_end_time = std::chrono::steady_clock::now();
+        
+        // Calculate timing for each stage
+        double coarse_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            coarse_end - coarse_start).count() / 1000.0;
+        double medium_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            medium_end - medium_start).count() / 1000.0;
+        double fine_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            fine_end - fine_start).count() / 1000.0;
+        double total_ndt_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            ndt_end_time - ndt_start_time).count() / 1000.0;
+        
+        ROS_INFO("NDT Registration times - Coarse: %.3fs, Medium: %.3fs, Fine: %.3fs, Total: %.3fs",
+                coarse_time, medium_time, fine_time, total_ndt_time);
+        
+        // Calculate registration error metric
+        double registration_error = calculateRegistrationError(downsampled_cloud, reference_cloud, final_transform);
+        accumulated_error_ += registration_error;
+        
+        ROS_INFO("Registration error metric: %.6f", registration_error);
+        
+        // Update global pose
+        current_pose_ = final_transform * current_pose_;
+        
+        // Check whether to update keyframe
+        if (use_keyframe_strategy_) {
+            bool update_keyframe = shouldUpdateKeyframe(final_transform);
+            if (update_keyframe) {
+                keyframe_cloud_ = downsampled_cloud;
+                ROS_INFO("Updated keyframe at frame %d", frames_processed_ + 1);
+            }
+        }
+        
+        // Update target cloud for next registration
+        target_cloud_ = downsampled_cloud;
+        
+        // Transform current cloud to global coordinates and add to map
+        pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::transformPointCloud(*downsampled_cloud, *transformed_cloud, current_pose_);
+        
+        // Optionally add to global map (can be used for visualization or loop closure)
+        *global_map_cloud_ += *transformed_cloud;
+        
+        // Downsample global map periodically to manage memory
+        if (global_map_cloud_->size() > 100000) {
+            pcl::PointCloud<pcl::PointXYZ>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+            downsampleCloud(global_map_cloud_, temp_cloud, downsample_resolution_ * 2.0);
+            global_map_cloud_ = temp_cloud;
+        }
+        
+        // Publish registered cloud
+        publishRegisteredCloud(transformed_cloud, header);
+        
+        // Publish results
+        publishResults(header);
+        
+        // Print pose for debugging
+        printCurrentPose();
+    }
+    
+    // Calculate a registration error metric
+    double calculateRegistrationError(const pcl::PointCloud<pcl::PointXYZ>::Ptr& source,
+                                     const pcl::PointCloud<pcl::PointXYZ>::Ptr& target,
+                                     const Eigen::Matrix4d& transform) {
+        // Transform source cloud
+        pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_source(new pcl::PointCloud<pcl::PointXYZ>);
+        pcl::transformPointCloud(*source, *transformed_source, transform);
+        
+        // Build KD-tree for target
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(target);
+        
+        // Calculate mean squared error
+        double total_error = 0.0;
+        int count = 0;
+        
+        for (const auto& point : transformed_source->points) {
+            std::vector<int> indices(1);
+            std::vector<float> distances(1);
+            
+            if (kdtree.nearestKSearch(point, 1, indices, distances)) {
+                total_error += distances[0];
+                count++;
+            }
+        }
+        
+        if (count > 0) {
+            return std::sqrt(total_error / count);
+        } else {
+            return 0.0;
+        }
+    }
+    
+    // Determine if we should update the keyframe
+    bool shouldUpdateKeyframe(const Eigen::Matrix4d& relative_transform) {
+        // Extract translation
+        Eigen::Vector3d translation = relative_transform.block<3, 1>(0, 3);
+        
+        // Extract rotation in angle-axis form
+        Eigen::AngleAxisd angle_axis(relative_transform.block<3, 3>(0, 0));
+        double rotation_angle = std::abs(angle_axis.angle());
+        
+        // Check if translation or rotation exceeds thresholds
+        if (translation.norm() > keyframe_trans_threshold_ || 
+            rotation_angle > keyframe_rot_threshold_) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    void printCurrentPose() {
+        Eigen::Vector3d translation = current_pose_.block<3, 1>(0, 3);
+        Eigen::Matrix3d rotation_matrix = current_pose_.block<3, 3>(0, 0);
+        Eigen::Quaterniond quaternion(rotation_matrix);
+        
+        ROS_INFO_THROTTLE(1, "Current Pose - Position: [%.3f, %.3f, %.3f], Orientation: [%.3f, %.3f, %.3f, %.3f]",
+                        translation.x(), translation.y(), translation.z(),
+                        quaternion.w(), quaternion.x(), quaternion.y(), quaternion.z());
+    }
+    
+    void publishRegisteredCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, 
+                               const std_msgs::Header& header) {
+        if (registered_cloud_pub_.getNumSubscribers() > 0) {
+            sensor_msgs::PointCloud2 cloud_msg;
+            pcl::toROSMsg(*cloud, cloud_msg);
+            cloud_msg.header = header;
+            cloud_msg.header.frame_id = fixed_frame_;
+            registered_cloud_pub_.publish(cloud_msg);
+        }
+    }
+    
+    void publishResults(const std_msgs::Header& header) {
+        // Extract translation and rotation from the 4x4 matrix
+        Eigen::Vector3d translation = current_pose_.block<3, 1>(0, 3);
+        Eigen::Matrix3d rotation_matrix = current_pose_.block<3, 3>(0, 0);
+        Eigen::Quaterniond quaternion(rotation_matrix);
+        
+        // Create and publish pose message
+        geometry_msgs::PoseStamped pose_msg;
+        pose_msg.header = header;
+        pose_msg.header.frame_id = fixed_frame_;
+        
+        pose_msg.pose.position.x = translation.x();
+        pose_msg.pose.position.y = translation.y();
+        pose_msg.pose.position.z = translation.z();
+        
+        pose_msg.pose.orientation.w = quaternion.w();
+        pose_msg.pose.orientation.x = quaternion.x();
+        pose_msg.pose.orientation.y = quaternion.y();
+        pose_msg.pose.orientation.z = quaternion.z();
+        
+        pose_pub_.publish(pose_msg);
+        
+        // Create and publish odometry message
+        nav_msgs::Odometry odom_msg;
+        odom_msg.header = header;
+        odom_msg.header.frame_id = fixed_frame_;
+        odom_msg.child_frame_id = "lidar_link";
+        
+        odom_msg.pose.pose = pose_msg.pose;
+        
+        // Estimate velocity from position changes
+        if (current_velocity_.norm() > 0) {
+            odom_msg.twist.twist.linear.x = current_velocity_.x();
+            odom_msg.twist.twist.linear.y = current_velocity_.y();
+            odom_msg.twist.twist.linear.z = current_velocity_.z();
+        } else {
+            odom_msg.twist.twist.linear.x = 0.0;
+            odom_msg.twist.twist.linear.y = 0.0;
+            odom_msg.twist.twist.linear.z = 0.0;
+        }
+        
+        odom_msg.twist.twist.angular.x = 0.0;
+        odom_msg.twist.twist.angular.y = 0.0;
+        odom_msg.twist.twist.angular.z = 0.0;
+        
+        odom_pub_.publish(odom_msg);
+        
+        // Publish TF transform if enabled
+        if (publish_tf_) {
+            tf::Transform transform;
+            transform.setOrigin(tf::Vector3(translation.x(), translation.y(), translation.z()));
+            tf::Quaternion tf_quaternion(quaternion.x(), quaternion.y(), quaternion.z(), quaternion.w());
+            transform.setRotation(tf_quaternion);
+            
+            tf_broadcaster_.sendTransform(tf::StampedTransform(
+                transform, header.stamp, fixed_frame_, "lidar_link"));
+        }
+    }
+    
+    // Filter points by height - useful for Velodyne on car
+    void filterCloudByHeight(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+                           pcl::PointCloud<pcl::PointXYZ>::Ptr& output,
+                           double min_z = -std::numeric_limits<double>::max(),
+                           double max_z = std::numeric_limits<double>::max()) {
+        // Use PCL's PassThrough filter for more efficient filtering
+        pcl::PassThrough<pcl::PointXYZ> pass;
+        pass.setInputCloud(input);
+        pass.setFilterFieldName("z");
+        pass.setFilterLimits(min_z, max_z);
+        pass.filter(*output);
+    }
+    
+    // Improved ground segmentation based on height and normals
+    void segmentGroundPoints(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+                           pcl::PointCloud<pcl::PointXYZ>::Ptr& non_ground) {
+        // Compute normals
+        pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+        pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> ne;
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+        
+        ne.setInputCloud(input);
+        ne.setSearchMethod(tree);
+        ne.setRadiusSearch(0.5);  // 50cm radius for normal estimation
+        ne.compute(*normals);
+        
+        non_ground->clear();
+        non_ground->reserve(input->size());
+        
+        // Points with normals not pointing up are not ground
+        for (size_t i = 0; i < input->size(); ++i) {
+            const auto& point = input->points[i];
+            const auto& normal = normals->points[i];
+            
+            // Check if normal points up (z component close to 1)
+            if (std::abs(normal.normal_z) < 0.8 || normal.normal_z < 0) {  // Not ground if normal doesn't point up
+                non_ground->push_back(point);
+            }
+        }
+        
+        // Add additional check - non-ground must be above a certain height
+        pcl::PointCloud<pcl::PointXYZ>::Ptr height_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+        height_filtered->reserve(non_ground->size());
+        
+        for (const auto& point : non_ground->points) {
+            if (point.z > ground_z_threshold_ + 0.2) {  // Points significantly above ground threshold
+                height_filtered->push_back(point);
+            }
+        }
+        
+        *non_ground = *height_filtered;
+        non_ground->width = non_ground->size();
+        non_ground->height = 1;
+        non_ground->is_dense = false;
+    }
+    
+    // Remove outliers for better registration
+    void removeOutliers(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+                      pcl::PointCloud<pcl::PointXYZ>::Ptr& output) {
+        // Use radius outlier removal
+        pcl::RadiusOutlierRemoval<pcl::PointXYZ> rad_rem;
+        rad_rem.setInputCloud(input);
+        rad_rem.setRadiusSearch(outlier_radius_);
+        rad_rem.setMinNeighborsInRadius(outlier_min_neighbors_);
+        
+        // Apply filter
+        rad_rem.filter(*output);
+        
+        // If too many points were removed, use statistical outlier removal instead
+        if (output->size() < input->size() * 0.5) {
+            ROS_WARN("Radius outlier removal filtered too many points, using statistical filter instead");
+            
+            pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+            sor.setInputCloud(input);
+            sor.setMeanK(20);
+            sor.setStddevMulThresh(1.0);
+            sor.filter(*output);
+        }
+        
+        // If still too few points, use original cloud
+        if (output->size() < 100) {
+            ROS_WARN("Outlier removal resulted in too few points, using original cloud");
+            *output = *input;
+        }
+    }
+    
+    // Downsample point cloud
+    void downsampleCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& input, 
+                       pcl::PointCloud<pcl::PointXYZ>::Ptr& output,
+                       double resolution) {
+        try {
+            pcl::VoxelGrid<pcl::PointXYZ> voxel_grid;
+            voxel_grid.setInputCloud(input);
+            voxel_grid.setLeafSize(resolution, resolution, resolution);
+            voxel_grid.filter(*output);
+            
+            if (output->empty()) {
+                ROS_WARN("Downsampling resulted in empty cloud, using original");
+                *output = *input;
+            }
+        }
+        catch (const std::exception& e) {
+            ROS_ERROR("Error in downsampling: %s", e.what());
+            *output = *input;  // Use original if downsampling fails
+        }
+    }
+    
+    // Function to build NDT grid from target point cloud
+    std::vector<NDTCell> buildNDTGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, 
+                                   double voxel_size = 1.0) {
+        // Grid dimensions
+        Eigen::Vector3d min_pt(std::numeric_limits<double>::max(),
+                              std::numeric_limits<double>::max(),
+                              std::numeric_limits<double>::max());
+        Eigen::Vector3d max_pt(std::numeric_limits<double>::lowest(),
+                              std::numeric_limits<double>::lowest(),
+                              std::numeric_limits<double>::lowest());
+        
+        // Find bounding box
+        for (const auto& pt : cloud->points) {
+            min_pt.x() = std::min(min_pt.x(), static_cast<double>(pt.x));
+            min_pt.y() = std::min(min_pt.y(), static_cast<double>(pt.y));
+            min_pt.z() = std::min(min_pt.z(), static_cast<double>(pt.z));
+            
+            max_pt.x() = std::max(max_pt.x(), static_cast<double>(pt.x));
+            max_pt.y() = std::max(max_pt.y(), static_cast<double>(pt.y));
+            max_pt.z() = std::max(max_pt.z(), static_cast<double>(pt.z));
+        }
+        
+        // Add margin to avoid boundary issues
+        min_pt -= Eigen::Vector3d::Constant(voxel_size * 0.5);
+        max_pt += Eigen::Vector3d::Constant(voxel_size * 0.5);
+        
+        // Use a map for sparse storage of cells
+        std::unordered_map<size_t, NDTCell> cell_map;
+        
+        // Helper function to compute hash key
+        auto computeHashKey = [&](const Eigen::Vector3i& idx) -> size_t {
+            // Simple hash function for 3D grid coordinates
+            return ((idx.x() * 73856093) ^ (idx.y() * 19349663) ^ (idx.z() * 83492791)) % 2147483647;
+        };
+        
+        // First pass: Accumulate points and compute cell means
+        for (const auto& pt : cloud->points) {
+            Eigen::Vector3d p(pt.x, pt.y, pt.z);
+            Eigen::Vector3i idx = ((p - min_pt) / voxel_size).cast<int>();
+            
+            size_t key = computeHashKey(idx);
+            auto& cell = cell_map[key];
+            cell.mean += p;
+            cell.point_count++;
+        }
+        
+        // Finalize means
+        for (auto& pair : cell_map) {
+            auto& cell = pair.second;
+            if (cell.point_count > 0) {
+                cell.mean /= cell.point_count;
+            }
+        }
+        
+        // Second pass: Compute covariances
+        for (const auto& pt : cloud->points) {
+            Eigen::Vector3d p(pt.x, pt.y, pt.z);
+            Eigen::Vector3i idx = ((p - min_pt) / voxel_size).cast<int>();
+            
+            size_t key = computeHashKey(idx);
+            if (cell_map.count(key) > 0) {
+                auto& cell = cell_map[key];
+                if (cell.point_count > 0) {
+                    Eigen::Vector3d diff = p - cell.mean;
+                    cell.covariance += diff * diff.transpose();
+                }
+            }
+        }
+        
+        // Finalize covariances and compute inverses
+        // Finalize covariances and compute inverses
+std::vector<NDTCell> active_cells;
+const double min_eigenvalue = 0.005;  // Reduced to allow more flexibility
+
+for (auto& pair : cell_map) {
+    auto& cell = pair.second;
+    if (cell.point_count > 3) {  // Need at least 3 points for 3D covariance
+        cell.covariance /= (cell.point_count - 1);
+        
+        // Add regularization to avoid singularity
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(cell.covariance);
+        Eigen::Vector3d eigenvalues = eigensolver.eigenvalues();
+        Eigen::Matrix3d eigenvectors = eigensolver.eigenvectors();
+        
+        // Apply minimum eigenvalue constraint
+        for (int l = 0; l < 3; l++) {
+            if (eigenvalues(l) < min_eigenvalue) {
+                eigenvalues(l) = min_eigenvalue;
+            }
+        }
+        
+        // Reconstruct regularized covariance
+        cell.covariance = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
+        
+        // Check determinant before inversion to avoid singular matrices
+        double det = cell.covariance.determinant();
+        bool is_invertible = std::abs(det) > 1e-12;
+        
+        if (is_invertible) {
+            // Matrix can be inverted normally
+            cell.inverse_covariance = cell.covariance.inverse();
+            cell.det_covariance = det;
+            
+            if (!std::isnan(cell.inverse_covariance.sum()) && !std::isinf(cell.inverse_covariance.sum())) {
+                active_cells.push_back(cell);
+            }
+        } else {
+            // Add more regularization and try again
+            for (int l = 0; l < 3; l++) {
+                eigenvalues(l) += 0.01;
+            }
+            cell.covariance = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
+            cell.inverse_covariance = cell.covariance.inverse();
+            cell.det_covariance = cell.covariance.determinant();
+            
+            if (!std::isnan(cell.inverse_covariance.sum()) && !std::isinf(cell.inverse_covariance.sum())) {
+                active_cells.push_back(cell);
+            }
+        }
+    }
+}
+        
+        return active_cells;
+    }
+
+    // Main NDT registration function with Ceres optimization
+    Eigen::Matrix4d ndtRegistrationCeres(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& source_cloud,
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& target_cloud,
+        const Eigen::Matrix4d& initial_guess = Eigen::Matrix4d::Identity(),
+        double voxel_size = 1.0) {
+        
+        auto grid_start = std::chrono::steady_clock::now();
+        
+        // Build NDT grid for target cloud
+        std::vector<NDTCell> target_cells = buildNDTGrid(target_cloud, voxel_size);
+        
+        auto grid_end = std::chrono::steady_clock::now();
+        double grid_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            grid_end - grid_start).count() / 1000.0;
+            
+        ROS_DEBUG("NDT grid building took %.3f seconds, created %zu cells", 
+                grid_time, target_cells.size());
+        
+        if (target_cells.empty()) {
+            ROS_WARN("No valid NDT cells created from target cloud");
+            return initial_guess;
+        }
+        
+        auto kdtree_start = std::chrono::steady_clock::now();
+        
+        // Build KD-tree for nearest cell search
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cell_centers(new pcl::PointCloud<pcl::PointXYZ>);
+        for (const auto& cell : target_cells) {
+            pcl::PointXYZ pt;
+            pt.x = cell.mean.x();
+            pt.y = cell.mean.y();
+            pt.z = cell.mean.z();
+            cell_centers->push_back(pt);
+        }
+        
+        pcl::search::KdTree<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(cell_centers);
+        
+        auto kdtree_end = std::chrono::steady_clock::now();
+        double kdtree_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            kdtree_end - kdtree_start).count() / 1000.0;
+            
+        ROS_DEBUG("KD-tree building took %.3f seconds", kdtree_time);
+        
+        auto problem_start = std::chrono::steady_clock::now();
+        
+        // Setup Ceres optimization problem
+        ceres::Problem problem;
+        
+        // Extract initial guess parameters
+        Eigen::Matrix3d init_rotation = initial_guess.block<3, 3>(0, 0);
+        Eigen::Vector3d init_translation = initial_guess.block<3, 1>(0, 3);
+        
+        // Ensure rotation matrix is valid (orthogonal)
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(init_rotation, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        init_rotation = svd.matrixU() * svd.matrixV().transpose();
+        
+        // Convert rotation matrix to angle-axis representation
+        Eigen::AngleAxisd angle_axis(init_rotation);
+        Eigen::Vector3d rotation_aa = angle_axis.angle() * angle_axis.axis();
+        
+        // Handle edge case where angle is almost zero
+        if (angle_axis.angle() < 1e-10) {
+            rotation_aa = Eigen::Vector3d::Zero();
+        }
+        
+        // Optimization parameters: [tx, ty, tz, rx, ry, rz]
+        double transformation[6] = {
+            init_translation.x(), init_translation.y(), init_translation.z(),
+            rotation_aa.x(), rotation_aa.y(), rotation_aa.z()
+        };
+        
+        // Add regularization term to stabilize optimization
+        ceres::CostFunction* regularization_cost = 
+            new TransformationRegularizationCostFunction(reg_translation_weight_, reg_rotation_weight_);
+        problem.AddResidualBlock(
+            regularization_cost,
+            nullptr,
+            transformation
+        );
+        
+        // Add cost functions for each source point
+        int added_residuals = 0;
+        int max_residuals = 2000;  // Limit number of residuals for performance
+        
+        // Randomly select points if source cloud is too large
+        std::vector<int> indices;
+        if (source_cloud->size() > max_residuals) {
+            indices.resize(max_residuals);
+            // Generate random indices without replacement
+            std::vector<int> all_indices(source_cloud->size());
+            for (size_t i = 0; i < source_cloud->size(); ++i) {
+                all_indices[i] = i;
+            }
+            std::random_shuffle(all_indices.begin(), all_indices.end());
+            for (int i = 0; i < max_residuals; ++i) {
+                indices[i] = all_indices[i];
+            }
+        } else {
+            indices.resize(source_cloud->size());
+            for (size_t i = 0; i < source_cloud->size(); ++i) {
+                indices[i] = i;
+            }
+        }
+        
+        // Add residuals for selected points
+        for (int idx : indices) {
+            const auto& pt = source_cloud->points[idx];
+            Eigen::Vector3d point(pt.x, pt.y, pt.z);
+            
+            // Find the nearest NDT cell
+            std::vector<int> nn_indices(1);
+            std::vector<float> nn_distances(1);
+            pcl::PointXYZ search_pt;
+            search_pt.x = point.x();
+            search_pt.y = point.y();
+            search_pt.z = point.z();
+            
+            if (kdtree.nearestKSearch(search_pt, 1, nn_indices, nn_distances)) {
+                const NDTCell& nearest_cell = target_cells[nn_indices[0]];
+                
+                // Only use cells with reasonable distance
+                if (nn_distances[0] <= voxel_size * 2.0) {
+                    // Calculate weight based on distance to cell center
+                    double distance_weight = 1.0;
+                    if (distance_weight_factor_ > 0) {
+                        // Points closer to cell center get higher weight
+                        distance_weight = std::exp(-distance_weight_factor_ * nn_distances[0]);
+                    }
+                    
+                    // Add cost function with weight
+                    ceres::CostFunction* cost_function = 
+                        new NDTCostFunction(point, nearest_cell, distance_weight);
+                        
+                    problem.AddResidualBlock(
+                        cost_function,
+                        new ceres::HuberLoss(0.1),  // Robust loss function
+                        transformation
+                    );
+                    added_residuals++;
+                }
+            }
+        }
+        
+        if (added_residuals == 0) {
+            ROS_WARN("No valid residuals added to optimization problem");
+            return initial_guess;
+        }
+        
+        auto problem_end = std::chrono::steady_clock::now();
+        double problem_setup_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            problem_end - problem_start).count() / 1000.0;
+            
+        ROS_DEBUG("Problem setup took %.3f seconds, added %d residuals", 
+                problem_setup_time, added_residuals);
+        
+        // Set solver options
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.minimizer_progress_to_stdout = false;
+        options.max_num_iterations = max_iterations_;
+        options.function_tolerance = 1e-8;  // Tighter tolerances for better accuracy
+        options.gradient_tolerance = 1e-10;
+        options.parameter_tolerance = 1e-10;
+        options.num_threads = 4;  // Use multiple threads
+        
+        auto solve_start = std::chrono::steady_clock::now();
+        
+        // Solve
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, &problem, &summary);
+        
+        auto solve_end = std::chrono::steady_clock::now();
+        double solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            solve_end - solve_start).count() / 1000.0;
+            
+        ROS_DEBUG("Ceres solver took %.3f seconds, %d iterations",
+                 solve_time, summary.iterations.size());
+        
+        // Check if optimization was successful
+        if (!summary.IsSolutionUsable()) {
+            ROS_WARN("NDT optimization failed: %s", summary.BriefReport().c_str());
+            return initial_guess;
+        }
+        
+        // Convert solution back to transformation matrix
+        Eigen::Vector3d final_translation(
+            transformation[0], transformation[1], transformation[2]);
+            
+        Eigen::Vector3d final_rotation_aa(
+            transformation[3], transformation[4], transformation[5]);
+        
+        Eigen::Matrix4d result = Eigen::Matrix4d::Identity();
+        
+        // Handle case where rotation angle is very small
+        double rotation_norm = final_rotation_aa.norm();
+        if (rotation_norm < 1e-10) {
+            // Identity rotation if angle is too small
+            result.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+        } else {
+            Eigen::AngleAxisd final_rotation(rotation_norm, final_rotation_aa / rotation_norm);
+            result.block<3, 3>(0, 0) = final_rotation.toRotationMatrix();
+        }
+        
+        result.block<3, 1>(0, 3) = final_translation;
+        
+        // Log the final transformation parameters
+        ROS_DEBUG("NDT Registration result - Translation: [%.3f, %.3f, %.3f], Rotation magnitude: %.6f rad",
+                final_translation.x(), final_translation.y(), final_translation.z(), rotation_norm);
+        
+        double initial_cost = summary.initial_cost;
+        double final_cost = summary.final_cost;
+        double cost_reduction = 100.0 * (initial_cost - final_cost) / initial_cost;
+        
+        ROS_DEBUG("NDT optimization reduced cost by %.2f%% (from %.6f to %.6f)",
+                cost_reduction, initial_cost, final_cost);
+        
+        return result;
+    }
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "high_accuracy_ndt_registration");
+    ros::NodeHandle nh("~");
+    
+    HighAccuracyNDTRegistration ndt_registration(nh);
+    
+    ros::spin();
+    
+    return 0;
+}

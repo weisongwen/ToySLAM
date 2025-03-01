@@ -1,6 +1,6 @@
 <!-- Save as uwb_imu_fusion.launch -->
 <launch>
-    <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen" > 
+    <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen" launch-prefix="gdb -ex run --args"> 
         <param name="use_sim_time" value="true"/>
     </node>
     

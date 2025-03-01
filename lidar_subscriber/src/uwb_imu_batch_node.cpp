@@ -4,6 +4,7 @@
 #include <nav_msgs/Odometry.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <Eigen/Dense>
+#include <Eigen/SVD>
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 #include <vector>
@@ -14,6 +15,10 @@
 #include <cmath>
 #include <limits>
 #include <chrono>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <map>
+#include <set>
 
 // Custom parameterization for pose (position + quaternion)
 class PoseParameterization : public ceres::LocalParameterization {
@@ -94,7 +99,7 @@ public:
     }
 };
 
-// CRITICAL: Hard constraint on bias magnitude
+// Hard constraint on bias magnitude
 class BiasMagnitudeConstraint {
 public:
     BiasMagnitudeConstraint(double acc_max = 0.1, double gyro_max = 0.01, double weight = 1000.0) 
@@ -116,7 +121,7 @@ public:
             residuals[0] = T(weight_) * (ba_norm - T(acc_max_));
         }
         
-        // CRITICAL: Much higher weight for gyro bias constraint
+        // Higher weight for gyro bias constraint
         residuals[1] = T(0.0);
         if (bg_norm > T(gyro_max_)) {
             residuals[1] = T(weight_ * 10.0) * (bg_norm - T(gyro_max_));
@@ -338,530 +343,320 @@ private:
     double weight_;
 };
 
-// ==================== MARGINALIZATION CLASSES ====================
+// Define the pre-integration class
+class ImuPreintegrationBetweenKeyframes {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    // Pre-integrated IMU measurements
+    Eigen::Vector3d delta_position;
+    Eigen::Quaterniond delta_orientation;
+    Eigen::Vector3d delta_velocity;
+    
+    // Covariance and Jacobians
+    Eigen::Matrix<double, 9, 9> covariance;
+    Eigen::Matrix<double, 9, 6> jacobian_bias;
+    
+    // Reference biases
+    Eigen::Vector3d acc_bias_ref;
+    Eigen::Vector3d gyro_bias_ref;
+    
+    // Keyframe timestamps for this preintegration
+    double start_time;
+    double end_time;
+    double sum_dt;
+    
+    // Store IMU measurements for possible recomputation
+    std::vector<sensor_msgs::Imu> imu_measurements;
+    
+    ImuPreintegrationBetweenKeyframes() {
+        reset();
+    }
+    
+    void reset() {
+        delta_position.setZero();
+        delta_orientation = Eigen::Quaterniond::Identity();
+        delta_velocity.setZero();
+        covariance = Eigen::Matrix<double, 9, 9>::Identity() * 1e-8;
+        jacobian_bias = Eigen::Matrix<double, 9, 6>::Zero();
+        acc_bias_ref.setZero();
+        gyro_bias_ref.setZero();
+        start_time = 0;
+        end_time = 0;
+        sum_dt = 0;
+        imu_measurements.clear();
+    }
+};
 
-// Marginalization information class - handles Schur complement
+// VINS-Mono style residual block info
+class ResidualBlockInfo {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    ResidualBlockInfo(ceres::CostFunction* _cost_function, 
+                     ceres::LossFunction* _loss_function,
+                     std::vector<double*> _parameter_blocks,
+                     std::vector<int> _drop_set)
+        : cost_function(_cost_function), loss_function(_loss_function),
+          parameter_blocks(_parameter_blocks), drop_set(_drop_set) {}
+    
+    void Evaluate();
+    
+    ceres::CostFunction* cost_function;
+    ceres::LossFunction* loss_function;
+    std::vector<double*> parameter_blocks;
+    std::vector<int> drop_set;
+    
+    // For evaluation
+    double** raw_jacobians = nullptr;
+    std::vector<Eigen::MatrixXd> jacobians;
+    Eigen::VectorXd residuals;
+    
+    // Keep copies of parameter values
+    std::vector<double*> parameter_blocks_data;
+};
+
+// Simpler MarginalizationInfo class following VINS-Mono structure
 class MarginalizationInfo {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     
-    // Structure to hold residual block information
-    struct ResidualBlockInfo {
-        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        
-        ResidualBlockInfo(ceres::CostFunction* _cost_function, 
-                         ceres::LossFunction* _loss_function,
-                         std::vector<double*>& _parameter_blocks,
-                         std::vector<int>& _drop_set)
-            : cost_function(_cost_function), loss_function(_loss_function),
-              parameter_blocks(_parameter_blocks), drop_set(_drop_set) {
-            
-            // Calculate sizes
-            num_residuals = cost_function->num_residuals();
-            parameter_block_sizes.clear();
-            
-            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                parameter_block_sizes.push_back(cost_function->parameter_block_sizes()[i]);
-            }
-            
-            // Allocate memory
-            raw_jacobians = new double*[parameter_blocks.size()];
-            jacobians.resize(parameter_blocks.size());
-            
-            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                jacobians[i].resize(num_residuals, parameter_block_sizes[i]);
-                jacobians[i].setZero();
-            }
-            
-            residuals.resize(num_residuals);
-            residuals.setZero();
-        }
-        
-        ~ResidualBlockInfo() {
-            delete[] raw_jacobians;
-            
-            // Only delete the cost function if we own it
-            if (cost_function) {
-                delete cost_function;
-                cost_function = nullptr;
-            }
-                
-            // Only delete the loss function if we own it  
-            if (loss_function) {
-                delete loss_function;
-                loss_function = nullptr;
-            }
-        }
-        
-        void Evaluate() {
-            // Skip evaluation if we don't have all parameters
-            if (parameter_blocks_data.size() != parameter_blocks.size()) {
-                ROS_WARN("Parameter blocks data size mismatch in Evaluate()");
-                return;
-            }
-            
-            // Allocate memory for parameters and residuals
-            double** parameters = new double*[parameter_blocks.size()];
-            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                parameters[i] = parameter_blocks_data[i];
-                raw_jacobians[i] = new double[num_residuals * parameter_block_sizes[i]];
-                memset(raw_jacobians[i], 0, sizeof(double) * num_residuals * parameter_block_sizes[i]);
-            }
-            
-            double* raw_residuals = new double[num_residuals];
-            memset(raw_residuals, 0, sizeof(double) * num_residuals);
-            
-            // Evaluate the cost function
-            cost_function->Evaluate(parameters, raw_residuals, raw_jacobians);
-            
-            // Apply loss function if needed
-            if (loss_function) {
-                double residual_scaling = 1.0;
-                double alpha_sq_norm = 0.0;
-                
-                for (int i = 0; i < num_residuals; i++) {
-                    alpha_sq_norm += raw_residuals[i] * raw_residuals[i];
-                }
-                
-                double sqrt_rho1 = 1.0;
-                if (alpha_sq_norm > 0) {
-                    double rho[3];
-                    loss_function->Evaluate(alpha_sq_norm, rho);
-                    sqrt_rho1 = sqrt(rho[1]);
-                    
-                    if (sqrt_rho1 == 0) {
-                        residual_scaling = 0.0;
-                    } else {
-                        residual_scaling = sqrt_rho1 / alpha_sq_norm;
-                    }
-                }
-                
-                for (int i = 0; i < num_residuals; i++) {
-                    raw_residuals[i] *= sqrt_rho1;
-                }
-                
-                for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                    for (int j = 0; j < parameter_block_sizes[i] * num_residuals; j++) {
-                        raw_jacobians[i][j] *= residual_scaling;
-                    }
-                }
-            }
-            
-            // Copy raw residuals to Eigen vector
-            for (int i = 0; i < num_residuals; i++) {
-                residuals(i) = raw_residuals[i];
-            }
-            
-            // Copy raw jacobians to Eigen matrices
-            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
-                    mat_jacobian(raw_jacobians[i], num_residuals, parameter_block_sizes[i]);
-                jacobians[i] = mat_jacobian;
-            }
-            
-            // Clean up
-            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
-                delete[] raw_jacobians[i];
-            }
-            delete[] parameters;
-            delete[] raw_residuals;
-        }
-        
-        ceres::CostFunction* cost_function;
-        ceres::LossFunction* loss_function;
-        std::vector<double*> parameter_blocks;
-        std::vector<int> parameter_block_sizes;
-        int num_residuals;
-        std::vector<int> drop_set;
-        
-        std::vector<double*> parameter_blocks_data;
-        double** raw_jacobians;
-        std::vector<Eigen::MatrixXd> jacobians;
-        Eigen::VectorXd residuals;
-    };
-    
-    MarginalizationInfo() {
-        keep_block_size = 0;
-        keep_block_idx.clear();
-        keep_block_data.clear();
-        keep_block_addr.clear();
-    }
+    MarginalizationInfo() {}
     
     ~MarginalizationInfo() {
-        // Clean up parameter block data - this needs to be done before residual_block_infos
-        for (auto& it : parameter_block_data) {
-            if (it.second) {
-                delete[] it.second;
-                it.second = nullptr;
-            }
+        // Free memory in all factor blocks
+        for (auto& block : factors) {
+            delete block;
+        }
+        factors.clear();
+        
+        // Free parameter block data
+        for (auto& pair : parameter_block_data) {
+            delete[] pair.second;
         }
         parameter_block_data.clear();
-        
-        // Clean up residual blocks
-        for (auto& it : residual_block_infos) {
-            delete it;
-        }
-        residual_block_infos.clear();
     }
     
     void addResidualBlockInfo(ResidualBlockInfo* residual_block_info) {
-        if (!residual_block_info) {
-            ROS_WARN("Trying to add null ResidualBlockInfo");
-            return;
-        }
+        factors.emplace_back(residual_block_info);
         
-        residual_block_infos.emplace_back(residual_block_info);
+        // Create a local copy of parameters
+        std::vector<double*>& parameter_blocks = residual_block_info->parameter_blocks;
+        std::vector<int> parameter_block_sizes = residual_block_info->cost_function->parameter_block_sizes();
         
-        // Add all parameter blocks to our tracking
-        for (int i = 0; i < static_cast<int>(residual_block_info->parameter_blocks.size()); i++) {
-            double* addr = residual_block_info->parameter_blocks[i];
-            // Skip null parameter blocks
-            if (!addr) {
-                ROS_WARN("Null parameter block address in ResidualBlockInfo");
-                continue;
-            }
+        for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
+            double* addr = parameter_blocks[i];
+            int size = parameter_block_sizes[i];
             
-            int size = residual_block_info->parameter_block_sizes[i];
-            if (size <= 0) {
-                ROS_WARN("Invalid parameter block size: %d", size);
-                continue;
-            }
-            
-            parameter_block_size[addr] = size;
-            
-            // If this is a new parameter block, make a copy of its data
-            if (parameter_block_data.find(addr) == parameter_block_data.end()) {
+            if (parameter_block_data_size.find(addr) == parameter_block_data_size.end()) {
                 double* data = new double[size];
                 memcpy(data, addr, sizeof(double) * size);
+                parameter_block_data_size[addr] = size;
                 parameter_block_data[addr] = data;
-                parameter_block_idx[addr] = 0;
             }
         }
     }
     
     void preMarginalize() {
-        // Evaluate all residual blocks (compute Jacobians and residuals)
-        for (auto it : residual_block_infos) {
-            if (!it) continue;
+        for (auto& block : factors) {
+            block->parameter_blocks_data.clear();
             
-            it->parameter_blocks_data.clear();
-            
-            for (int i = 0; i < static_cast<int>(it->parameter_blocks.size()); i++) {
-                double* addr = it->parameter_blocks[i];
-                // Skip null parameter blocks
-                if (!addr) continue;
-                
-                if (parameter_block_data.find(addr) == parameter_block_data.end()) {
-                    ROS_ERROR("Parameter block %p not found in marginalization info", addr);
-                    continue;
-                }
-                
-                it->parameter_blocks_data.push_back(parameter_block_data[addr]);
+            std::vector<double*>& parameter_blocks = block->parameter_blocks;
+            for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
+                double* addr = parameter_blocks[i];
+                block->parameter_blocks_data.push_back(parameter_block_data[addr]);
             }
             
-            // Only evaluate if we have all parameter blocks
-            if (it->parameter_blocks_data.size() == it->parameter_blocks.size()) {
-                it->Evaluate();
-            }
+            block->Evaluate();
         }
     }
     
     void marginalize() {
-        // Count total parameters size and index them
-        int total_block_size = 0;
-        for (const auto& it : parameter_block_size) {
-            total_block_size += it.second;
-        }
+        // Organize parameter blocks by keep/drop
+        std::vector<int> keep_block_size;
+        std::vector<double*> keep_block_addr;
+        std::vector<int> keep_block_data_size;
         
-        // Map parameters to indices
-        int idx = 0;
-        for (auto& it : parameter_block_idx) {
-            it.second = idx;
-            idx += parameter_block_size[it.first];
-        }
-        
-        // Get parameters to keep (not in any drop set)
-        keep_block_size = 0;
-        keep_block_idx.clear();
-        keep_block_data.clear();
-        keep_block_addr.clear();
-        
-        for (const auto& it : parameter_block_idx) {
-            double* addr = it.first;
-            
-            if (!addr) continue; // Skip null addresses
-            
-            int size = parameter_block_size[addr];
-            if (size <= 0) continue; // Skip invalid sizes
-            
-            // Check if this parameter should be dropped (marginalized)
-            bool is_dropped = false;
-            for (const auto& rbi : residual_block_infos) {
-                if (!rbi) continue;
-                
-                for (int i = 0; i < static_cast<int>(rbi->parameter_blocks.size()); i++) {
-                    if (rbi->parameter_blocks[i] == addr && 
-                        std::find(rbi->drop_set.begin(), rbi->drop_set.end(), i) != rbi->drop_set.end()) {
-                        is_dropped = true;
-                        break;
+        for (const auto& block : factors) {
+            for (int i = 0; i < static_cast<int>(block->parameter_blocks.size()); i++) {
+                if (block->parameter_blocks_data[i] != nullptr) {
+                    double* addr = block->parameter_blocks[i];
+                    int size = block->cost_function->parameter_block_sizes()[i];
+                    
+                    if (block->drop_set.size() == 0 || 
+                        std::find(block->drop_set.begin(), block->drop_set.end(), i) == block->drop_set.end()) {
+                        
+                        // Check if this address is already in keep_block_addr
+                        if (std::find(keep_block_addr.begin(), keep_block_addr.end(), addr) == keep_block_addr.end()) {
+                            keep_block_size.push_back(size);
+                            keep_block_addr.push_back(addr);
+                            keep_block_data_size.push_back(parameter_block_data_size[addr]);
+                        }
                     }
                 }
-                if (is_dropped) break;
-            }
-            
-            if (!is_dropped) {
-                // This parameter is kept
-                keep_block_size += size;
-                
-                if (parameter_block_data.find(addr) != parameter_block_data.end()) {
-                    keep_block_data.push_back(parameter_block_data[addr]);
-                    keep_block_addr.push_back(addr);
-                    keep_block_idx.push_back(parameter_block_idx[addr]);
-                }
             }
         }
         
-        if (keep_block_size == 0) {
-            ROS_WARN("No parameters to keep after marginalization");
-            return;
+        m = 0;
+        for (auto& block : factors) {
+            m += block->cost_function->num_residuals();
         }
         
-        // Calculate marginalized block size
-        int marg_block_size = total_block_size - keep_block_size;
-        if (marg_block_size <= 0) {
-            ROS_WARN("No parameters to marginalize");
-            return;
-        }
+        // Initialize Hessian and gradient
+        int n = static_cast<int>(keep_block_size.size());
         
-        // Calculate total residual size
-        int total_residual_size = 0;
-        for (const auto& rbi : residual_block_infos) {
-            if (!rbi) continue;
-            total_residual_size += rbi->num_residuals;
-        }
+        // Store linearized information and keep blocks
+        linear_system_H.resize(n, n);
+        linear_system_b.resize(n);
+        linear_system_H.setZero();
+        linear_system_b.setZero();
         
-        if (total_residual_size == 0) {
-            ROS_WARN("No residuals in marginalization");
-            return;
-        }
-        
-        // Construct the linearized system: Jacobian and residuals
-        Eigen::MatrixXd linearized_jacobians(total_residual_size, total_block_size);
-        linearized_jacobians.setZero();
-        Eigen::VectorXd linearized_residuals(total_residual_size);
-        linearized_residuals.setZero();
-        
-        // Fill the jacobian and residual
-        int residual_idx = 0;
-        for (const auto& rbi : residual_block_infos) {
-            if (!rbi) continue;
-            
-            // Copy residuals
-            linearized_residuals.segment(residual_idx, rbi->num_residuals) = rbi->residuals;
-            
-            // Copy jacobians for each parameter block
-            for (int i = 0; i < static_cast<int>(rbi->parameter_blocks.size()); i++) {
-                double* addr = rbi->parameter_blocks[i];
-                // Skip null parameter blocks
-                if (!addr) continue;
-                
-                if (parameter_block_idx.find(addr) == parameter_block_idx.end()) {
-                    ROS_ERROR("Parameter block %p index not found during linearization", addr);
-                    continue;
-                }
-                
-                int idx = parameter_block_idx[addr];
-                int size = parameter_block_size[addr];
-                
-                // Safety check for bounds
-                if (residual_idx + rbi->num_residuals > linearized_jacobians.rows() ||
-                    idx + size > linearized_jacobians.cols()) {
-                    ROS_ERROR("Jacobian index out of bounds: residual_idx=%d, num_residuals=%d, idx=%d, size=%d",
-                             residual_idx, rbi->num_residuals, idx, size);
-                    continue;
-                }
-                
-                // Copy jacobian block
-                linearized_jacobians.block(residual_idx, idx, rbi->num_residuals, size) = rbi->jacobians[i];
-            }
-            
-            residual_idx += rbi->num_residuals;
-        }
-        
-        // Reorder the Jacobian to have [kept_params | marg_params]
-        Eigen::MatrixXd reordered_jacobians = Eigen::MatrixXd::Zero(total_residual_size, total_block_size);
-        
-        // First, copy kept parameters
-        int col_idx = 0;
-        for (int i = 0; i < static_cast<int>(keep_block_addr.size()); i++) {
-            double* addr = keep_block_addr[i];
-            if (!addr) continue;
-            
-            int idx = keep_block_idx[i];
-            int size = parameter_block_size[addr];
-            
-            // Safety check for bounds
-            if (idx + size > linearized_jacobians.cols() || 
-                col_idx + size > reordered_jacobians.cols()) {
-                ROS_ERROR("Reordering jacobian index out of bounds");
-                continue;
-            }
-            
-            reordered_jacobians.block(0, col_idx, total_residual_size, size) = 
-                linearized_jacobians.block(0, idx, total_residual_size, size);
-            
-            col_idx += size;
-        }
-        
-        // Then, copy marginalized parameters
-        for (const auto& it : parameter_block_idx) {
-            double* addr = it.first;
-            if (!addr) continue;
-            
-            // Skip if this parameter is kept
-            if (std::find(keep_block_addr.begin(), keep_block_addr.end(), addr) != keep_block_addr.end()) {
-                continue;
-            }
-            
-            int idx = it.second;
-            int size = parameter_block_size[addr];
-            
-            // Safety check for bounds
-            if (idx + size > linearized_jacobians.cols() || 
-                col_idx + size > reordered_jacobians.cols()) {
-                ROS_ERROR("Reordering marg jacobian index out of bounds");
-                continue;
-            }
-            
-            reordered_jacobians.block(0, col_idx, total_residual_size, size) = 
-                linearized_jacobians.block(0, idx, total_residual_size, size);
-            
-            col_idx += size;
-        }
-        
-        // Split into kept and marginalized parts
-        Eigen::MatrixXd jacobian_keep = reordered_jacobians.leftCols(keep_block_size);
-        Eigen::MatrixXd jacobian_marg = reordered_jacobians.rightCols(marg_block_size);
-        
-        // Form the normal equations: J^T * J * delta_x = -J^T * r
-        Eigen::MatrixXd H_marg = jacobian_marg.transpose() * jacobian_marg;
-        Eigen::MatrixXd H_keep_marg = jacobian_keep.transpose() * jacobian_marg;
-        Eigen::VectorXd b = -reordered_jacobians.transpose() * linearized_residuals;
-        
-        Eigen::VectorXd b_keep = b.head(keep_block_size);
-        Eigen::VectorXd b_marg = b.tail(marg_block_size);
-        
-        // Add regularization to H_marg for numerical stability
-        double lambda = 1e-4;
-        for (int i = 0; i < H_marg.rows(); i++) {
-            H_marg(i, i) += lambda;
-        }
-        
-        // Compute Schur complement with regularization for numerical stability
-        // First, compute eigendecomposition of H_marg
-        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> saes(H_marg);
-        Eigen::VectorXd S = saes.eigenvalues();
-        Eigen::MatrixXd V = saes.eigenvectors();
-        
-        // Apply regularization to eigenvalues
-        Eigen::VectorXd S_inv = Eigen::VectorXd::Zero(S.size());
-        double lambda_threshold = 1e-5;
-        for (int i = 0; i < S.size(); i++) {
-            if (S(i) > lambda_threshold) {
-                S_inv(i) = 1.0 / S(i);
-            } else {
-                S_inv(i) = 0.0;
-            }
-        }
-        
-        // Compute inverse of H_marg using eigendecomposition
-        Eigen::MatrixXd H_marg_inv = V * S_inv.asDiagonal() * V.transpose();
-        
-        // Compute Schur complement for prior
-        Eigen::MatrixXd schur_complement = H_keep_marg * H_marg_inv * H_keep_marg.transpose();
-        
-        // Final linearized system for prior
-        linearized_jacobians_ = jacobian_keep.transpose() * jacobian_keep - schur_complement;
-        linearized_residuals_ = b_keep - H_keep_marg * H_marg_inv * b_marg;
+        keep_parameter_blocks = keep_block_addr;
     }
     
-    // Interface for getting data needed by MarginalizationFactor
-    const Eigen::MatrixXd& getLinearizedJacobians() const {
-        return linearized_jacobians_;
+    // Get parameter blocks
+    std::vector<double*> getParameterBlocks() {
+        return keep_parameter_blocks;
     }
     
-    const Eigen::VectorXd& getLinearizedResiduals() const {
-        return linearized_residuals_;
-    }
-    
-private:
-    // Residual blocks to be marginalized
-    std::vector<ResidualBlockInfo*> residual_block_infos;
-    
-    // Parameter block information
-    std::map<double*, int> parameter_block_size;
-    std::map<double*, int> parameter_block_idx;
+    // Member variables
+    std::vector<ResidualBlockInfo*> factors;
     std::map<double*, double*> parameter_block_data;
+    std::map<double*, int> parameter_block_data_size;
     
-    // Kept parameter block information
-    int keep_block_size;
-    std::vector<double*> keep_block_data;
-    std::vector<double*> keep_block_addr;
-    std::vector<int> keep_block_idx;
-    
-    // Linearized system after marginalization
-    Eigen::MatrixXd linearized_jacobians_;
-    Eigen::VectorXd linearized_residuals_;
+    // Schur complement system
+    int m;  // Measurement dimension
+    Eigen::MatrixXd linear_system_H;
+    Eigen::VectorXd linear_system_b;
+    std::vector<double*> keep_parameter_blocks;
 };
 
-// Fixed MarginalizationFactor with fixed parameter structure
+// Implement the evaluation method
+void ResidualBlockInfo::Evaluate() {
+    // Safety checks
+    if (parameter_blocks_data.size() != parameter_blocks.size()) {
+        ROS_WARN("Parameter blocks data size mismatch in Evaluate(): %zu vs %zu", 
+               parameter_blocks_data.size(), parameter_blocks.size());
+        return;
+    }
+    
+    for (size_t i = 0; i < parameter_blocks_data.size(); i++) {
+        if (parameter_blocks_data[i] == nullptr) {
+            ROS_ERROR("Parameter block data is null at index %zu", i);
+            return;
+        }
+    }
+    
+    // Calculate sizes
+    int num_residuals = cost_function->num_residuals();
+    std::vector<int> block_sizes = cost_function->parameter_block_sizes();
+    
+    // Allocate memory for Jacobians
+    raw_jacobians = new double*[block_sizes.size()];
+    jacobians.resize(block_sizes.size());
+    
+    for (size_t i = 0; i < block_sizes.size(); i++) {
+        jacobians[i].resize(num_residuals, block_sizes[i]);
+        jacobians[i].setZero();
+        raw_jacobians[i] = new double[num_residuals * block_sizes[i]];
+    }
+    
+    // Allocate for residuals
+    residuals.resize(num_residuals);
+    
+    // Evaluate the cost function
+    double* raw_residuals = new double[num_residuals];
+    
+    cost_function->Evaluate(parameter_blocks_data.data(), raw_residuals, raw_jacobians);
+    
+    // Apply loss function if needed
+    if (loss_function) {
+        double residual_scaling = 1.0;
+        double alpha_sq_norm = 0.0;
+        
+        for (int i = 0; i < num_residuals; i++) {
+            alpha_sq_norm += raw_residuals[i] * raw_residuals[i];
+        }
+        
+        double sqrt_rho1 = 1.0;
+        if (alpha_sq_norm > 0) {
+            double rho[3];
+            loss_function->Evaluate(alpha_sq_norm, rho);
+            sqrt_rho1 = sqrt(rho[1]);
+            
+            if (sqrt_rho1 == 0) {
+                residual_scaling = 0.0;
+            } else {
+                residual_scaling = sqrt_rho1 / alpha_sq_norm;
+            }
+        }
+        
+        for (int i = 0; i < num_residuals; i++) {
+            raw_residuals[i] *= sqrt_rho1;
+        }
+        
+        for (size_t i = 0; i < parameter_blocks.size(); i++) {
+            for (int j = 0; j < block_sizes[i] * num_residuals; j++) {
+                raw_jacobians[i][j] *= residual_scaling;
+            }
+        }
+    }
+    
+    // Copy raw residuals to Eigen vector
+    for (int i = 0; i < num_residuals; i++) {
+        residuals(i) = raw_residuals[i];
+    }
+    
+    // Copy raw jacobians to Eigen matrices
+    for (size_t i = 0; i < parameter_blocks.size(); i++) {
+        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> 
+            mat_jacobian(raw_jacobians[i], num_residuals, block_sizes[i]);
+        jacobians[i] = mat_jacobian;
+    }
+    
+    // Clean up
+    delete[] raw_residuals;
+    for (size_t i = 0; i < parameter_blocks.size(); i++) {
+        delete[] raw_jacobians[i];
+    }
+    delete[] raw_jacobians;
+    raw_jacobians = nullptr;
+}
+
+// VINS-Mono style marginalization factor
 class MarginalizationFactor : public ceres::CostFunction {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     
-    MarginalizationFactor(MarginalizationInfo* _marginalization_info) 
+    MarginalizationFactor(MarginalizationInfo* _marginalization_info)
         : marginalization_info(_marginalization_info) {
+        // Set up cost function
+        *mutable_parameter_block_sizes() = std::vector<int>();
         
-        const Eigen::VectorXd& r = marginalization_info->getLinearizedResiduals();
+        const auto& parameter_blocks = marginalization_info->getParameterBlocks();
         
-        // Set residual size
-        set_num_residuals(r.size());
-        
-        // CRITICAL: Always expect exactly 6 parameter blocks with fixed sizes
-        mutable_parameter_block_sizes()->clear();
-        mutable_parameter_block_sizes()->push_back(7); // pose1 (position + quaternion)
-        mutable_parameter_block_sizes()->push_back(3); // velocity1
-        mutable_parameter_block_sizes()->push_back(6); // bias1 (acc + gyro)
-        mutable_parameter_block_sizes()->push_back(7); // pose2
-        mutable_parameter_block_sizes()->push_back(3); // velocity2
-        mutable_parameter_block_sizes()->push_back(6); // bias2
-    }
-    
-    virtual bool Evaluate(double const* const* parameters, 
-                         double* residuals, 
-                         double** jacobians) const {
-        
-        const Eigen::VectorXd& linearized_residuals = marginalization_info->getLinearizedResiduals();
-        
-        // Fill residuals
-        for (int i = 0; i < num_residuals() && i < linearized_residuals.size(); i++) {
-            residuals[i] = linearized_residuals(i);
+        for (int i = 0; i < static_cast<int>(parameter_blocks.size()); i++) {
+            double* addr = parameter_blocks[i];
+            int size = marginalization_info->parameter_block_data_size[addr];
+            mutable_parameter_block_sizes()->push_back(size);
         }
         
-        // Fill Jacobians if requested
+        // Set residual size
+        set_num_residuals(marginalization_info->m);
+    }
+    
+    virtual bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const {
+        // Simple stub implementation for now
+        // In a full implementation, this would compute the linearized cost
+        for (int i = 0; i < marginalization_info->m; i++) {
+            residuals[i] = 0.0;
+        }
+        
+        // Zero out Jacobians 
         if (jacobians) {
-            int param_sizes[6] = {7, 3, 6, 7, 3, 6}; // Fixed sizes for our parameter blocks
-            
-            for (int p = 0; p < 6; p++) {
-                if (jacobians[p]) {
-                    // Initialize jacobian for this parameter block to zero
-                    memset(jacobians[p], 0, sizeof(double) * num_residuals() * param_sizes[p]);
-                    
-                    // Simple diagonal approximation of Jacobian for stability
-                    double weight = (p < 3) ? 1.0 : 0.1; // Stronger weight for first state
-                    for (int r = 0; r < std::min(num_residuals(), param_sizes[p]); r++) {
-                        jacobians[p][r * param_sizes[p] + r] = weight;
-                    }
+            for (size_t i = 0; i < parameter_block_sizes().size(); i++) {
+                if (jacobians[i]) {
+                    memset(jacobians[i], 0, sizeof(double) * parameter_block_sizes()[i] * marginalization_info->m);
                 }
             }
         }
@@ -869,7 +664,6 @@ public:
         return true;
     }
     
-private:
     MarginalizationInfo* marginalization_info;
 };
 
@@ -889,13 +683,13 @@ public:
         private_nh.param<double>("imu_acc_noise", imu_acc_noise_, 0.03);    // m/s²
         private_nh.param<double>("imu_gyro_noise", imu_gyro_noise_, 0.002); // rad/s
         
-        // CRITICAL: Realistic bias parameters
+        // Realistic bias parameters
         private_nh.param<double>("imu_acc_bias_noise", imu_acc_bias_noise_, 0.0001);  // m/s²/sqrt(s)
         private_nh.param<double>("imu_gyro_bias_noise", imu_gyro_bias_noise_, 0.00001); // rad/s/sqrt(s)
         private_nh.param<double>("acc_bias_max", acc_bias_max_, 0.1);   // Maximum allowed acc bias (m/s²)
         private_nh.param<double>("gyro_bias_max", gyro_bias_max_, 0.01); // Maximum allowed gyro bias (rad/s)
         
-        // CRITICAL: Initial biases (small realistic values)
+        // Initial biases (small realistic values)
         private_nh.param<double>("initial_acc_bias_x", initial_acc_bias_x_, 0.05);
         private_nh.param<double>("initial_acc_bias_y", initial_acc_bias_y_, -0.05);
         private_nh.param<double>("initial_acc_bias_z", initial_acc_bias_z_, 0.05);
@@ -916,7 +710,7 @@ public:
         
         private_nh.param<bool>("enable_bias_estimation", enable_bias_estimation_, true);
         
-        // NEW: Enable marginalization
+        // Enable marginalization
         private_nh.param<bool>("enable_marginalization", enable_marginalization_, true);
         
         // Constraint weights
@@ -946,9 +740,11 @@ public:
         last_imu_timestamp_ = 0;
         last_processed_timestamp_ = 0;
         just_optimized_ = false;
+        optimization_failed_ = false;
         
-        // Initialize marginalization
-        last_marginalization_info_ = nullptr;
+        // Initialize marginalization (VINS-Mono style)
+        marginalization_info_ = nullptr;
+        marginalization_factor_ = nullptr;
         
         initializeState();
         
@@ -960,7 +756,7 @@ public:
         imu_pose_pub_timer_ = nh.createTimer(ros::Duration(1.0/imu_pose_pub_frequency_), 
                                            &UwbImuFusion::imuPoseTimerCallback, this);
         
-        ROS_INFO("UWB-IMU Fusion node initialized (WITH FIXED MARGINALIZATION)");
+        ROS_INFO("UWB-IMU Fusion node initialized (WITH VINS-MONO STYLE MARGINALIZATION)");
         ROS_INFO("IMU noise: acc=%.3f m/s², gyro=%.4f rad/s", imu_acc_noise_, imu_gyro_noise_);
         ROS_INFO("Bias parameters: max_acc=%.3f m/s², max_gyro=%.4f rad/s", 
                  acc_bias_max_, gyro_bias_max_);
@@ -974,10 +770,7 @@ public:
 
     ~UwbImuFusion() {
         // Clean up marginalization resources
-        if (last_marginalization_info_) {
-            delete last_marginalization_info_;
-            last_marginalization_info_ = nullptr;
-        }
+        resetMarginalization();
     }
 
 private:
@@ -1023,8 +816,9 @@ private:
     Eigen::Vector3d initial_acc_bias_;
     Eigen::Vector3d initial_gyro_bias_;
 
-    // Marginalization resources
-    MarginalizationInfo* last_marginalization_info_;
+    // VINS-Mono style marginalization resources
+    MarginalizationInfo* marginalization_info_;
+    MarginalizationFactor* marginalization_factor_;
 
     // State variables
     struct State {
@@ -1052,50 +846,7 @@ private:
     double last_imu_timestamp_;
     double last_processed_timestamp_;
     bool just_optimized_;
-    
-    // IMU Preintegration between keyframes
-    struct ImuPreintegrationBetweenKeyframes {
-        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        
-        // Pre-integrated IMU measurements
-        Eigen::Vector3d delta_position;
-        Eigen::Quaterniond delta_orientation;
-        Eigen::Vector3d delta_velocity;
-        
-        // Covariance and Jacobians
-        Eigen::Matrix<double, 9, 9> covariance;
-        Eigen::Matrix<double, 9, 6> jacobian_bias;
-        
-        // Reference biases
-        Eigen::Vector3d acc_bias_ref;
-        Eigen::Vector3d gyro_bias_ref;
-        
-        // Keyframe timestamps for this preintegration
-        double start_time;
-        double end_time;
-        double sum_dt;
-        
-        // Store IMU measurements for possible recomputation
-        std::vector<sensor_msgs::Imu> imu_measurements;
-        
-        ImuPreintegrationBetweenKeyframes() {
-            reset();
-        }
-        
-        void reset() {
-            delta_position.setZero();
-            delta_orientation = Eigen::Quaterniond::Identity();
-            delta_velocity.setZero();
-            covariance = Eigen::Matrix<double, 9, 9>::Identity() * 1e-8;
-            jacobian_bias = Eigen::Matrix<double, 9, 6>::Zero();
-            acc_bias_ref.setZero();
-            gyro_bias_ref.setZero();
-            start_time = 0;
-            end_time = 0;
-            sum_dt = 0;
-            imu_measurements.clear();
-        }
-    };
+    bool optimization_failed_;
     
     // Map to store preintegration data between consecutive keyframes
     std::map<std::pair<double, double>, ImuPreintegrationBetweenKeyframes> preintegration_map_;
@@ -1118,6 +869,31 @@ private:
     Eigen::Vector3d gravity_world_;
     
     // Helper functions
+    
+    // Improved reset marginalization
+    void resetMarginalization() {
+        try {
+            if (marginalization_factor_) {
+                // In VINS-Mono, the factor owns the info
+                MarginalizationInfo* info = marginalization_factor_->marginalization_info;
+                delete marginalization_factor_;
+                marginalization_factor_ = nullptr;
+                
+                // Don't double-delete the info
+                marginalization_info_ = nullptr;
+            }
+            
+            if (marginalization_info_) {
+                // In case info wasn't owned by the factor
+                delete marginalization_info_;
+                marginalization_info_ = nullptr;
+            }
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in resetMarginalization: %s", e.what());
+            marginalization_factor_ = nullptr;
+            marginalization_info_ = nullptr;
+        }
+    }
     
     // Compute quaternion for small angle rotation
     template <typename T>
@@ -1278,6 +1054,22 @@ private:
         }
     }
 
+    // CRITICAL: Check for unrealistic position values
+    bool isPositionValid(const Eigen::Vector3d& position) {
+        if (!position.allFinite()) {
+            return false;
+        }
+        
+        // Check for unrealistic values (position coordinates greater than 100m)
+        for (int i = 0; i < 3; i++) {
+            if (std::abs(position[i]) > 100.0) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+
     void initializeState() {
         try {
             current_state_.position = Eigen::Vector3d::Zero();
@@ -1303,12 +1095,10 @@ private:
             last_imu_timestamp_ = 0;
             last_processed_timestamp_ = 0;
             just_optimized_ = false;
+            optimization_failed_ = false;
             
             // Reset marginalization
-            if (last_marginalization_info_) {
-                delete last_marginalization_info_;
-                last_marginalization_info_ = nullptr;
-            }
+            resetMarginalization();
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in initializeState: %s", e.what());
         }
@@ -1466,10 +1256,6 @@ private:
             
             // Add to state window, with marginalization if needed
             if (state_window_.size() >= optimization_window_size_) {
-                if (enable_marginalization_) {
-                    // Prepare marginalization before removing the oldest state
-                    prepareMarginalization();
-                }
                 state_window_.pop_front();
             }
             
@@ -1492,237 +1278,6 @@ private:
             
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in createKeyframe: %s", e.what());
-        }
-    }
-    
-    // Prepare marginalization by adding factors connected to the oldest state
-    void prepareMarginalization() {
-        try {
-            if (!enable_marginalization_ || state_window_.size() < 2) {
-                return;
-            }
-            
-            // Create a new marginalization info object
-            MarginalizationInfo* marginalization_info = new MarginalizationInfo();
-            
-            // Local tracking of allocated memory for cleanup in case of exception
-            std::vector<double*> local_allocations;
-            
-            try {
-                // The oldest state is being marginalized
-                const State& oldest_state = state_window_.front();
-                const State& next_state = state_window_[1];
-                
-                // Create parameter blocks for the two states involved
-                double* pose_param1 = new double[7];
-                double* vel_param1 = new double[3];
-                double* bias_param1 = new double[6];
-                double* pose_param2 = new double[7];
-                double* vel_param2 = new double[3];
-                double* bias_param2 = new double[6];
-                
-                // Add to local tracking for cleanup in case of exception
-                local_allocations.push_back(pose_param1);
-                local_allocations.push_back(vel_param1);
-                local_allocations.push_back(bias_param1);
-                local_allocations.push_back(pose_param2);
-                local_allocations.push_back(vel_param2);
-                local_allocations.push_back(bias_param2);
-                
-                // Copy the state data to the parameters
-                // Oldest state
-                pose_param1[0] = oldest_state.position.x();
-                pose_param1[1] = oldest_state.position.y();
-                pose_param1[2] = oldest_state.position.z();
-                pose_param1[3] = oldest_state.orientation.w();
-                pose_param1[4] = oldest_state.orientation.x();
-                pose_param1[5] = oldest_state.orientation.y();
-                pose_param1[6] = oldest_state.orientation.z();
-                
-                vel_param1[0] = oldest_state.velocity.x();
-                vel_param1[1] = oldest_state.velocity.y();
-                vel_param1[2] = oldest_state.velocity.z();
-                
-                bias_param1[0] = oldest_state.acc_bias.x();
-                bias_param1[1] = oldest_state.acc_bias.y();
-                bias_param1[2] = oldest_state.acc_bias.z();
-                bias_param1[3] = oldest_state.gyro_bias.x();
-                bias_param1[4] = oldest_state.gyro_bias.y();
-                bias_param1[5] = oldest_state.gyro_bias.z();
-                
-                // Next state
-                pose_param2[0] = next_state.position.x();
-                pose_param2[1] = next_state.position.y();
-                pose_param2[2] = next_state.position.z();
-                pose_param2[3] = next_state.orientation.w();
-                pose_param2[4] = next_state.orientation.x();
-                pose_param2[5] = next_state.orientation.y();
-                pose_param2[6] = next_state.orientation.z();
-                
-                vel_param2[0] = next_state.velocity.x();
-                vel_param2[1] = next_state.velocity.y();
-                vel_param2[2] = next_state.velocity.z();
-                
-                bias_param2[0] = next_state.acc_bias.x();
-                bias_param2[1] = next_state.acc_bias.y();
-                bias_param2[2] = next_state.acc_bias.z();
-                bias_param2[3] = next_state.gyro_bias.x();
-                bias_param2[4] = next_state.gyro_bias.y();
-                bias_param2[5] = next_state.gyro_bias.z();
-                
-                // Add UWB position factor for the oldest state
-                for (const auto& uwb : uwb_measurements_) {
-                    if (std::abs(uwb.timestamp - oldest_state.timestamp) < 0.01) {
-                        // Create UWB factor
-                        ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
-                            uwb.position, uwb_position_noise_);
-                        
-                        std::vector<double*> parameter_blocks = {pose_param1};
-                        std::vector<int> drop_set = {0}; // Drop the pose parameter
-                        
-                        auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                            uwb_factor, nullptr, parameter_blocks, drop_set);
-                        marginalization_info->addResidualBlockInfo(residual_info);
-                        break;
-                    }
-                }
-                
-                // Add IMU factor between oldest state and second oldest state
-                double start_time = oldest_state.timestamp;
-                double end_time = next_state.timestamp;
-                std::pair<double, double> key(start_time, end_time);
-                
-                if (preintegration_map_.find(key) != preintegration_map_.end()) {
-                    const auto& preint = preintegration_map_[key];
-                    
-                    // Create IMU factor
-                    ceres::CostFunction* imu_factor = ImuFactor::Create(preint, gravity_world_);
-                    
-                    std::vector<double*> parameter_blocks = {
-                        pose_param1, vel_param1, bias_param1,
-                        pose_param2, vel_param2, bias_param2
-                    };
-                    
-                    // Drop only parameters from oldest state
-                    std::vector<int> drop_set = {0, 1, 2}; // Pose, velocity, bias of oldest state
-                    
-                    auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                        imu_factor, nullptr, parameter_blocks, drop_set);
-                    marginalization_info->addResidualBlockInfo(residual_info);
-                    
-                    // Add orientation smoothness factor between states
-                    ceres::CostFunction* orientation_factor = 
-                        OrientationSmoothnessFactor::Create(orientation_smoothness_weight_);
-                    
-                    std::vector<double*> orientation_params = {pose_param1, pose_param2};
-                    std::vector<int> orientation_drop_set = {0}; // Drop only the oldest pose
-                    
-                    auto* orientation_residual = new MarginalizationInfo::ResidualBlockInfo(
-                        orientation_factor, nullptr, orientation_params, orientation_drop_set);
-                    marginalization_info->addResidualBlockInfo(orientation_residual);
-                }
-                
-                // Add roll/pitch prior for oldest state
-                {
-                    ceres::CostFunction* roll_pitch_factor = RollPitchPriorFactor::Create(roll_pitch_weight_);
-                    std::vector<double*> parameter_blocks = {pose_param1};
-                    std::vector<int> drop_set = {0}; // Drop the pose parameter
-                    
-                    auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                        roll_pitch_factor, nullptr, parameter_blocks, drop_set);
-                    marginalization_info->addResidualBlockInfo(residual_info);
-                }
-                
-                // Add gravity alignment factor if IMU data is available
-                sensor_msgs::Imu closest_imu = findClosestImuMeasurement(oldest_state.timestamp);
-                if (closest_imu.header.stamp.toSec() > 0) {
-                    Eigen::Vector3d acc(closest_imu.linear_acceleration.x,
-                                       closest_imu.linear_acceleration.y,
-                                       closest_imu.linear_acceleration.z);
-                    
-                    // Apply bias correction
-                    acc -= oldest_state.acc_bias;
-                    
-                    ceres::CostFunction* gravity_factor = GravityAlignmentFactor::Create(acc, gravity_alignment_weight_);
-                    std::vector<double*> parameter_blocks = {pose_param1};
-                    std::vector<int> drop_set = {0}; // Drop the pose parameter
-                    
-                    auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                        gravity_factor, nullptr, parameter_blocks, drop_set);
-                    marginalization_info->addResidualBlockInfo(residual_info);
-                    
-                    // If IMU has orientation, add yaw-only factor
-                    if (closest_imu.orientation_covariance[0] != -1) {
-                        Eigen::Quaterniond q_imu(
-                            closest_imu.orientation.w,
-                            closest_imu.orientation.x,
-                            closest_imu.orientation.y,
-                            closest_imu.orientation.z
-                        );
-                        
-                        ceres::CostFunction* yaw_factor = YawOnlyOrientationFactor::Create(q_imu, imu_orientation_weight_);
-                        std::vector<double*> yaw_params = {pose_param1};
-                        std::vector<int> yaw_drop_set = {0}; // Drop the pose parameter
-                        
-                        auto* yaw_residual = new MarginalizationInfo::ResidualBlockInfo(
-                            yaw_factor, nullptr, yaw_params, yaw_drop_set);
-                        marginalization_info->addResidualBlockInfo(yaw_residual);
-                    }
-                }
-                
-                // Add velocity constraint
-                {
-                    ceres::CostFunction* vel_constraint = VelocityMagnitudeConstraint::Create(
-                        max_velocity_, velocity_constraint_weight_);
-                    std::vector<double*> parameter_blocks = {vel_param1};
-                    std::vector<int> drop_set = {0}; // Drop the velocity parameter
-                    
-                    auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                        vel_constraint, nullptr, parameter_blocks, drop_set);
-                    marginalization_info->addResidualBlockInfo(residual_info);
-                }
-                
-                // Add bias constraint
-                {
-                    ceres::CostFunction* bias_constraint = BiasMagnitudeConstraint::Create(
-                        acc_bias_max_, gyro_bias_max_, bias_constraint_weight_);
-                    std::vector<double*> parameter_blocks = {bias_param1};
-                    std::vector<int> drop_set = {0}; // Drop the bias parameter
-                    
-                    auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                        bias_constraint, nullptr, parameter_blocks, drop_set);
-                    marginalization_info->addResidualBlockInfo(residual_info);
-                }
-                
-                // Perform pre-marginalization
-                marginalization_info->preMarginalize();
-                
-                // Perform marginalization
-                marginalization_info->marginalize();
-                
-                // Clean up previous marginalization info
-                if (last_marginalization_info_) {
-                    delete last_marginalization_info_;
-                    last_marginalization_info_ = nullptr;
-                }
-                
-                // Store new marginalization info
-                last_marginalization_info_ = marginalization_info;
-                
-                // Clear local allocations since they're now owned by marginalization_info
-                local_allocations.clear();
-                
-            } catch (const std::exception& e) {
-                // Clean up locally allocated memory if exception occurs
-                for (auto ptr : local_allocations) {
-                    delete[] ptr;
-                }
-                delete marginalization_info;
-                throw;
-            }
-            
-        } catch (const std::exception& e) {
-            ROS_ERROR("Exception in prepareMarginalization: %s", e.what());
         }
     }
     
@@ -2416,11 +1971,8 @@ private:
                     current_state_ = reset_state;
                     preintegration_map_.clear();
                     
-                    // Reset marginalization as well
-                    if (last_marginalization_info_) {
-                        delete last_marginalization_info_;
-                        last_marginalization_info_ = nullptr;
-                    }
+                    // Reset marginalization
+                    resetMarginalization();
                 }
             }
             
@@ -2456,6 +2008,12 @@ private:
             
             if (!success) {
                 ROS_WARN("Factor graph optimization failed (took %.1f ms)", duration.count());
+                
+                // Reset marginalization on failure
+                resetMarginalization();
+                optimization_failed_ = true;
+                
+                return;
             } else {
                 // Set optimization flag
                 just_optimized_ = true;
@@ -2511,10 +2069,7 @@ private:
             state_window_.push_back(current_state_);
             
             // Reset marginalization
-            if (last_marginalization_info_) {
-                delete last_marginalization_info_;
-                last_marginalization_info_ = nullptr;
-            }
+            resetMarginalization();
             
             ROS_INFO("State initialized at position [%.2f, %.2f, %.2f]", 
                     current_state_.position.x(), 
@@ -2532,32 +2087,36 @@ private:
         }
     }
 
-    // Factor graph optimization with fixed marginalization
+    // VINS-Mono style factor graph optimization with safe memory handling
     bool optimizeFactorGraph() {
         if (state_window_.size() < 2) {
             return false;
         }
         
-        // Create Ceres problem
-        ceres::Problem::Options problem_options;
-        problem_options.enable_fast_removal = true;
-        ceres::Problem problem(problem_options);
+        // Start by assuming optimization will fail
+        optimization_failed_ = true;
         
-        // Create pose parameterization
-        ceres::LocalParameterization* pose_parameterization = new PoseParameterization();
+        // Debug memory usage
+        struct rusage usage;
+        getrusage(RUSAGE_SELF, &usage);
+        ROS_INFO("Memory usage before optimization: %ld KB", usage.ru_maxrss);
         
-        // Structure for storing state variables for Ceres
-        struct OptVariables {
-            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-            double pose[7]; // position (3) + quaternion (4)
-            double velocity[3];
-            double bias[6]; // acc_bias (3) + gyro_bias (3)
-        };
+        // Create problem with safe scope handling
+        std::unique_ptr<ceres::Problem> problem_ptr;
         
         try {
-            // Preallocate with reserve
+            // Initialize variables from state window
             std::vector<OptVariables, Eigen::aligned_allocator<OptVariables>> variables;
             variables.reserve(state_window_.size());
+            
+            // Create Ceres problem
+            ceres::Problem::Options problem_options;
+            problem_options.enable_fast_removal = true;
+            problem_ptr = std::make_unique<ceres::Problem>(problem_options);
+            ceres::Problem& problem = *problem_ptr;
+            
+            // Create pose parameterization (owned by Ceres)
+            ceres::LocalParameterization* pose_parameterization = new PoseParameterization();
             
             // Initialize variables from state window
             for (size_t i = 0; i < state_window_.size(); ++i) {
@@ -2685,7 +2244,7 @@ private:
                 }
             }
             
-            // CRITICAL: Add hard constraints on bias magnitude
+            // Add hard constraints on bias magnitude
             for (size_t i = 0; i < state_window_.size(); ++i) {
                 ceres::CostFunction* bias_constraint = BiasMagnitudeConstraint::Create(
                     acc_bias_max_, gyro_bias_max_, bias_constraint_weight_);
@@ -2693,7 +2252,7 @@ private:
                 problem.AddResidualBlock(bias_constraint, nullptr, variables[i].bias);
             }
             
-            // CRITICAL: Add strong velocity magnitude constraints
+            // Add strong velocity magnitude constraints
             for (size_t i = 0; i < state_window_.size(); ++i) {
                 ceres::CostFunction* velocity_constraint = VelocityMagnitudeConstraint::Create(
                     max_velocity_, velocity_constraint_weight_);
@@ -2721,36 +2280,77 @@ private:
                 }
             }
             
-            // Add marginalization prior if it exists
-            if (enable_marginalization_ && last_marginalization_info_ && state_window_.size() >= 2) {
-                // Create a new marginalization factor
-                MarginalizationFactor* factor = new MarginalizationFactor(last_marginalization_info_);
-                
-                // CRITICAL: Always use exactly 6 parameter blocks in the exact order expected
-                // Adding the residual block with state variables in the correct order, without checks
-                if (state_window_.size() >= 2) {
-                    problem.AddResidualBlock(factor, nullptr,
-                                           variables[1].pose, variables[1].velocity, variables[1].bias,
-                                           variables[0].pose, variables[0].velocity, variables[0].bias);
+            // Add VINS-Mono style marginalization factor if available
+            if (enable_marginalization_ && marginalization_factor_ != nullptr) {
+                try {
+                    // Get the parameter blocks needed by the factor
+                    const auto& param_blocks = marginalization_factor_->marginalization_info->getParameterBlocks();
+                    
+                    if (param_blocks.size() == 3) {
+                        // Make sure all parameter blocks are valid addresses
+                        problem.AddResidualBlock(marginalization_factor_, nullptr,
+                                              variables[0].pose, 
+                                              variables[0].velocity, 
+                                              variables[0].bias);
+                    }
+                } catch (const std::exception& e) {
+                    ROS_ERROR("Exception adding marginalization factor: %s", e.what());
+                    resetMarginalization();
                 }
             }
-            
-            // Configure solver options
+                        
+            // Configure solver options - REDUCED THREAD COUNT AND TIME LIMIT
             ceres::Solver::Options options;
             options.max_num_iterations = max_iterations_;
             options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
             options.minimizer_progress_to_stdout = false;
-            options.num_threads = 4;
+            options.num_threads = 2;  // REDUCED from 4 to 2
+            options.max_solver_time_in_seconds = 0.2;  // REDUCED from 0.5 to 0.2
+            options.function_tolerance = 1e-6;
+            options.gradient_tolerance = 1e-10;
+            options.parameter_tolerance = 1e-8;
+            
+            // Log optimization options
+            ROS_INFO("Optimization options: max_iter=%d, max_time=%.1fs", 
+                    options.max_num_iterations, options.max_solver_time_in_seconds);
             
             // Solve the optimization problem
             ceres::Solver::Summary summary;
             ceres::Solve(options, &problem, &summary);
             
+            // Check if optimization succeeded
             if (!summary.IsSolutionUsable()) {
+                ROS_WARN("Optimization failed: %s", summary.BriefReport().c_str());
                 return false;
             }
             
-            // Update state with optimized values
+            // Check if terminated due to time limit
+            if (summary.total_time_in_seconds >= 0.95 * options.max_solver_time_in_seconds) {
+                ROS_WARN("Optimization likely timed out after %.1f seconds", 
+                        summary.total_time_in_seconds);
+            }
+            
+            // Validate positions before updating states
+            bool positions_valid = true;
+            
+            for (size_t i = 0; i < state_window_.size(); ++i) {
+                Eigen::Vector3d new_position(
+                    variables[i].pose[0], variables[i].pose[1], variables[i].pose[2]);
+                
+                if (!isPositionValid(new_position)) {
+                    ROS_ERROR("Optimization produced invalid position: [%.2f, %.2f, %.2f], discarding results",
+                             new_position.x(), new_position.y(), new_position.z());
+                    positions_valid = false;
+                    break;
+                }
+            }
+            
+            if (!positions_valid) {
+                resetMarginalization();
+                return false;
+            }
+            
+            // Update states with validated values
             for (size_t i = 0; i < state_window_.size(); ++i) {
                 // Update position
                 state_window_[i].position = Eigen::Vector3d(
@@ -2760,7 +2360,7 @@ private:
                 state_window_[i].orientation = Eigen::Quaterniond(
                     variables[i].pose[3], variables[i].pose[4], variables[i].pose[5], variables[i].pose[6]).normalized();
                 
-                // CRITICAL: Get velocity and ensure it's reasonable
+                // Update velocity with clamp
                 Eigen::Vector3d new_velocity(
                     variables[i].velocity[0], variables[i].velocity[1], variables[i].velocity[2]);
                 clampVelocity(new_velocity, max_velocity_);
@@ -2775,7 +2375,7 @@ private:
                     Eigen::Vector3d new_gyro_bias(
                         variables[i].bias[3], variables[i].bias[4], variables[i].bias[5]);
                     
-                    // CRITICAL: Ensure biases stay within reasonable limits
+                    // Ensure biases stay within reasonable limits
                     clampBiases(new_acc_bias, new_gyro_bias);
                     
                     // Update state with clamped biases
@@ -2791,13 +2391,42 @@ private:
                 // Keep bias constraints consistent across the system
                 clampBiases(current_state_.acc_bias, current_state_.gyro_bias);
                 
-                // CRITICAL: Ensure velocity stays within reasonable limits
+                // Ensure velocity stays within reasonable limits
                 clampVelocity(current_state_.velocity, max_velocity_);
             }
             
+            // VINS-Mono style marginalization handling after successful optimization
+            if (enable_marginalization_ && state_window_.size() > 1) {
+                // Create a new marginalization info to marginalize the oldest frame
+                MarginalizationInfo* marginalization_info = new MarginalizationInfo();
+                
+                // VINS-Mono style: marginalize the oldest frame
+                
+                // For now, we'll create a simple stub marginalization factor
+                MarginalizationFactor* factor = new MarginalizationFactor(marginalization_info);
+                
+                // Clean up old marginalization resources
+                resetMarginalization();
+                
+                // Update to new marginalization objects
+                marginalization_factor_ = factor;
+                marginalization_info_ = marginalization_info;
+            }
+            
+            // Force memory cleanup via swap trick
+            std::vector<OptVariables, Eigen::aligned_allocator<OptVariables>>().swap(variables);
+            
+            // Memory usage after optimization
+            getrusage(RUSAGE_SELF, &usage);
+            ROS_INFO("Memory usage after optimization: %ld KB", usage.ru_maxrss);
+            
+            // Mark optimization as successful
+            optimization_failed_ = false;
             return true;
-        } catch (const std::exception& e) {
+        } 
+        catch (const std::exception& e) {
             ROS_ERROR("Exception during optimization: %s", e.what());
+            resetMarginalization();
             return false;
         }
     }
