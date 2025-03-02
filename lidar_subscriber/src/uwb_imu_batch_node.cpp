@@ -136,10 +136,10 @@ private:
     double weight_;
 };
 
-// IMPROVED: Better velocity magnitude constraint allowing horizontal motion
+// IMPROVED: Adaptive velocity magnitude constraint for high-speed scenarios
 class VelocityMagnitudeConstraint {
 public:
-    VelocityMagnitudeConstraint(double max_velocity = 2.0, double weight = 300.0)
+    VelocityMagnitudeConstraint(double max_velocity = 25.0, double weight = 300.0)
         : max_velocity_(max_velocity), weight_(weight) {}
     
     template <typename T>
@@ -161,7 +161,7 @@ public:
         return true;
     }
     
-    static ceres::CostFunction* Create(double max_velocity = 2.0, double weight = 300.0) {
+    static ceres::CostFunction* Create(double max_velocity = 25.0, double weight = 300.0) {
         return new ceres::AutoDiffCostFunction<VelocityMagnitudeConstraint, 1, 3>(
             new VelocityMagnitudeConstraint(max_velocity, weight));
     }
@@ -909,6 +909,37 @@ private:
     MarginalizationInfo* marginalization_info;
 };
 
+// UWB position factor for Ceres
+class UwbPositionFactor {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    UwbPositionFactor(const Eigen::Vector3d& measured_position, double noise_std)
+        : measured_position_(measured_position), noise_std_(noise_std) {}
+    
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        // Extract position from pose (position + quaternion)
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> position(pose);
+        
+        // Compute position residuals
+        residuals[0] = (position[0] - T(measured_position_[0])) / T(noise_std_);
+        residuals[1] = (position[1] - T(measured_position_[1])) / T(noise_std_);
+        residuals[2] = (position[2] - T(measured_position_[2])) / T(noise_std_);
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Vector3d& measured_position, double noise_std) {
+        return new ceres::AutoDiffCostFunction<UwbPositionFactor, 3, 7>(
+            new UwbPositionFactor(measured_position, noise_std));
+    }
+    
+private:
+    const Eigen::Vector3d measured_position_;
+    const double noise_std_;
+};
+
 // Main UWB-IMU fusion class
 class UwbImuFusion {
 public:
@@ -917,6 +948,18 @@ public:
     UwbImuFusion() {
         ros::NodeHandle nh;
         ros::NodeHandle private_nh("~");
+        
+        // Load topic name parameters
+        private_nh.param<std::string>("imu_topic", imu_topic_, "/sensor_simulator/imu_data");
+        private_nh.param<std::string>("uwb_topic", uwb_topic_, "/sensor_simulator/UWBPoistionPS");
+        private_nh.param<int>("imu_queue_size", imu_queue_size_, 1000);
+        private_nh.param<int>("uwb_queue_size", uwb_queue_size_, 100);
+        
+        // Load output topic parameters
+        private_nh.param<std::string>("optimized_pose_topic", optimized_pose_topic_, "/uwb_imu_fusion/optimized_pose");
+        private_nh.param<std::string>("imu_pose_topic", imu_pose_topic_, "/uwb_imu_fusion/imu_pose");
+        private_nh.param<int>("optimized_pose_queue_size", optimized_pose_queue_size_, 10);
+        private_nh.param<int>("imu_pose_queue_size", imu_pose_queue_size_, 200);
         
         // Load parameters
         private_nh.param<double>("gravity_magnitude", gravity_magnitude_, 9.81);
@@ -969,17 +1012,17 @@ public:
         private_nh.param<double>("imu_orientation_weight", imu_orientation_weight_, 50.0);
         private_nh.param<double>("bias_constraint_weight", bias_constraint_weight_, 1000.0);
         
-        // IMPROVED: Velocity parameters
-        private_nh.param<double>("max_velocity", max_velocity_, 2.0); // Maximum realistic velocity (m/s)
-        private_nh.param<double>("velocity_constraint_weight", velocity_constraint_weight_, 200.0);
-        private_nh.param<double>("min_horizontal_velocity", min_horizontal_velocity_, 0.3); // Minimum desired velocity
-        private_nh.param<double>("horizontal_velocity_weight", horizontal_velocity_weight_, 20.0);
+        // IMPROVED: Velocity parameters for high-speed scenarios (0-70 km/h)
+        private_nh.param<double>("max_velocity", max_velocity_, 25.0); // Maximum velocity (m/s) = 90 km/h
+        private_nh.param<double>("velocity_constraint_weight", velocity_constraint_weight_, 150.0);
+        private_nh.param<double>("min_horizontal_velocity", min_horizontal_velocity_, 0.5); // Minimum desired velocity
+        private_nh.param<double>("horizontal_velocity_weight", horizontal_velocity_weight_, 10.0);
         
-        private_nh.param<double>("orientation_smoothness_weight", orientation_smoothness_weight_, 150.0);
-        private_nh.param<double>("gravity_alignment_weight", gravity_alignment_weight_, 200.0);
+        private_nh.param<double>("orientation_smoothness_weight", orientation_smoothness_weight_, 100.0);
+        private_nh.param<double>("gravity_alignment_weight", gravity_alignment_weight_, 150.0);
         
         // IMPROVED: RK4 integration parameters
-        private_nh.param<double>("max_integration_dt", max_integration_dt_, 0.01); // Maximum step size for RK4
+        private_nh.param<double>("max_integration_dt", max_integration_dt_, 0.005); // Reduced for high-speed scenarios
         private_nh.param<double>("min_integration_dt", min_integration_dt_, 1e-8); // Minimum step size
         private_nh.param<double>("bias_correction_threshold", bias_correction_threshold_, 0.05); // Threshold for bias validity check
         
@@ -987,11 +1030,11 @@ public:
         initial_acc_bias_ = Eigen::Vector3d(initial_acc_bias_x_, initial_acc_bias_y_, initial_acc_bias_z_);
         initial_gyro_bias_ = Eigen::Vector3d(initial_gyro_bias_x_, initial_gyro_bias_y_, initial_gyro_bias_z_);
         
-        // Initialize subscribers and publishers
-        imu_sub_ = nh.subscribe("/sensor_simulator/imu_data", 1000, &UwbImuFusion::imuCallback, this);
-        uwb_sub_ = nh.subscribe("/sensor_simulator/UWBPoistionPS", 100, &UwbImuFusion::uwbCallback, this);
-        optimized_pose_pub_ = nh.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/optimized_pose", 10);
-        imu_pose_pub_ = nh.advertise<nav_msgs::Odometry>("/uwb_imu_fusion/imu_pose", 200);
+        // Initialize subscribers and publishers with configurable topics
+        imu_sub_ = nh.subscribe(imu_topic_, imu_queue_size_, &UwbImuFusion::imuCallback, this);
+        uwb_sub_ = nh.subscribe(uwb_topic_, uwb_queue_size_, &UwbImuFusion::uwbCallback, this);
+        optimized_pose_pub_ = nh.advertise<nav_msgs::Odometry>(optimized_pose_topic_, optimized_pose_queue_size_);
+        imu_pose_pub_ = nh.advertise<nav_msgs::Odometry>(imu_pose_topic_, imu_pose_queue_size_);
         
         // Initialize state
         is_initialized_ = false;
@@ -1010,20 +1053,23 @@ public:
                                            &UwbImuFusion::optimizationTimerCallback, this);
         
         ROS_INFO("UWB-IMU Fusion node initialized with IMU-rate pose publishing");
+        ROS_INFO("Subscribing to IMU topic: %s (queue: %d)", imu_topic_.c_str(), imu_queue_size_);
+        ROS_INFO("Subscribing to UWB topic: %s (queue: %d)", uwb_topic_.c_str(), uwb_queue_size_);
+        ROS_INFO("Publishing to optimized pose topic: %s", optimized_pose_topic_.c_str());
+        ROS_INFO("Publishing to IMU pose topic: %s", imu_pose_topic_.c_str());
         ROS_INFO("IMU pre-integration using RK4 with max step size: %.4f sec", max_integration_dt_);
         ROS_INFO("IMU noise: acc=%.3f m/s², gyro=%.4f rad/s", imu_acc_noise_, imu_gyro_noise_);
         ROS_INFO("Bias noise: acc=%.6f m/s²/sqrt(s), gyro=%.6f rad/s/sqrt(s)", imu_acc_bias_noise_, imu_gyro_bias_noise_);
         ROS_INFO("Bias parameters: max_acc=%.3f m/s², max_gyro=%.4f rad/s", 
                  acc_bias_max_, gyro_bias_max_);
-        ROS_INFO("Velocity constraints: max=%.1f m/s, min_horizontal=%.1f m/s", 
-                 max_velocity_, min_horizontal_velocity_);
+        ROS_INFO("Velocity constraints: max=%.1f m/s (%.1f km/h), min_horizontal=%.1f m/s", 
+                 max_velocity_, max_velocity_*3.6, min_horizontal_velocity_);
         ROS_INFO("Initial biases: acc=[%.3f, %.3f, %.3f], gyro=[%.4f, %.4f, %.4f]",
                  initial_acc_bias_.x(), initial_acc_bias_.y(), initial_acc_bias_.z(),
                  initial_gyro_bias_.x(), initial_gyro_bias_.y(), initial_gyro_bias_.z());
         ROS_INFO("Bias estimation is %s", enable_bias_estimation_ ? "enabled" : "disabled");
         ROS_INFO("Marginalization is %s", enable_marginalization_ ? "enabled" : "disabled");
         ROS_INFO("Using RK4 integration with bias correction threshold: %.3f", bias_correction_threshold_);
-        ROS_INFO("Using Huber loss for IMU factors");
         
         // Log feature configuration status
         ROS_INFO("Feature configuration: roll_pitch=%s, gravity=%s, orientation_smooth=%s",
@@ -1034,6 +1080,7 @@ public:
                  enable_velocity_constraint_ ? "enabled" : "disabled",
                  enable_horizontal_velocity_incentive_ ? "enabled" : "disabled",
                  enable_imu_orientation_factor_ ? "enabled" : "disabled");
+        ROS_INFO("Optimized for high-speed scenarios (0-70 km/h)");
     }
 
     ~UwbImuFusion() {
@@ -1052,6 +1099,16 @@ private:
     ros::Publisher imu_pose_pub_;
     ros::Timer optimization_timer_;
     tf2_ros::TransformBroadcaster tf_broadcaster_;
+
+    // Topic names and queue sizes
+    std::string imu_topic_;
+    std::string uwb_topic_;
+    int imu_queue_size_;
+    int uwb_queue_size_;
+    std::string optimized_pose_topic_;
+    std::string imu_pose_topic_;
+    int optimized_pose_queue_size_;
+    int imu_pose_queue_size_;
 
     // Parameters
     double gravity_magnitude_;
@@ -1085,7 +1142,7 @@ private:
     double max_imu_dt_;
     double imu_orientation_weight_;
     double bias_constraint_weight_;
-    double max_velocity_;      // Maximum allowed velocity
+    double max_velocity_;      // Maximum allowed velocity - now 25 m/s (90 km/h) for higher speeds
     double velocity_constraint_weight_;
     double min_horizontal_velocity_; // Minimum desired horizontal velocity
     double horizontal_velocity_weight_; // Weight for horizontal velocity incentive
@@ -1373,17 +1430,21 @@ private:
         }
     }
     
-    // IMPROVED: Better velocity clamping that preserves direction for circular motion
-    void clampVelocity(Eigen::Vector3d& velocity, double max_velocity = 2.0) {
+    // IMPROVED: Better velocity clamping that preserves direction for high-speed scenarios
+    void clampVelocity(Eigen::Vector3d& velocity, double max_velocity = 25.0) {
         double velocity_norm = velocity.norm();
+        
         if (velocity_norm > max_velocity) {
             // Scale velocity proportionally to keep direction but limit magnitude
             velocity *= (max_velocity / velocity_norm);
         }
         
-        // Only enforce a minimum horizontal velocity if it's very small
+        // Only enforce a minimum horizontal velocity if it's very small and we're not moving vertically
         double h_vel_norm = std::sqrt(velocity.x()*velocity.x() + velocity.y()*velocity.y());
-        if (h_vel_norm < 0.05) { // Very small threshold that still allows zero
+        double v_vel_abs = std::abs(velocity.z());
+        
+        // If horizontal velocity is small but vertical velocity is significant, don't enforce minimum
+        if (h_vel_norm < 0.05 && v_vel_abs < 0.5) {
             // Set a minimum velocity in the current horizontal direction or along x-axis if zero
             if (h_vel_norm > 1e-6) {
                 // Scale up existing direction to minimum
@@ -1402,6 +1463,38 @@ private:
                 velocity *= (max_velocity / velocity_norm);
             }
         }
+    }
+
+    // Estimate velocity magnitude from IMU data
+    double estimateMaxVelocityFromImu() {
+        // Default value if we don't have enough data
+        double estimated_max_velocity = max_velocity_;
+        
+        // Look at recent IMU data to estimate reasonable velocity bound
+        if (imu_buffer_.size() >= 10) {
+            double max_acc = 0.0;
+            
+            // Find maximum acceleration magnitude in recent data
+            for (size_t i = imu_buffer_.size() - 10; i < imu_buffer_.size(); i++) {
+                const auto& imu = imu_buffer_[i];
+                double acc_mag = std::sqrt(
+                    imu.linear_acceleration.x * imu.linear_acceleration.x +
+                    imu.linear_acceleration.y * imu.linear_acceleration.y +
+                    imu.linear_acceleration.z * imu.linear_acceleration.z
+                );
+                max_acc = std::max(max_acc, acc_mag - gravity_magnitude_);
+            }
+            
+            // Use a reasonable time period for acceleration (1-5 seconds)
+            // v = a * t, assuming constant acceleration
+            double assumed_acc_time = 3.0;
+            double potential_max_vel = max_acc * assumed_acc_time;
+            
+            // Ensure a reasonable range: between 5 m/s and 35 m/s (18-126 km/h)
+            estimated_max_velocity = std::max(5.0, std::min(35.0, potential_max_vel));
+        }
+        
+        return estimated_max_velocity;
     }
 
     void initializeState() {
@@ -1596,7 +1689,12 @@ private:
             clampBiases(propagated_state.acc_bias, propagated_state.gyro_bias);
             
             // CRITICAL: Ensure velocity is reasonable but preserve direction
-            clampVelocity(propagated_state.velocity, max_velocity_);
+            double adaptive_max_velocity = max_velocity_;
+            // For high-speed scenarios, estimate max velocity from IMU data
+            if (imu_buffer_.size() > 10) {
+                adaptive_max_velocity = estimateMaxVelocityFromImu();
+            }
+            clampVelocity(propagated_state.velocity, adaptive_max_velocity);
             
             // Add to state window, with marginalization if needed
             if (state_window_.size() >= optimization_window_size_) {
@@ -1809,8 +1907,14 @@ private:
                 
                 // Add velocity constraint if enabled
                 if (enable_velocity_constraint_) {
+                    // Use adaptive max velocity based on IMU data
+                    double adaptive_max_velocity = max_velocity_;
+                    if (imu_buffer_.size() > 10) {
+                        adaptive_max_velocity = estimateMaxVelocityFromImu();
+                    }
+                    
                     ceres::CostFunction* vel_constraint = VelocityMagnitudeConstraint::Create(
-                        max_velocity_, velocity_constraint_weight_);
+                        adaptive_max_velocity, velocity_constraint_weight_);
                     std::vector<double*> parameter_blocks = {vel_param1};
                     std::vector<int> drop_set = {0}; // Drop the velocity parameter
                     
@@ -1875,7 +1979,170 @@ private:
         }
     }
     
-    // IMPROVED: Propagate state with RK4 integration and better time handling
+    // IMPROVED: IMU pre-integration factor for Ceres with bias correction validity check
+    class ImuFactor {
+    public:
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        
+        ImuFactor(const ImuPreintegrationBetweenKeyframes& preint, const Eigen::Vector3d& gravity,
+                 double bias_correction_threshold = 0.05) 
+            : preint_(preint), gravity_(gravity), bias_correction_threshold_(bias_correction_threshold) {}
+        
+        template <typename T>
+        bool operator()(const T* const pose_i, const T* const vel_i, const T* const bias_i,
+                       const T* const pose_j, const T* const vel_j, const T* const bias_j,
+                       T* residuals) const {
+            
+            // Extract states
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_i(pose_i);
+            Eigen::Map<const Eigen::Quaternion<T>> q_i(pose_i + 3);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_i(vel_i);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_i(bias_i);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_i(bias_i + 3);
+            
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_j(pose_j);
+            Eigen::Map<const Eigen::Quaternion<T>> q_j(pose_j + 3);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_j(vel_j);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_j(bias_j);
+            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_j(bias_j + 3);
+            
+            // Time delta
+            T sum_dt = T(preint_.sum_dt);
+            
+            // Pre-integrated IMU measurements
+            Eigen::Matrix<T, 3, 1> delta_p = preint_.delta_position.cast<T>();
+            Eigen::Quaternion<T> delta_q = preint_.delta_orientation.cast<T>();
+            Eigen::Matrix<T, 3, 1> delta_v = preint_.delta_velocity.cast<T>();
+            
+            // Reference biases used during pre-integration
+            Eigen::Matrix<T, 3, 1> ba_ref = preint_.acc_bias_ref.cast<T>();
+            Eigen::Matrix<T, 3, 1> bg_ref = preint_.gyro_bias_ref.cast<T>();
+            
+            // IMPROVED: Bias corrections with validity check
+            Eigen::Matrix<T, 3, 1> dba = ba_i - ba_ref;
+            Eigen::Matrix<T, 3, 1> dbg = bg_i - bg_ref;
+            
+            // Check if bias corrections are small enough for linear approximation
+            T dba_norm = dba.norm();
+            T dbg_norm = dbg.norm();
+            
+            // IMPROVED: Add nonlinear correction if bias change is too large
+            // This is a simplified model for the case study - in production,
+            // you would recompute the entire preintegration
+            if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) {
+                // Apply nonlinear scaling to limit extreme corrections
+                T dba_scale = ceres::fmin(T(bias_correction_threshold_) / dba_norm, T(1.0));
+                T dbg_scale = ceres::fmin(T(bias_correction_threshold_) / dbg_norm, T(1.0));
+                
+                dba *= dba_scale;
+                dbg *= dbg_scale;
+            }
+            
+            // Limit bias correction magnitude for numerical stability
+            const T max_bias_correction = T(0.1);
+            for (int i = 0; i < 3; ++i) {
+                dba(i) = ceres::fmin(ceres::fmax(dba(i), -max_bias_correction), max_bias_correction);
+                dbg(i) = ceres::fmin(ceres::fmax(dbg(i), -max_bias_correction), max_bias_correction);
+            }
+            
+            // Jacobian w.r.t bias changes
+            Eigen::Matrix<T, 9, 6> jacobian_bias = preint_.jacobian_bias.cast<T>();
+            
+            // Bias correction vector
+            Eigen::Matrix<T, 6, 1> bias_correction_vec;
+            bias_correction_vec.template segment<3>(0) = dba;
+            bias_correction_vec.template segment<3>(3) = dbg;
+            
+            // Corrections to pre-integrated measurements using Jacobians
+            Eigen::Matrix<T, 9, 1> delta_bias_correction = jacobian_bias * bias_correction_vec;
+            
+            Eigen::Matrix<T, 3, 1> corrected_delta_p = delta_p + delta_bias_correction.template segment<3>(0);
+            Eigen::Matrix<T, 3, 1> corrected_delta_v = delta_v + delta_bias_correction.template segment<3>(3);
+            
+            // Correction to delta_q (orientation)
+            Eigen::Matrix<T, 3, 1> corrected_delta_q_vec = delta_bias_correction.template segment<3>(6);
+            
+            // Limit orientation correction magnitude
+            const T max_angle_correction = T(0.1);  // radians
+            T correction_norm = corrected_delta_q_vec.norm();
+            if (correction_norm > max_angle_correction) {
+                corrected_delta_q_vec *= (max_angle_correction / correction_norm);
+            }
+            
+            Eigen::Quaternion<T> corrected_delta_q = delta_q * deltaQ(corrected_delta_q_vec);
+            
+            // Gravity vector in world frame
+            Eigen::Matrix<T, 3, 1> g = gravity_.cast<T>();
+            
+            // Compute residuals
+            Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
+            
+            // Position residual
+            residual.template segment<3>(0) = q_i.inverse() * ((p_j - p_i - v_i * sum_dt) - 
+                                                           T(0.5) * g * sum_dt * sum_dt) - corrected_delta_p;
+            
+            // Orientation residual
+            Eigen::Quaternion<T> q_i_inverse_times_q_j = q_i.conjugate() * q_j;
+            Eigen::Quaternion<T> delta_q_residual = corrected_delta_q.conjugate() * q_i_inverse_times_q_j;
+            
+            // Convert to angle-axis representation
+            T dq_w = delta_q_residual.w();
+            if (dq_w < T(1e-5)) {
+                dq_w = T(1e-5);  // Prevent division by very small number
+            }
+            residual.template segment<3>(3) = T(2.0) * delta_q_residual.vec() / dq_w;
+            
+            // Velocity residual
+            residual.template segment<3>(6) = q_i.inverse() * (v_j - v_i - g * sum_dt) - corrected_delta_v;
+            
+            // CRITICAL: Bias change residuals - adjusted for high-speed scenario
+            residual.template segment<3>(9) = (ba_j - ba_i) / T(0.002);   // Accelerometer bias change
+            residual.template segment<3>(12) = (bg_j - bg_i) / T(0.0002); // Gyroscope bias change
+            
+            // Weight residuals by the information matrix
+            Eigen::Matrix<T, 9, 9> sqrt_information = preint_.covariance.cast<T>().inverse().llt().matrixL().transpose();
+            
+            // Scale the position, orientation, and velocity residuals
+            residual.template segment<3>(0) = sqrt_information.template block<3, 3>(0, 0) * residual.template segment<3>(0);
+            residual.template segment<3>(3) = sqrt_information.template block<3, 3>(3, 3) * residual.template segment<3>(3);
+            residual.template segment<3>(6) = sqrt_information.template block<3, 3>(6, 6) * residual.template segment<3>(6);
+            
+            return true;
+        }
+        
+        static ceres::CostFunction* Create(const ImuPreintegrationBetweenKeyframes& preint, 
+                                          const Eigen::Vector3d& gravity,
+                                          double bias_correction_threshold = 0.05) {
+            return new ceres::AutoDiffCostFunction<ImuFactor, 15, 7, 3, 6, 7, 3, 6>(
+                new ImuFactor(preint, gravity, bias_correction_threshold));
+        }
+        
+    private:
+        const ImuPreintegrationBetweenKeyframes preint_;
+        const Eigen::Vector3d gravity_;
+        const double bias_correction_threshold_;
+        
+        // Helper function to compute quaternion for small angle-axis rotation
+        template <typename T>
+        static Eigen::Quaternion<T> deltaQ(const Eigen::Matrix<T, 3, 1>& theta) {
+            T theta_norm = theta.norm();
+            
+            Eigen::Quaternion<T> dq;
+            if (theta_norm > T(1e-5)) {
+                Eigen::Matrix<T, 3, 1> a = theta / theta_norm;
+                dq = Eigen::Quaternion<T>(cos(theta_norm / T(2.0)), 
+                                        a.x() * sin(theta_norm / T(2.0)),
+                                        a.y() * sin(theta_norm / T(2.0)),
+                                        a.z() * sin(theta_norm / T(2.0)));
+            } else {
+                dq = Eigen::Quaternion<T>(T(1.0), theta.x() / T(2.0), theta.y() / T(2.0), theta.z() / T(2.0));
+                dq.normalize();
+            }
+            return dq;
+        }
+    };
+    
+    // IMPROVED: Propagate state with RK4 integration and better time handling for high speeds
     State propagateState(const State& reference_state, double target_time) {
         State result = reference_state;
         
@@ -1922,13 +2189,14 @@ private:
                 continue;
             }
             
-            // Subdivide large time steps for better accuracy
+            // Subdivide large time steps for better accuracy - use smaller steps for high-speed
             int num_steps = 1;
             double step_dt = dt;
             
-            // IMPROVED: If dt is too large, subdivide into smaller steps
+            // IMPROVED: If dt is too large, subdivide into smaller steps - more subdivision for high speeds
             if (dt > max_integration_dt_) {
-                num_steps = std::ceil(dt / max_integration_dt_);
+                // For high speeds, use more subdivision steps
+                num_steps = std::max(2, static_cast<int>(std::ceil(dt / max_integration_dt_)));
                 step_dt = dt / num_steps;
             }
             
@@ -2002,7 +2270,10 @@ private:
                 result.velocity += acc_integrated * step_dt;
                 
                 // CRITICAL: Ensure velocity stays within reasonable limits while preserving direction
-                clampVelocity(result.velocity, max_velocity_);
+                // For propagation, we use a high max velocity to avoid artificially limiting
+                // the state when using high-accuracy IMU integration
+                double adaptive_max_vel = std::max(max_velocity_, 35.0); // Allow higher during propagation
+                clampVelocity(result.velocity, adaptive_max_vel);
                 
                 // RK4 for position
                 Eigen::Vector3d k1p = velocity_before;
@@ -2062,7 +2333,8 @@ private:
             result.velocity += acc_world * dt;
             
             // Clamp velocity while preserving direction
-            clampVelocity(result.velocity, max_velocity_);
+            double adaptive_max_vel = std::max(max_velocity_, 35.0); // Allow higher during propagation
+            clampVelocity(result.velocity, adaptive_max_vel);
             
             // Update position using trapezoidal integration
             result.position += 0.5 * (velocity_before + result.velocity) * dt;
@@ -2175,19 +2447,25 @@ private:
                 // Update velocity
                 current_state_.velocity += acc_world * dt;
                 
-                // FIXED: Only dampen vertical component slightly - allow x/y to change naturally
-                current_state_.velocity.z() *= 0.98;  // Mild damping of vertical component only
+                // IMPROVED: For high-speed scenarios - remove vertical damping
+                // Only apply slight damping if we have a large spurious vertical velocity
+                double v_vel_abs = std::abs(current_state_.velocity.z());
+                if (v_vel_abs > 5.0) {  // Only dampen extreme vertical velocities
+                    current_state_.velocity.z() *= 0.95;  // Mild damping only on extreme values
+                }
+                
+                // Adaptive max velocity based on IMU data for real-time propagation
+                double adaptive_max_vel = max_velocity_;
+                if (imu_buffer_.size() > 10) {
+                    adaptive_max_vel = std::max(max_velocity_, estimateMaxVelocityFromImu());
+                }
                 
                 // Ensure velocity stays reasonable with smart clamping that preserves direction
-                clampVelocity(current_state_.velocity, max_velocity_);
+                clampVelocity(current_state_.velocity, adaptive_max_vel);
                 
                 // Update position using trapezoidal integration
                 current_state_.position += 0.5 * (velocity_before + current_state_.velocity) * dt;
             }
-            
-            // Mild height regularization
-            // Bias Z toward 1.0 (known height for this simulation) - but less aggressively
-            current_state_.position.z() = 0.98 * current_state_.position.z() + 0.02 * 1.0;
             
             // Update timestamp
             current_state_.timestamp = timestamp;
@@ -2295,11 +2573,12 @@ private:
                     continue;
                 }
                 
-                // IMPROVED: Subdivide large time steps
+                // IMPROVED: Subdivide large time steps - more subdivision for high-speed
                 int num_steps = 1;
                 double step_dt = dt;
                 if (dt > max_integration_dt_) {
-                    num_steps = std::ceil(dt / max_integration_dt_);
+                    // For high speeds, use more subdivision steps
+                    num_steps = std::max(2, static_cast<int>(std::ceil(dt / max_integration_dt_)));
                     step_dt = dt / num_steps;
                 }
                 
@@ -2460,200 +2739,6 @@ private:
         }
     }
 
-    // IMPROVED: IMU pre-integration factor for Ceres with bias correction validity check
-    class ImuFactor {
-    public:
-        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        
-        ImuFactor(const ImuPreintegrationBetweenKeyframes& preint, const Eigen::Vector3d& gravity,
-                 double bias_correction_threshold = 0.05) 
-            : preint_(preint), gravity_(gravity), bias_correction_threshold_(bias_correction_threshold) {}
-        
-        template <typename T>
-        bool operator()(const T* const pose_i, const T* const vel_i, const T* const bias_i,
-                       const T* const pose_j, const T* const vel_j, const T* const bias_j,
-                       T* residuals) const {
-            
-            // Extract states
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_i(pose_i);
-            Eigen::Map<const Eigen::Quaternion<T>> q_i(pose_i + 3);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_i(vel_i);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_i(bias_i);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_i(bias_i + 3);
-            
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> p_j(pose_j);
-            Eigen::Map<const Eigen::Quaternion<T>> q_j(pose_j + 3);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> v_j(vel_j);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> ba_j(bias_j);
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> bg_j(bias_j + 3);
-            
-            // Time delta
-            T sum_dt = T(preint_.sum_dt);
-            
-            // Pre-integrated IMU measurements
-            Eigen::Matrix<T, 3, 1> delta_p = preint_.delta_position.cast<T>();
-            Eigen::Quaternion<T> delta_q = preint_.delta_orientation.cast<T>();
-            Eigen::Matrix<T, 3, 1> delta_v = preint_.delta_velocity.cast<T>();
-            
-            // Reference biases used during pre-integration
-            Eigen::Matrix<T, 3, 1> ba_ref = preint_.acc_bias_ref.cast<T>();
-            Eigen::Matrix<T, 3, 1> bg_ref = preint_.gyro_bias_ref.cast<T>();
-            
-            // IMPROVED: Bias corrections with validity check
-            Eigen::Matrix<T, 3, 1> dba = ba_i - ba_ref;
-            Eigen::Matrix<T, 3, 1> dbg = bg_i - bg_ref;
-            
-            // Check if bias corrections are small enough for linear approximation
-            T dba_norm = dba.norm();
-            T dbg_norm = dbg.norm();
-            
-            // IMPROVED: Add nonlinear correction if bias change is too large
-            // This is a simplified model for the case study - in production,
-            // you would recompute the entire preintegration
-            if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) {
-                // Apply nonlinear scaling to limit extreme corrections
-                T dba_scale = ceres::fmin(T(bias_correction_threshold_) / dba_norm, T(1.0));
-                T dbg_scale = ceres::fmin(T(bias_correction_threshold_) / dbg_norm, T(1.0));
-                
-                dba *= dba_scale;
-                dbg *= dbg_scale;
-            }
-            
-            // Limit bias correction magnitude for numerical stability
-            const T max_bias_correction = T(0.1);
-            for (int i = 0; i < 3; ++i) {
-                dba(i) = ceres::fmin(ceres::fmax(dba(i), -max_bias_correction), max_bias_correction);
-                dbg(i) = ceres::fmin(ceres::fmax(dbg(i), -max_bias_correction), max_bias_correction);
-            }
-            
-            // Jacobian w.r.t bias changes
-            Eigen::Matrix<T, 9, 6> jacobian_bias = preint_.jacobian_bias.cast<T>();
-            
-            // Bias correction vector
-            Eigen::Matrix<T, 6, 1> bias_correction_vec;
-            bias_correction_vec.template segment<3>(0) = dba;
-            bias_correction_vec.template segment<3>(3) = dbg;
-            
-            // Corrections to pre-integrated measurements using Jacobians
-            Eigen::Matrix<T, 9, 1> delta_bias_correction = jacobian_bias * bias_correction_vec;
-            
-            Eigen::Matrix<T, 3, 1> corrected_delta_p = delta_p + delta_bias_correction.template segment<3>(0);
-            Eigen::Matrix<T, 3, 1> corrected_delta_v = delta_v + delta_bias_correction.template segment<3>(3);
-            
-            // Correction to delta_q (orientation)
-            Eigen::Matrix<T, 3, 1> corrected_delta_q_vec = delta_bias_correction.template segment<3>(6);
-            
-            // Limit orientation correction magnitude
-            const T max_angle_correction = T(0.1);  // radians
-            T correction_norm = corrected_delta_q_vec.norm();
-            if (correction_norm > max_angle_correction) {
-                corrected_delta_q_vec *= (max_angle_correction / correction_norm);
-            }
-            
-            Eigen::Quaternion<T> corrected_delta_q = delta_q * deltaQ(corrected_delta_q_vec);
-            
-            // Gravity vector in world frame
-            Eigen::Matrix<T, 3, 1> g = gravity_.cast<T>();
-            
-            // Compute residuals
-            Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
-            
-            // Position residual
-            residual.template segment<3>(0) = q_i.inverse() * ((p_j - p_i - v_i * sum_dt) - 
-                                                           T(0.5) * g * sum_dt * sum_dt) - corrected_delta_p;
-            
-            // Orientation residual
-            Eigen::Quaternion<T> q_i_inverse_times_q_j = q_i.conjugate() * q_j;
-            Eigen::Quaternion<T> delta_q_residual = corrected_delta_q.conjugate() * q_i_inverse_times_q_j;
-            
-            // Convert to angle-axis representation
-            T dq_w = delta_q_residual.w();
-            if (dq_w < T(1e-5)) {
-                dq_w = T(1e-5);  // Prevent division by very small number
-            }
-            residual.template segment<3>(3) = T(2.0) * delta_q_residual.vec() / dq_w;
-            
-            // Velocity residual
-            residual.template segment<3>(6) = q_i.inverse() * (v_j - v_i - g * sum_dt) - corrected_delta_v;
-            
-            // CRITICAL: Bias change residuals
-            residual.template segment<3>(9) = (ba_j - ba_i) / T(0.002);   // Accelerometer bias change
-            residual.template segment<3>(12) = (bg_j - bg_i) / T(0.0002); // Gyroscope bias change
-            
-            // Weight residuals by the information matrix
-            Eigen::Matrix<T, 9, 9> sqrt_information = preint_.covariance.cast<T>().inverse().llt().matrixL().transpose();
-            
-            // Scale the position, orientation, and velocity residuals
-            residual.template segment<3>(0) = sqrt_information.template block<3, 3>(0, 0) * residual.template segment<3>(0);
-            residual.template segment<3>(3) = sqrt_information.template block<3, 3>(3, 3) * residual.template segment<3>(3);
-            residual.template segment<3>(6) = sqrt_information.template block<3, 3>(6, 6) * residual.template segment<3>(6);
-            
-            return true;
-        }
-        
-        static ceres::CostFunction* Create(const ImuPreintegrationBetweenKeyframes& preint, 
-                                          const Eigen::Vector3d& gravity,
-                                          double bias_correction_threshold = 0.05) {
-            return new ceres::AutoDiffCostFunction<ImuFactor, 15, 7, 3, 6, 7, 3, 6>(
-                new ImuFactor(preint, gravity, bias_correction_threshold));
-        }
-        
-    private:
-        const ImuPreintegrationBetweenKeyframes preint_;
-        const Eigen::Vector3d gravity_;
-        const double bias_correction_threshold_;
-        
-        // Helper function to compute quaternion for small angle-axis rotation
-        template <typename T>
-        static Eigen::Quaternion<T> deltaQ(const Eigen::Matrix<T, 3, 1>& theta) {
-            T theta_norm = theta.norm();
-            
-            Eigen::Quaternion<T> dq;
-            if (theta_norm > T(1e-5)) {
-                Eigen::Matrix<T, 3, 1> a = theta / theta_norm;
-                dq = Eigen::Quaternion<T>(cos(theta_norm / T(2.0)), 
-                                        a.x() * sin(theta_norm / T(2.0)),
-                                        a.y() * sin(theta_norm / T(2.0)),
-                                        a.z() * sin(theta_norm / T(2.0)));
-            } else {
-                dq = Eigen::Quaternion<T>(T(1.0), theta.x() / T(2.0), theta.y() / T(2.0), theta.z() / T(2.0));
-                dq.normalize();
-            }
-            return dq;
-        }
-    };
-
-    // UWB position factor for Ceres
-    class UwbPositionFactor {
-    public:
-        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-        
-        UwbPositionFactor(const Eigen::Vector3d& measured_position, double noise_std)
-            : measured_position_(measured_position), noise_std_(noise_std) {}
-        
-        template <typename T>
-        bool operator()(const T* const pose, T* residuals) const {
-            // Extract position from pose (position + quaternion)
-            Eigen::Map<const Eigen::Matrix<T, 3, 1>> position(pose);
-            
-            // Compute position residuals
-            residuals[0] = (position[0] - T(measured_position_[0])) / T(noise_std_);
-            residuals[1] = (position[1] - T(measured_position_[1])) / T(noise_std_);
-            residuals[2] = (position[2] - T(measured_position_[2])) / T(noise_std_);
-            
-            return true;
-        }
-        
-        static ceres::CostFunction* Create(const Eigen::Vector3d& measured_position, double noise_std) {
-            return new ceres::AutoDiffCostFunction<UwbPositionFactor, 3, 7>(
-                new UwbPositionFactor(measured_position, noise_std));
-        }
-        
-    private:
-        const Eigen::Vector3d measured_position_;
-        const double noise_std_;
-    };
-
     void optimizationTimerCallback(const ros::TimerEvent& event) {
         try {
             std::lock_guard<std::mutex> lock(data_mutex_);
@@ -2675,7 +2760,17 @@ private:
                 double position_error_z = std::abs(latest_state.position.z() - latest_uwb.position.z());
                 double position_error_xy = (latest_state.position.head<2>() - latest_uwb.position.head<2>()).norm();
                 
-                if (position_error_z > 0.5 || position_error_xy > 0.5) {
+                // Adjust position drift threshold for high-speed scenarios
+                double adaptive_drift_threshold = 1.0; // Default threshold
+                double velocity_norm = latest_state.velocity.norm();
+                
+                // Increase allowable drift at higher speeds
+                if (velocity_norm > 10.0) {
+                    adaptive_drift_threshold = 1.0 + (velocity_norm - 10.0) * 0.1;
+                    adaptive_drift_threshold = std::min(adaptive_drift_threshold, 3.0); // Cap at 3 meters
+                }
+                
+                if (position_error_z > adaptive_drift_threshold || position_error_xy > adaptive_drift_threshold) {
                     ROS_WARN("Position drift detected: Z=%.2f meters, XY=%.2f meters. Resetting to UWB position.", 
                              position_error_z, position_error_xy);
                     
@@ -2686,7 +2781,7 @@ private:
                     // Keep existing velocity direction but reduce magnitude
                     if (reset_state.velocity.norm() > 0.1) {
                         reset_state.velocity.normalize();
-                        reset_state.velocity *= min_horizontal_velocity_;
+                        reset_state.velocity *= std::min(min_horizontal_velocity_ * 2.0, velocity_norm * 0.5);
                     } else {
                         // Initialize with horizontal velocity in direction of orientation if velocity is very small
                         double yaw = atan2(2.0 * (reset_state.orientation.w() * reset_state.orientation.z() + 
@@ -2764,10 +2859,14 @@ private:
                 // Output state after optimization
                 Eigen::Vector3d euler_angles = quaternionToEulerDegrees(current_state_.orientation);
                 
+                // Get velocity in km/h for better reporting in high-speed scenario
+                double velocity_kmh = current_state_.velocity.norm() * 3.6; // m/s to km/h
+                
                 ROS_INFO("Optimization time: %.1f ms", duration.count());
-                ROS_INFO("State: Pos [%.2f, %.2f, %.2f] | Vel [%.2f, %.2f, %.2f] | Euler [%.1f, %.1f, %.1f] deg | Bias acc [%.3f, %.3f, %.3f] gyro [%.3f, %.3f, %.3f]",
+                ROS_INFO("State: Pos [%.2f, %.2f, %.2f] | Vel [%.2f, %.2f, %.2f] (%.1f km/h) | Euler [%.1f, %.1f, %.1f] deg | Bias acc [%.3f, %.3f, %.3f] gyro [%.3f, %.3f, %.3f]",
                     current_state_.position.x(), current_state_.position.y(), current_state_.position.z(),
                     current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z(),
+                    velocity_kmh,
                     euler_angles.x(), euler_angles.y(), euler_angles.z(),
                     current_state_.acc_bias.x(), current_state_.acc_bias.y(), current_state_.acc_bias.z(),
                     current_state_.gyro_bias.x(), current_state_.gyro_bias.y(), current_state_.gyro_bias.z());
@@ -3010,11 +3109,17 @@ private:
                 }
             }
             
-            // IMPROVED: Add velocity magnitude constraints if enabled
+            // IMPROVED: Add adaptive velocity magnitude constraints if enabled
             if (enable_velocity_constraint_) {
+                // Estimate max velocity from IMU data for adaptive constraints
+                double adaptive_max_velocity = max_velocity_;
+                if (imu_buffer_.size() > 10) {
+                    adaptive_max_velocity = estimateMaxVelocityFromImu();
+                }
+                
                 for (size_t i = 0; i < state_window_.size(); ++i) {
                     ceres::CostFunction* velocity_constraint = VelocityMagnitudeConstraint::Create(
-                        max_velocity_, velocity_constraint_weight_);
+                        adaptive_max_velocity, velocity_constraint_weight_);
                     problem.AddResidualBlock(velocity_constraint, nullptr, variables[i].velocity);
                 }
             }
@@ -3045,7 +3150,7 @@ private:
                     ceres::CostFunction* imu_factor = ImuFactor::Create(
                         preint, gravity_world_, bias_correction_threshold_);
                     
-                    // IMPROVED: Use HuberLoss for IMU factor (instead of Cauchy)
+                    // IMPROVED: Use HuberLoss for IMU factor
                     problem.AddResidualBlock(imu_factor, new ceres::HuberLoss(1.0),
                                            variables[i].pose, variables[i].velocity, variables[i].bias,
                                            variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
@@ -3095,7 +3200,13 @@ private:
                 Eigen::Vector3d new_velocity(
                     variables[i].velocity[0], variables[i].velocity[1], variables[i].velocity[2]);
                 
-                clampVelocity(new_velocity, max_velocity_);
+                // Use adaptive max velocity for high-speed scenario
+                double adaptive_max_velocity = max_velocity_;
+                if (imu_buffer_.size() > 10) {
+                    adaptive_max_velocity = estimateMaxVelocityFromImu();
+                }
+                
+                clampVelocity(new_velocity, adaptive_max_velocity);
                 state_window_[i].velocity = new_velocity;
                 
                 // Update biases if enabled
@@ -3124,7 +3235,11 @@ private:
                 clampBiases(current_state_.acc_bias, current_state_.gyro_bias);
                 
                 // Ensure velocity stays within reasonable limits while preserving direction
-                clampVelocity(current_state_.velocity, max_velocity_);
+                double adaptive_max_velocity = max_velocity_;
+                if (imu_buffer_.size() > 10) {
+                    adaptive_max_velocity = estimateMaxVelocityFromImu();
+                }
+                clampVelocity(current_state_.velocity, adaptive_max_velocity);
             }
             
             return true;

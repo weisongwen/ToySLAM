@@ -30,7 +30,7 @@
 #include <iomanip>
 
 // TASLO: Optimized for Velodyne HDL-32E LiDAR
-// Based on FLOAM implementation
+// Based on FLOAM/A-LOAM implementation strategies
 
 class TASLO {
 public:
@@ -40,27 +40,38 @@ public:
         nh_.param<double>("edge_threshold", edge_threshold_, 0.25);  // Adjusted for HDL-32E
         nh_.param<double>("surf_threshold", surf_threshold_, 0.08);  // Adjusted for HDL-32E
         nh_.param<double>("map_resolution", map_resolution_, 0.3);   // Adjusted for HDL-32E
-        nh_.param<double>("min_scan_range", min_scan_range_, 0.3);
-        nh_.param<double>("max_scan_range", max_range_, 100.0);
+        nh_.param<double>("min_scan_range", min_scan_range_, 1.0);
+        nh_.param<double>("max_scan_range", max_range_, 80.0);
         nh_.param<bool>("mapping_flag", mapping_flag_, true);
         nh_.param<bool>("publish_debug_clouds", publish_debug_clouds_, true);
         nh_.param<bool>("use_laser_scan_lines", use_laser_scan_lines_, true);
         nh_.param<bool>("use_sub_maps", use_sub_maps_, true);
-        nh_.param<int>("optimization_iterations", optimization_iterations_, 12);  // Increased for HDL-32E
+        nh_.param<int>("optimization_iterations", optimization_iterations_, 10);  // Reduced for faster processing
         nh_.param<double>("max_angular_velocity", max_angular_velocity_, 0.5); // rad/s
         nh_.param<double>("max_linear_velocity", max_linear_velocity_, 1.0); // m/s
         nh_.param<double>("distance_threshold_downsample", distance_threshold_downsample_, 5.0);
         nh_.param<bool>("enable_motion_compensation", enable_motion_compensation_, true);
         nh_.param<double>("mapping_frequency", mapping_frequency_, 10.0);
         nh_.param<double>("scan_period", scan_period_, 0.05);  // 20Hz for HDL-32E
-        nh_.param<bool>("save_trajectory", save_trajectory_, false);
+        nh_.param<bool>("save_trajectory", save_trajectory_, true);
         nh_.param<std::string>("trajectory_filename", trajectory_filename_, "taslo_trajectory.txt");
         nh_.param<bool>("use_ring_field", use_ring_field_, true);  // Use ring field if available
-        nh_.param<double>("keyframe_angle_threshold", keyframe_angle_threshold_, 0.2);
-        nh_.param<double>("keyframe_distance_threshold", keyframe_distance_threshold_, 0.5);
+        nh_.param<double>("keyframe_angle_threshold", keyframe_angle_threshold_, 0.05);  // More sensitive
+        nh_.param<double>("keyframe_distance_threshold", keyframe_distance_threshold_, 0.2);  // More sensitive
+        nh_.param<int>("keyframe_time_interval", keyframe_time_interval_, 10);  // Create keyframe every N frames
         nh_.param<std::string>("map_frame", map_frame_, "map");
         nh_.param<std::string>("odom_frame", odom_frame_, "odom");
         nh_.param<std::string>("lidar_frame", lidar_frame_, "velodyne");
+        nh_.param<double>("icp_fitness_threshold", icp_fitness_threshold_, 0.3);  // Threshold for ICP convergence
+        
+        // Enhanced motion detection parameters
+        nh_.param<bool>("use_aggressive_motion_detection", use_aggressive_motion_detection_, true);
+        nh_.param<double>("min_motion_threshold", min_motion_threshold_, 0.05);  // 5cm minimum motion detection
+        nh_.param<int>("forced_motion_interval", forced_motion_interval_, 20);  // Force motion detection every N frames
+        nh_.param<bool>("use_constant_velocity", use_constant_velocity_, true);  // Use constant velocity motion model
+        nh_.param<bool>("use_aloam_factors", use_aloam_factors_, true);  // Use A-LOAM correspondence factors
+        nh_.param<double>("feature_min_distance", feature_min_distance_, 0.15);  // Minimum distance between features
+        nh_.param<double>("system_noise", system_noise_, 0.001);  // System noise for regularization
         
         // Initialize clouds
         edge_points_sharp_.reset(new pcl::PointCloud<pcl::PointXYZI>());
@@ -68,6 +79,7 @@ public:
         surf_points_flat_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         surf_points_less_flat_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         curr_cloud_raw_.reset(new pcl::PointCloud<pcl::PointXYZI>());
+        prev_cloud_.reset(new pcl::PointCloud<pcl::PointXYZI>());
         
         // For mapping
         edge_points_map_local_.reset(new pcl::PointCloud<pcl::PointXYZI>());
@@ -81,10 +93,16 @@ public:
         
         // Initial pose
         system_initialized_ = false;
+        first_frame_processed_ = false;
+        frame_count_ = 0;
+        frames_without_motion_ = 0;
         q_w_curr_ = Eigen::Quaterniond(1, 0, 0, 0);
         t_w_curr_ = Eigen::Vector3d(0, 0, 0);
         last_keyframe_t_ = t_w_curr_;
         last_keyframe_q_ = q_w_curr_;
+        
+        // Motion tracking
+        prev_to_curr_transform_ = Eigen::Matrix4f::Identity();
         
         // Motion prediction
         last_frame_time_ = ros::Time(0);
@@ -125,6 +143,11 @@ public:
         }
         
         ROS_INFO("TASLO initialized with scan_line = %d (HDL-32E), map_resolution = %.2f", scan_line_, map_resolution_);
+        ROS_INFO("Using A-LOAM factors: %s, Constant velocity model: %s", 
+                use_aloam_factors_ ? "true" : "false", 
+                use_constant_velocity_ ? "true" : "false");
+        ROS_INFO("Frame IDs: map=%s, odom=%s, lidar=%s", 
+                map_frame_.c_str(), odom_frame_.c_str(), lidar_frame_.c_str());
     }
     
     ~TASLO() {
@@ -181,9 +204,21 @@ private:
     bool use_ring_field_;
     double keyframe_angle_threshold_;
     double keyframe_distance_threshold_;
+    int keyframe_time_interval_;
+    double icp_fitness_threshold_;
     std::string map_frame_;
     std::string odom_frame_;
     std::string lidar_frame_;
+    
+    // Enhanced motion detection parameters
+    bool use_aggressive_motion_detection_;
+    double min_motion_threshold_;
+    int forced_motion_interval_;
+    int frames_without_motion_;
+    bool use_constant_velocity_;
+    bool use_aloam_factors_;
+    double feature_min_distance_;
+    double system_noise_;
     
     // Point clouds
     pcl::PointCloud<pcl::PointXYZI>::Ptr edge_points_sharp_;
@@ -191,6 +226,7 @@ private:
     pcl::PointCloud<pcl::PointXYZI>::Ptr surf_points_flat_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr surf_points_less_flat_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr curr_cloud_raw_;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr prev_cloud_; // For frame-to-frame matching
     
     // Map point clouds
     pcl::PointCloud<pcl::PointXYZI>::Ptr edge_points_map_local_;
@@ -204,8 +240,13 @@ private:
     
     // Pose
     bool system_initialized_;
+    bool first_frame_processed_;
+    int frame_count_;
     Eigen::Quaterniond q_w_curr_;
     Eigen::Vector3d t_w_curr_;
+    
+    // For transform tracking
+    Eigen::Matrix4f prev_to_curr_transform_;
     
     // For keyframe
     Eigen::Vector3d last_keyframe_t_;
@@ -233,6 +274,12 @@ private:
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_queue_;
     std::queue<pcl::PointCloud<pcl::PointXYZI>::Ptr> edge_map_update_queue_;
     std::queue<pcl::PointCloud<pcl::PointXYZI>::Ptr> surf_map_update_queue_;
+    
+    // For transformation representation
+    struct TransformationParameters {
+        Eigen::Vector3d translation;
+        Eigen::Vector3d rotation; // Euler angles or axis-angle representation
+    };
     
     // For curvature calculation
     struct PointInfo {
@@ -366,18 +413,54 @@ private:
         }
     }
     
+    // Transform conversion utilities
+    Eigen::Matrix4f transformToMatrix(const TransformationParameters& params) {
+        Eigen::Matrix4f matrix = Eigen::Matrix4f::Identity();
+        
+        // Convert rotation to matrix form
+        Eigen::AngleAxisf roll(params.rotation.x(), Eigen::Vector3f::UnitX());
+        Eigen::AngleAxisf pitch(params.rotation.y(), Eigen::Vector3f::UnitY());
+        Eigen::AngleAxisf yaw(params.rotation.z(), Eigen::Vector3f::UnitZ());
+        Eigen::Matrix3f rotation_matrix = (yaw * pitch * roll).matrix();
+        
+        // Set rotation part
+        matrix.block<3, 3>(0, 0) = rotation_matrix;
+        
+        // Set translation part
+        matrix.block<3, 1>(0, 3) = params.translation.cast<float>();
+        
+        return matrix;
+    }
+    
+    TransformationParameters matrixToTransform(const Eigen::Matrix4f& matrix) {
+        TransformationParameters params;
+        
+        // Extract translation
+        params.translation = matrix.block<3, 1>(0, 3).cast<double>();
+        
+        // Extract rotation (convert to Euler angles)
+        Eigen::Matrix3f rotation_matrix = matrix.block<3, 3>(0, 0);
+        params.rotation.x() = atan2(rotation_matrix(2, 1), rotation_matrix(2, 2));
+        params.rotation.y() = -asin(rotation_matrix(2, 0));
+        params.rotation.z() = atan2(rotation_matrix(1, 0), rotation_matrix(0, 0));
+        
+        return params;
+    }
+    
     void processCloud(const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
         auto start_time = std::chrono::high_resolution_clock::now();
         
         // Convert to PCL point cloud
-        pcl::fromROSMsg(*cloud_msg, *curr_cloud_raw_);
+        pcl::PointCloud<pcl::PointXYZI>::Ptr current_cloud(new pcl::PointCloud<pcl::PointXYZI>());
+        pcl::fromROSMsg(*cloud_msg, *current_cloud);
         
-        if (curr_cloud_raw_->empty()) {
+        if (current_cloud->empty()) {
             ROS_WARN("Empty cloud received!");
             return;
         }
         
-        ROS_INFO("Processing cloud with %ld points", curr_cloud_raw_->size());
+        ROS_INFO("Processing cloud with %ld points", current_cloud->size());
+        curr_cloud_raw_ = current_cloud;
         
         // Clear feature clouds
         edge_points_sharp_->clear();
@@ -385,62 +468,19 @@ private:
         surf_points_flat_->clear();
         surf_points_less_flat_->clear();
         
-        // Motion prediction for better initial guess
-        Eigen::Quaterniond q_pred = q_w_curr_;
-        Eigen::Vector3d t_pred = t_w_curr_;
-        
-        if (system_initialized_ && last_frame_time_.toSec() > 0) {
-            double delta_time = (cloud_msg->header.stamp - last_frame_time_).toSec();
-            if (delta_time > 0 && delta_time < 1.0) { // Valid time difference
-                // Apply motion prediction
-                t_pred = t_w_curr_ + linear_velocity_ * delta_time;
-                
-                // Angular velocity is in axis-angle form
-                double angle = angular_velocity_.norm() * delta_time;
-                if (angle > 0.001) {
-                    Eigen::Vector3d axis = angular_velocity_.normalized();
-                    Eigen::Quaterniond delta_q(Eigen::AngleAxisd(angle, axis));
-                    q_pred = q_w_curr_ * delta_q;
-                }
-            }
-        }
-        
-        // Apply motion compensation if enabled
-        if (enable_motion_compensation_ && system_initialized_) {
-            compensateMotion(curr_cloud_raw_, q_w_curr_, t_w_curr_, q_pred, t_pred, cloud_msg->header.stamp);
-        }
-        
-        // Extract features
+        // Extract features using adaptive thresholding
         extractFeatures(curr_cloud_raw_, cloud_msg);
         
-        // Odometry (scan-to-map)
-        if (system_initialized_) {
-            optimizeOdometry(q_pred, t_pred);
-            
-            // Update velocity for next frame
-            double dt = (cloud_msg->header.stamp - last_frame_time_).toSec();
-            if (dt > 0.01 && dt < 1.0) {
-                // Compute linear velocity
-                Eigen::Vector3d delta_translation = t_w_curr_ - t_pred;
-                linear_velocity_ = delta_translation / dt;
-                
-                // Compute angular velocity (in axis-angle form)
-                Eigen::Quaterniond delta_rotation = q_w_curr_ * q_pred.inverse();
-                Eigen::AngleAxisd axis_angle(delta_rotation);
-                angular_velocity_ = axis_angle.axis() * axis_angle.angle() / dt;
-                
-                // Apply limits to velocity estimates to avoid wild predictions
-                if (linear_velocity_.norm() > max_linear_velocity_) {
-                    linear_velocity_ = linear_velocity_.normalized() * max_linear_velocity_;
-                }
-                
-                if (angular_velocity_.norm() > max_angular_velocity_) {
-                    angular_velocity_ = angular_velocity_.normalized() * max_angular_velocity_;
-                }
-            }
-        } else {
-            // Initialize system with first cloud
+        // Frame-to-frame odometry: calculate initial transformation from previous to current frame
+        Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+        
+        if (!first_frame_processed_) {
+            // First frame - just initialize
+            first_frame_processed_ = true;
             system_initialized_ = true;
+            
+            // Copy current cloud as previous for next iteration
+            *prev_cloud_ = *curr_cloud_raw_;
             
             // Set initial map
             edge_points_map_local_->clear();
@@ -458,10 +498,74 @@ private:
                 surf_map_update_queue_.push(surf_points_less_flat_);
             }
             
+            // Set initial pose
+            {
+                std::lock_guard<std::mutex> lock(pose_mutex_);
+                q_w_curr_ = Eigen::Quaterniond(1, 0, 0, 0);
+                t_w_curr_ = Eigen::Vector3d(0, 0, 0);
+            }
+            
             ROS_INFO("System initialized!");
+            
+            // Publish initial results
+            publishResults(cloud_msg->header.stamp);
+            
+            // Update time
+            last_frame_time_ = cloud_msg->header.stamp;
+            
+            return;
         }
         
-        // Update local map
+        // Frame count for debugging
+        frame_count_++;
+        
+        // Use motion prediction based on previous transforms
+        if (use_constant_velocity_ && frame_count_ >= 2) {
+            initial_guess = predictMotion();
+            
+            Eigen::Vector3f translation = initial_guess.block<3,1>(0,3);
+            double motion_magnitude = translation.norm();
+            
+            ROS_INFO("Used motion prediction for initial guess: tx=%.3f, ty=%.3f, tz=%.3f, magnitude=%.3f", 
+                    translation.x(), translation.y(), translation.z(), motion_magnitude);
+        } else {
+            // For first frames or if constant velocity is disabled, use identity
+            initial_guess.setIdentity();
+            
+            // If we haven't had motion in a while, inject a small forward motion
+            if (frames_without_motion_ > forced_motion_interval_ / 2) {
+                initial_guess(0, 3) = 0.05; // Small forward motion
+                initial_guess(1, 3) = 0.01 * (rand() % 3 - 1); // Small random lateral motion
+                ROS_WARN("Injecting small forward motion after %d static frames", frames_without_motion_);
+            }
+        }
+        
+        // Convert initial guess to quaternion and translation
+        Eigen::Quaterniond q_init;
+        Eigen::Vector3d t_init;
+        
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            // Get current global pose
+            Eigen::Matrix4f current_pose = Eigen::Matrix4f::Identity();
+            current_pose.block<3,3>(0,0) = q_w_curr_.toRotationMatrix().cast<float>();
+            current_pose.block<3,1>(0,3) = t_w_curr_.cast<float>();
+            
+            // Apply initial guess (local transform) to global pose
+            Eigen::Matrix4f new_pose = current_pose * initial_guess;
+            
+            // Extract rotation and translation
+            Eigen::Matrix3f rotation = new_pose.block<3,3>(0,0);
+            q_init = Eigen::Quaterniond(rotation.cast<double>());
+            t_init = new_pose.block<3,1>(0,3).cast<double>();
+            
+            q_init.normalize();
+        }
+        
+        // Optimize the initial guess using point-based alignment (A-LOAM style)
+        optimizeOdometry(q_init, t_init);
+        
+        // Check if this is a keyframe
         bool is_keyframe = isKeyframe();
         if (is_keyframe && mapping_flag_) {
             updateLocalMap();
@@ -470,6 +574,41 @@ private:
             last_keyframe_q_ = q_w_curr_;
             last_keyframe_t_ = t_w_curr_;
         }
+        
+        // Calculate the transform from prev to current for motion prediction
+        {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            Eigen::Matrix4f current_pose = Eigen::Matrix4f::Identity();
+            current_pose.block<3,3>(0,0) = q_w_curr_.toRotationMatrix().cast<float>();
+            current_pose.block<3,1>(0,3) = t_w_curr_.cast<float>();
+            
+            // Store last transform for next frame
+            if (frame_count_ >= 2) {
+                Eigen::Matrix4f prev_pose = current_pose * initial_guess.inverse();
+                prev_to_curr_transform_ = prev_pose.inverse() * current_pose;
+            } else {
+                prev_to_curr_transform_ = initial_guess;
+            }
+            
+            // Log the transform for debugging
+            Eigen::Vector3f translation = prev_to_curr_transform_.block<3,1>(0,3);
+            double motion_magnitude = translation.norm();
+            ROS_INFO("Frame-to-frame transform: [%.3f, %.3f, %.3f], magnitude=%.3f", 
+                    translation.x(), translation.y(), translation.z(), motion_magnitude);
+                    
+            // Check if this is significant motion
+            if (motion_magnitude > min_motion_threshold_) {
+                frames_without_motion_ = 0;
+            } else {
+                frames_without_motion_++;
+                if (frames_without_motion_ > 5) {
+                    ROS_WARN("Minimal motion detected for %d consecutive frames", frames_without_motion_);
+                }
+            }
+        }
+        
+        // Store current cloud as previous for next iteration
+        *prev_cloud_ = *curr_cloud_raw_;
         
         // Publish results
         publishResults(cloud_msg->header.stamp);
@@ -487,105 +626,109 @@ private:
         ROS_INFO("Processing time: %ld ms", duration);
     }
     
-    void compensateMotion(pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, 
-                         const Eigen::Quaterniond& q_start,
-                         const Eigen::Vector3d& t_start,
-                         const Eigen::Quaterniond& q_end,
-                         const Eigen::Vector3d& t_end,
-                         const ros::Time& cloud_time) {
-        // This method compensates for the LiDAR motion during a scan
+    // A-LOAM/FLOAM-inspired motion prediction
+    Eigen::Matrix4f predictMotion() {
+        Eigen::Matrix4f result = Eigen::Matrix4f::Identity();
         
-        // For simplicity, we'll assume linear interpolation of pose during scan
-        int cloud_size = cloud->size();
-        
-        // Create a new cloud for the compensated points
-        pcl::PointCloud<pcl::PointXYZI>::Ptr compensated_cloud(new pcl::PointCloud<pcl::PointXYZI>());
-        compensated_cloud->resize(cloud_size);
-        
-        for (int point_id = 0; point_id < cloud_size; point_id++) {
-            // Assuming points are ordered by timestamp in the scan
-            // We'll use the point_id as a proxy for the point's timestamp
-            float ratio = static_cast<float>(point_id) / static_cast<float>(cloud_size - 1);
+        // If we've processed at least 2 frames, use constant velocity model
+        if (frame_count_ >= 2) {
+            // Use previous transform directly
+            result = prev_to_curr_transform_;
             
-            // Interpolate the pose
-            Eigen::Quaterniond q_interpolated = q_start.slerp(ratio, q_end);
-            Eigen::Vector3d t_interpolated = (1.0f - ratio) * t_start + ratio * t_end;
-            
-            // Normalize the quaternion
-            q_interpolated.normalize();
-            
-            // Apply the inverse transform to map each point to the end scan
-            const auto& point = cloud->points[point_id];
-            Eigen::Vector3d p(point.x, point.y, point.z);
-            
-            // First transform to global frame using the interpolated pose
-            Eigen::Vector3d p_global = q_interpolated * p + t_interpolated;
-            
-            // Then transform back to the end scan frame
-            Eigen::Vector3d p_compensated = q_end.inverse() * (p_global - t_end);
-            
-            // Store the compensated point
-            compensated_cloud->points[point_id].x = p_compensated.x();
-            compensated_cloud->points[point_id].y = p_compensated.y();
-            compensated_cloud->points[point_id].z = p_compensated.z();
-            compensated_cloud->points[point_id].intensity = point.intensity;
-        }
-        
-        // Replace the original cloud with the compensated one
-        cloud = compensated_cloud;
-    }
-    
-    void extractFeatures(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, 
-                        const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
-        std::vector<ScanLine> scan_lines;
-        
-        // Check if the cloud has ring information
-        bool has_ring_field = false;
-        int ring_field_idx = -1;
-        
-        if (use_ring_field_) {
-            for (size_t i = 0; i < cloud_msg->fields.size(); ++i) {
-                if (cloud_msg->fields[i].name == "ring") {
-                    has_ring_field = true;
-                    ring_field_idx = i;
-                    break;
+            // Add a bit more forward motion if we've had consecutive frames with little motion
+            if (frames_without_motion_ > 5) {
+                Eigen::Vector3f translation = result.block<3,1>(0,3);
+                double motion_magnitude = translation.norm();
+                
+                // If previous motion was very small, add a minimum forward motion
+                if (motion_magnitude < 0.02) {
+                    // Assume forward is in x direction (adjust as needed for your coordinate system)
+                    result(0, 3) += 0.05; // 5cm forward
+                    result(1, 3) += 0.01 * ((frame_count_ % 3) - 1); // Small random lateral motion
+                    ROS_WARN("Adding minimum forward motion after %d static frames", frames_without_motion_);
                 }
             }
         }
         
-        if (has_ring_field && ring_field_idx >= 0) {
-            organizePointCloudByRing(cloud, scan_lines, cloud_msg, ring_field_idx);
+        return result;
+    }
+    
+    // Enhanced feature extraction with adaptive thresholds (FLOAM/A-LOAM style)
+    void extractFeatures(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud, 
+                        const sensor_msgs::PointCloud2ConstPtr& cloud_msg) {
+        std::vector<ScanLine> scan_lines;
+        
+        // Organize point cloud by ring or scan line
+        if (use_ring_field_) {
+            // Find ring field
+            int ring_field_idx = -1;
+            for (size_t i = 0; i < cloud_msg->fields.size(); ++i) {
+                if (cloud_msg->fields[i].name == "ring") {
+                    ring_field_idx = i;
+                    break;
+                }
+            }
+            
+            if (ring_field_idx >= 0) {
+                organizePointCloudByRing(cloud, scan_lines, cloud_msg, ring_field_idx);
+            } else {
+                organizeByScanAngles(cloud, scan_lines);
+            }
         } else if (use_laser_scan_lines_) {
             organizePointCloudByScanLines(cloud, scan_lines);
         } else {
             organizeByScanAngles(cloud, scan_lines);
         }
         
-        // Extract features from each scan line
+        // Extract features from each scan line with adaptive thresholds
+        int total_points = 0;
+        for (const auto& scan_line : scan_lines) {
+            total_points += scan_line.point_infos.size();
+        }
+        
+        // Clear feature clouds
+        edge_points_sharp_->clear();
+        edge_points_less_sharp_->clear();
+        surf_points_flat_->clear();
+        surf_points_less_flat_->clear();
+        
+        // Target numbers of features - these should be proportional to the scan density
+        int target_sharp_points = std::min(2000, total_points / 100); 
+        int target_less_sharp_points = std::min(4000, total_points / 50);
+        int target_flat_points = std::min(4000, total_points / 50);
+        int target_less_flat_points = std::min(8000, total_points / 20);
+        
+        // Process each scan line
         for (auto& scan_line : scan_lines) {
             if (scan_line.point_infos.size() < 20) {
                 continue;  // Skip scan lines with too few points
             }
             
+            // Calculate curvature for each point
+            calculateCurvatureForScanLine(scan_line);
+            
             // Sort points by curvature
             std::sort(scan_line.point_infos.begin(), scan_line.point_infos.end());
             
-            // Extract sharp edge points (high curvature) and flat surface points (low curvature)
-            int point_count = scan_line.point_infos.size();
+            // Calculate adaptive thresholds per scan line
+            float edge_threshold_for_line = calculateAdaptiveEdgeThreshold(scan_line);
+            float surf_threshold_for_line = calculateAdaptiveSurfThreshold(scan_line);
             
-            // Parameters to control feature extraction
-            int num_sharp_points = std::min(30, point_count / 8);  // Increased for HDL-32E
-            int num_flat_points = std::min(60, point_count / 4);   // Increased for HDL-32E
-            float sharp_min_distance = 0.15; // Min distance between sharp points (decreased for HDL-32E)
+            // Compute counts based on proportion of points in this line vs. total
+            float ratio = static_cast<float>(scan_line.point_infos.size()) / static_cast<float>(total_points);
+            int line_sharp_count = std::max(2, static_cast<int>(target_sharp_points * ratio));
+            int line_less_sharp_count = std::max(4, static_cast<int>(target_less_sharp_points * ratio));
+            int line_flat_count = std::max(4, static_cast<int>(target_flat_points * ratio));
+            int line_less_flat_count = std::max(8, static_cast<int>(target_less_flat_points * ratio));
             
-            // Extract sharp edge points
-            extractSharpPoints(scan_line.point_infos, num_sharp_points, sharp_min_distance);
+            // Extract sharp edge points (high curvature)
+            extractSharpPointsFromLine(scan_line, line_sharp_count, line_less_sharp_count, edge_threshold_for_line);
             
-            // Extract flat surface points
-            extractFlatPoints(scan_line.point_infos, num_flat_points);
+            // Extract flat surface points (low curvature)
+            extractFlatPointsFromLine(scan_line, line_flat_count, line_less_flat_count, surf_threshold_for_line);
         }
         
-        // Downsample feature clouds
+        // Downsample to ensure manageable feature counts while maintaining distribution
         downsampleFeatures();
         
         ROS_INFO("Extracted: %ld sharp corners, %ld less-sharp corners, %ld flat surfaces, %ld less-flat surfaces",
@@ -595,6 +738,176 @@ private:
         // Publish feature clouds for debugging if requested
         if (publish_debug_clouds_) {
             publishFeatureClouds();
+        }
+    }
+    
+    // Adaptive threshold calculations (FLOAM-inspired)
+    float calculateAdaptiveEdgeThreshold(const ScanLine& scan_line) {
+        if (scan_line.point_infos.size() < 20) return static_cast<float>(edge_threshold_);
+        
+        // Use percentile-based approach for more robust threshold estimation
+        int high_curvature_idx = std::max(0, static_cast<int>(scan_line.point_infos.size() * 0.9));
+        float high_curvature = scan_line.point_infos[high_curvature_idx].curvature;
+        
+        // Apply adaptive scaling but ensure minimum threshold
+        return std::max(static_cast<float>(edge_threshold_), high_curvature * 0.5f);
+    }
+
+    float calculateAdaptiveSurfThreshold(const ScanLine& scan_line) {
+        if (scan_line.point_infos.size() < 20) return static_cast<float>(surf_threshold_);
+        
+        // Use percentile-based approach for more robust threshold estimation
+        int low_curvature_idx = std::min(static_cast<int>(scan_line.point_infos.size() * 0.1), 
+                                        static_cast<int>(scan_line.point_infos.size()) - 1);
+        float low_curvature = scan_line.point_infos[low_curvature_idx].curvature;
+        
+        // Apply adaptive scaling but ensure minimum threshold
+        return std::max(static_cast<float>(surf_threshold_), low_curvature * 2.0f);
+    }
+    
+    void calculateCurvatureForScanLine(ScanLine& scan_line) {
+        int point_count = scan_line.point_infos.size();
+        if (point_count < 10) return;
+        
+        // Ensure points are sorted by orientation
+        std::sort(scan_line.point_infos.begin(), scan_line.point_infos.end(),
+                [](const PointInfo& a, const PointInfo& b) {
+                    return std::atan2(a.raw_point.y(), a.raw_point.x()) < std::atan2(b.raw_point.y(), b.raw_point.x());
+                });
+        
+        // Calculate curvature for each point using a window of points
+        for (int i = 5; i < point_count - 5; i++) {
+            float diff_x = scan_line.point_infos[i - 5].point.x() + scan_line.point_infos[i - 4].point.x() +
+                          scan_line.point_infos[i - 3].point.x() + scan_line.point_infos[i - 2].point.x() +
+                          scan_line.point_infos[i - 1].point.x() - 10 * scan_line.point_infos[i].point.x() +
+                          scan_line.point_infos[i + 1].point.x() + scan_line.point_infos[i + 2].point.x() +
+                          scan_line.point_infos[i + 3].point.x() + scan_line.point_infos[i + 4].point.x() +
+                          scan_line.point_infos[i + 5].point.x();
+            float diff_y = scan_line.point_infos[i - 5].point.y() + scan_line.point_infos[i - 4].point.y() +
+                          scan_line.point_infos[i - 3].point.y() + scan_line.point_infos[i - 2].point.y() +
+                          scan_line.point_infos[i - 1].point.y() - 10 * scan_line.point_infos[i].point.y() +
+                          scan_line.point_infos[i + 1].point.y() + scan_line.point_infos[i + 2].point.y() +
+                          scan_line.point_infos[i + 3].point.y() + scan_line.point_infos[i + 4].point.y() +
+                          scan_line.point_infos[i + 5].point.y();
+            float diff_z = scan_line.point_infos[i - 5].point.z() + scan_line.point_infos[i - 4].point.z() +
+                          scan_line.point_infos[i - 3].point.z() + scan_line.point_infos[i - 2].point.z() +
+                          scan_line.point_infos[i - 1].point.z() - 10 * scan_line.point_infos[i].point.z() +
+                          scan_line.point_infos[i + 1].point.z() + scan_line.point_infos[i + 2].point.z() +
+                          scan_line.point_infos[i + 3].point.z() + scan_line.point_infos[i + 4].point.z() +
+                          scan_line.point_infos[i + 5].point.z();
+            
+            scan_line.point_infos[i].curvature = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
+        }
+    }
+    
+    void extractSharpPointsFromLine(ScanLine& scan_line, int num_sharp, int num_less_sharp, float threshold) {
+        int point_count = scan_line.point_infos.size();
+        if (point_count < 10) return;
+        
+        // Points are already sorted by curvature (ascending)
+        int selected_sharp = 0;
+        int selected_less_sharp = 0;
+        
+        // Select sharp points from highest curvature
+        for (int i = point_count - 1; i >= 0 && (selected_sharp < num_sharp || selected_less_sharp < num_less_sharp); i--) {
+            if (scan_line.point_infos[i].curvature < threshold * 0.8) {
+                break; // Not sharp enough
+            }
+            
+            if (scan_line.point_infos[i].label != 0) {
+                continue; // Already labeled
+            }
+            
+            // Check if the point is far enough from already selected sharp points
+            bool is_far_enough = true;
+            if (selected_sharp > 0) {
+                for (int j = 0; j < point_count; j++) {
+                    if (scan_line.point_infos[j].label == 1) { // Check against already selected sharp points
+                        float dist = (scan_line.point_infos[i].raw_point - scan_line.point_infos[j].raw_point).norm();
+                        if (dist < feature_min_distance_) {
+                            is_far_enough = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Select as sharp if far enough and we need more sharp points
+            if (is_far_enough && selected_sharp < num_sharp) {
+                scan_line.point_infos[i].label = 1; // Mark as sharp
+                selected_sharp++;
+                
+                // Also add to clouds
+                int idx = scan_line.point_infos[i].index;
+                pcl::PointXYZI point = curr_cloud_raw_->points[idx];
+                edge_points_sharp_->push_back(point);
+                edge_points_less_sharp_->push_back(point);
+            } 
+            // Select as less-sharp if we need more less-sharp points
+            else if (selected_less_sharp < num_less_sharp) {
+                scan_line.point_infos[i].label = 2; // Mark as less-sharp
+                selected_less_sharp++;
+                
+                // Add to less-sharp cloud
+                int idx = scan_line.point_infos[i].index;
+                pcl::PointXYZI point = curr_cloud_raw_->points[idx];
+                edge_points_less_sharp_->push_back(point);
+            }
+        }
+    }
+    
+    void extractFlatPointsFromLine(ScanLine& scan_line, int num_flat, int num_less_flat, float threshold) {
+        int point_count = scan_line.point_infos.size();
+        if (point_count < 10) return;
+        
+        int selected_flat = 0;
+        int selected_less_flat = 0;
+        
+        // Select flat points from lowest curvature
+        for (int i = 0; i < point_count && (selected_flat < num_flat || selected_less_flat < num_less_flat); i++) {
+            if (scan_line.point_infos[i].curvature > threshold * 1.5) {
+                break; // Not flat enough
+            }
+            
+            if (scan_line.point_infos[i].label != 0) {
+                continue; // Already labeled
+            }
+            
+            // Check distance from existing flat points (similar to sharp points)
+            bool is_far_enough = true;
+            if (selected_flat > 0) {
+                for (int j = 0; j < point_count; j++) {
+                    if (scan_line.point_infos[j].label == 3) { // Check against already selected flat points
+                        float dist = (scan_line.point_infos[i].raw_point - scan_line.point_infos[j].raw_point).norm();
+                        if (dist < feature_min_distance_ * 2.0) { // Flat features can be closer
+                            is_far_enough = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Select as flat if far enough and we need more flat points
+            if (is_far_enough && selected_flat < num_flat) {
+                scan_line.point_infos[i].label = 3; // Mark as flat
+                selected_flat++;
+                
+                // Add to clouds
+                int idx = scan_line.point_infos[i].index;
+                pcl::PointXYZI point = curr_cloud_raw_->points[idx];
+                surf_points_flat_->push_back(point);
+                surf_points_less_flat_->push_back(point);
+            } 
+            // Select as less-flat if we need more less-flat points
+            else if (selected_less_flat < num_less_flat) {
+                scan_line.point_infos[i].label = 4; // Mark as less-flat
+                selected_less_flat++;
+                
+                // Add to less-flat cloud
+                int idx = scan_line.point_infos[i].index;
+                pcl::PointXYZI point = curr_cloud_raw_->points[idx];
+                surf_points_less_flat_->push_back(point);
+            }
         }
     }
     
@@ -648,9 +961,6 @@ private:
             
             scan_lines[ring].point_infos.push_back(point_info);
         }
-        
-        // Calculate curvature for each point in each scan line
-        calculateCurvatureForScanLines(scan_lines);
     }
     
     void organizePointCloudByScanLines(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud,
@@ -701,48 +1011,6 @@ private:
             scan_lines[scan_id].end_orientation = ori;
             
             scan_lines[scan_id].point_infos.push_back(point_info);
-        }
-        
-        // Calculate curvature for each point
-        calculateCurvatureForScanLines(scan_lines);
-    }
-    
-    void calculateCurvatureForScanLines(std::vector<ScanLine>& scan_lines) {
-        for (auto& scan_line : scan_lines) {
-            if (scan_line.point_infos.size() < 10) {
-                continue;
-            }
-            
-            // Ensure points are sorted by orientation
-            std::sort(scan_line.point_infos.begin(), scan_line.point_infos.end(),
-                    [](const PointInfo& a, const PointInfo& b) {
-                        return std::atan2(a.raw_point.y(), a.raw_point.x()) < std::atan2(b.raw_point.y(), b.raw_point.x());
-                    });
-            
-            // Calculate curvature for each point
-            int point_count = scan_line.point_infos.size();
-            for (int i = 5; i < point_count - 5; i++) {
-                float diff_x = scan_line.point_infos[i - 5].point.x() + scan_line.point_infos[i - 4].point.x() +
-                              scan_line.point_infos[i - 3].point.x() + scan_line.point_infos[i - 2].point.x() +
-                              scan_line.point_infos[i - 1].point.x() - 10 * scan_line.point_infos[i].point.x() +
-                              scan_line.point_infos[i + 1].point.x() + scan_line.point_infos[i + 2].point.x() +
-                              scan_line.point_infos[i + 3].point.x() + scan_line.point_infos[i + 4].point.x() +
-                              scan_line.point_infos[i + 5].point.x();
-                float diff_y = scan_line.point_infos[i - 5].point.y() + scan_line.point_infos[i - 4].point.y() +
-                              scan_line.point_infos[i - 3].point.y() + scan_line.point_infos[i - 2].point.y() +
-                              scan_line.point_infos[i - 1].point.y() - 10 * scan_line.point_infos[i].point.y() +
-                              scan_line.point_infos[i + 1].point.y() + scan_line.point_infos[i + 2].point.y() +
-                              scan_line.point_infos[i + 3].point.y() + scan_line.point_infos[i + 4].point.y() +
-                              scan_line.point_infos[i + 5].point.y();
-                float diff_z = scan_line.point_infos[i - 5].point.z() + scan_line.point_infos[i - 4].point.z() +
-                              scan_line.point_infos[i - 3].point.z() + scan_line.point_infos[i - 2].point.z() +
-                              scan_line.point_infos[i - 1].point.z() - 10 * scan_line.point_infos[i].point.z() +
-                              scan_line.point_infos[i + 1].point.z() + scan_line.point_infos[i + 2].point.z() +
-                              scan_line.point_infos[i + 3].point.z() + scan_line.point_infos[i + 4].point.z() +
-                              scan_line.point_infos[i + 5].point.z();
-                
-                scan_line.point_infos[i].curvature = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
-            }
         }
     }
     
@@ -816,132 +1084,40 @@ private:
             
             scan_lines[scan_id].point_infos.push_back(point_info);
         }
-        
-        // Calculate curvature for each scan line
-        calculateCurvatureForScanLines(scan_lines);
-    }
-    
-    void extractSharpPoints(std::vector<PointInfo>& point_infos, int num_points, float min_distance) {
-        int point_count = point_infos.size();
-        
-        // We're going to select points with highest curvature as sharp points
-        // Start from the point with highest curvature
-        int selected = 0;
-        for (int i = point_count - 1; i >= 0 && selected < num_points; i--) {
-            if (point_infos[i].curvature < edge_threshold_) {
-                break; // Not sharp enough
-            }
-            
-            // Check if it's far enough from already selected points
-            bool is_far_enough = true;
-            for (int j = 0; j < point_count; j++) {
-                if (point_infos[j].label == 1) { // Check against already selected sharp points
-                    float dist = (point_infos[i].raw_point - point_infos[j].raw_point).norm();
-                    if (dist < min_distance) {
-                        is_far_enough = false;
-                        break;
-                    }
-                }
-            }
-            
-            if (is_far_enough) {
-                point_infos[i].label = 1; // Mark as sharp
-                selected++;
-                
-                // Add to edge points
-                int idx = point_infos[i].index;
-                pcl::PointXYZI point = curr_cloud_raw_->points[idx];
-                edge_points_sharp_->push_back(point);
-                edge_points_less_sharp_->push_back(point);
-            }
-        }
-        
-        // Add more points as less-sharp
-        int max_less_sharp = num_points * 3;
-        int less_sharp_count = selected;
-        
-        for (int i = point_count - 1; i >= 0 && less_sharp_count < max_less_sharp; i--) {
-            if (point_infos[i].label != 0 || point_infos[i].curvature < edge_threshold_ * 0.5) {
-                continue;
-            }
-            
-            point_infos[i].label = 2; // Mark as less-sharp
-            less_sharp_count++;
-            
-            // Add to less-sharp points
-            int idx = point_infos[i].index;
-            pcl::PointXYZI point = curr_cloud_raw_->points[idx];
-            edge_points_less_sharp_->push_back(point);
-        }
-    }
-    
-    void extractFlatPoints(std::vector<PointInfo>& point_infos, int num_points) {
-        int point_count = point_infos.size();
-        
-        // Select points with lowest curvature as flat points
-        int selected = 0;
-        for (int i = 0; i < point_count && selected < num_points; i++) {
-            if (point_infos[i].curvature > surf_threshold_ || point_infos[i].label != 0) {
-                continue; // Not flat enough or already labeled
-            }
-            
-            point_infos[i].label = 3; // Mark as flat
-            selected++;
-            
-            // Add to flat points
-            int idx = point_infos[i].index;
-            pcl::PointXYZI point = curr_cloud_raw_->points[idx];
-            surf_points_flat_->push_back(point);
-            surf_points_less_flat_->push_back(point);
-        }
-        
-        // Add more points as less-flat
-        int max_less_flat = num_points * 4;
-        int less_flat_count = selected;
-        
-        for (int i = 0; i < point_count && less_flat_count < max_less_flat; i++) {
-            if (point_infos[i].label != 0 || point_infos[i].curvature > surf_threshold_ * 2) {
-                continue;
-            }
-            
-            point_infos[i].label = 4; // Mark as less-flat
-            less_flat_count++;
-            
-            // Add to less-flat points
-            int idx = point_infos[i].index;
-            pcl::PointXYZI point = curr_cloud_raw_->points[idx];
-            surf_points_less_flat_->push_back(point);
-        }
     }
     
     void downsampleFeatures() {
-        if (edge_points_less_sharp_->size() > 1000) {
+        // Only downsample if we have too many features
+        if (edge_points_less_sharp_->size() > 2000) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr edge_less_sharp_ds(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::VoxelGrid<pcl::PointXYZI> edge_downsize_filter;
-            edge_downsize_filter.setLeafSize(0.15, 0.15, 0.15);  // Smaller voxel size for HDL-32E
+            edge_downsize_filter.setLeafSize(0.2, 0.2, 0.2);  // A-LOAM uses larger voxels for efficiency
             edge_downsize_filter.setInputCloud(edge_points_less_sharp_);
             edge_downsize_filter.filter(*edge_less_sharp_ds);
             edge_points_less_sharp_ = edge_less_sharp_ds;
         }
         
-        if (surf_points_less_flat_->size() > 1000) {
+        if (surf_points_less_flat_->size() > 4000) {
             pcl::PointCloud<pcl::PointXYZI>::Ptr surf_less_flat_ds(new pcl::PointCloud<pcl::PointXYZI>());
             pcl::VoxelGrid<pcl::PointXYZI> surf_downsize_filter;
-            surf_downsize_filter.setLeafSize(0.3, 0.3, 0.3);  // Smaller voxel size for HDL-32E
+            surf_downsize_filter.setLeafSize(0.4, 0.4, 0.4);  // A-LOAM uses larger voxels for surfaces
             surf_downsize_filter.setInputCloud(surf_points_less_flat_);
             surf_downsize_filter.filter(*surf_less_flat_ds);
             surf_points_less_flat_ = surf_less_flat_ds;
         }
     }
     
+    // A-LOAM style optimization
     void optimizeOdometry(const Eigen::Quaterniond& q_init, const Eigen::Vector3d& t_init) {
+        // Initialize pose with initial guess
         {
             std::lock_guard<std::mutex> lock(pose_mutex_);
             q_w_curr_ = q_init;
             t_w_curr_ = t_init;
         }
         
-        // Multiple iterations of optimization
+        // Multiple iterations of Gauss-Newton optimization
+        int valid_iterations = 0;
         for (int iter = 0; iter < optimization_iterations_; iter++) {
             // Transform feature points to world frame for matching
             pcl::PointCloud<pcl::PointXYZI>::Ptr edge_points_world(new pcl::PointCloud<pcl::PointXYZI>());
@@ -953,63 +1129,298 @@ private:
                 transformPointCloud(surf_points_flat_, surf_points_world, q_w_curr_, t_w_curr_);
             }
             
-            // Setup optimization matrices
+            // Setup system matrices
             Eigen::Matrix<double, 6, 6> A = Eigen::Matrix<double, 6, 6>::Zero();
             Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Zero();
             
-            // Find correspondences and compute residuals
+            // Find edge and surface correspondences and accumulate into system
             int edge_factors = 0;
             int surf_factors = 0;
             
-            edge_factors = findEdgeFeatureCorrespondences(edge_points_world, A, b);
-            surf_factors = findSurfFeatureCorrespondences(surf_points_world, A, b);
+            if (use_aloam_factors_) {
+                edge_factors = findEdgeFactorsALOAM(edge_points_world, A, b);
+                surf_factors = findSurfFactorsALOAM(surf_points_world, A, b);
+            } else {
+                edge_factors = findEdgeFeatureCorrespondences(edge_points_world, A, b);
+                surf_factors = findSurfFeatureCorrespondences(surf_points_world, A, b);
+            }
+            
+            int total_factors = edge_factors + surf_factors;
             
             // Skip iteration if not enough correspondences
-            if (edge_factors + surf_factors < 10) {
+            if (total_factors < 50) {
                 ROS_WARN("Not enough correspondences: edge=%d, surf=%d", edge_factors, surf_factors);
                 continue;
             }
             
-            // Add damping to diagonal elements for stability
+            valid_iterations++;
+            
+            // Add regularization - Levenberg-Marquardt style
             for (int i = 0; i < 6; i++) {
-                A(i, i) += 0.1;
+                A(i, i) += system_noise_ * 1000;  // Higher regularization for stability
             }
             
-            // Solve the normal equation: Ax = b
-            Eigen::Matrix<double, 6, 1> x = A.ldlt().solve(-b);
+            // Solve system Ax = b 
+            Eigen::Matrix<double, 6, 1> dx = A.ldlt().solve(-b);
             
-            // Check for convergence
-            double delta_norm = x.norm();
-            if (delta_norm < 1e-6) {
-                ROS_INFO("Optimization converged at iteration %d", iter);
-                break;
+            // Check for convergence or invalid solution
+            if (!std::isfinite(dx.sum()) || !std::isfinite(dx.norm())) {
+                ROS_WARN("Invalid optimization solution");
+                continue;
             }
             
             // Update pose
             {
                 std::lock_guard<std::mutex> lock(pose_mutex_);
                 
-                // Apply translation update
-                t_w_curr_[0] += x(0);
-                t_w_curr_[1] += x(1);
-                t_w_curr_[2] += x(2);
+                // Update translation
+                t_w_curr_[0] += dx(0);
+                t_w_curr_[1] += dx(1);
+                t_w_curr_[2] += dx(2);
                 
-                // Apply rotation update
-                Eigen::AngleAxisd angle_axis(std::sqrt(x(3)*x(3) + x(4)*x(4) + x(5)*x(5)), 
-                                          Eigen::Vector3d(x(3), x(4), x(5)).normalized());
-                Eigen::Quaterniond dq(angle_axis);
-                q_w_curr_ = q_w_curr_ * dq;
+                // Update rotation using axis-angle
+                double angle = std::sqrt(dx(3)*dx(3) + dx(4)*dx(4) + dx(5)*dx(5));
+                Eigen::Vector3d axis;
+                
+                if (angle < 1e-10) {
+                    axis = Eigen::Vector3d(1, 0, 0); // Default axis if angle is too small
+                } else {
+                    axis = Eigen::Vector3d(dx(3), dx(4), dx(5)) / angle;
+                }
+                
+                Eigen::AngleAxisd rot(angle, axis);
+                q_w_curr_ = q_w_curr_ * Eigen::Quaterniond(rot);
                 q_w_curr_.normalize();
+            }
+            
+            // Report progress less frequently
+            if (iter % 4 == 0) {
+                double delta_norm = dx.norm();
                 
-                // Print progress
-                if (iter % 4 == 0) { // Only print every 4 iterations to reduce output
+                {
+                    std::lock_guard<std::mutex> lock(pose_mutex_);
                     ROS_INFO("Opt iter %d: pos=[%.3f, %.3f, %.3f], delta=%.6f, factors: edge=%d, surf=%d", 
-                            iter, t_w_curr_[0], t_w_curr_[1], t_w_curr_[2], delta_norm, edge_factors, surf_factors);
+                            iter, t_w_curr_[0], t_w_curr_[1], t_w_curr_[2], 
+                            delta_norm, edge_factors, surf_factors);
+                }
+                
+                // Check for convergence
+                if (delta_norm < 1e-6) {
+                    ROS_INFO("Optimization converged at iteration %d", iter);
+                    break;
                 }
             }
         }
+        
+        // If no valid iterations, keep the initial guess
+        if (valid_iterations == 0) {
+            std::lock_guard<std::mutex> lock(pose_mutex_);
+            q_w_curr_ = q_init;
+            t_w_curr_ = t_init;
+            ROS_WARN("No valid optimization iterations, keeping initial guess");
+        }
     }
     
+    // A-LOAM style edge factors
+    int findEdgeFactorsALOAM(const pcl::PointCloud<pcl::PointXYZI>::Ptr& edge_points,
+                           Eigen::Matrix<double, 6, 6>& A, 
+                           Eigen::Matrix<double, 6, 1>& b) {
+        int num_factors = 0;
+        
+        for (const auto& point : edge_points->points) {
+            std::vector<int> point_search_idx;
+            std::vector<float> point_search_sq_dist;
+            
+            // Find closest points in the map - ALOAM uses 5
+            kdtree_edge_map_->nearestKSearch(point, 5, point_search_idx, point_search_sq_dist);
+            
+            if (point_search_idx.size() < 5) continue;
+            
+            if (point_search_sq_dist[4] < 0.01) continue; // Too close
+            
+            // Calculate centroid of the five points
+            Eigen::Vector3d centroid(0, 0, 0);
+            for (int i = 0; i < 5; i++) {
+                centroid += Eigen::Vector3d(
+                    edge_points_map_local_->points[point_search_idx[i]].x,
+                    edge_points_map_local_->points[point_search_idx[i]].y,
+                    edge_points_map_local_->points[point_search_idx[i]].z
+                );
+            }
+            centroid /= 5.0;
+            
+            // Calculate covariance
+            Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+            
+            for (int i = 0; i < 5; i++) {
+                Eigen::Vector3d point_i(
+                    edge_points_map_local_->points[point_search_idx[i]].x,
+                    edge_points_map_local_->points[point_search_idx[i]].y,
+                    edge_points_map_local_->points[point_search_idx[i]].z
+                );
+                
+                Eigen::Vector3d zero_mean = point_i - centroid;
+                covariance += zero_mean * zero_mean.transpose();
+            }
+            
+            // Compute eigenvectors
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen_solver(covariance);
+            
+            if (eigen_solver.eigenvalues()[2] < 3 * eigen_solver.eigenvalues()[0]) {
+                continue; // Not a good line correspondence if eigenvalues are too similar
+            }
+            
+            // Get the dominant direction (eigenvector of largest eigenvalue)
+            Eigen::Vector3d line_direction = eigen_solver.eigenvectors().col(2);
+            
+            // Current point
+            Eigen::Vector3d curr_point(point.x, point.y, point.z);
+            
+            // Project the current point onto the line
+            Eigen::Vector3d projection = centroid + line_direction * line_direction.dot(curr_point - centroid);
+            
+            // Calculate point-to-line distance vector
+            Eigen::Vector3d distance_vector = curr_point - projection;
+            
+            // Skip if the distance is too large
+            if (distance_vector.norm() > 1.0) continue;
+            
+            // Calculate Jacobian matrix
+            Eigen::Matrix<double, 3, 6> jacobian;
+            
+            // Translation part of Jacobian
+            jacobian.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+            
+            // Rotation part - cross product of point and distance vector
+            {
+                std::lock_guard<std::mutex> lock(pose_mutex_);
+                Eigen::Vector3d point_transformed = q_w_curr_.toRotationMatrix() * curr_point;
+                jacobian.block<3, 3>(0, 3) = -skewSymmetric(point_transformed);
+            }
+            
+            // Weight for robust Gauss-Newton (Huber loss)
+            double weight = 1.0;
+            double dist = distance_vector.norm();
+            if (dist > 0.1) {
+                weight = 0.1 / dist;
+            }
+            
+            // Update Hessian and gradient
+            Eigen::Vector3d dist_unit = distance_vector.normalized();
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    A(i, j) += weight * jacobian.col(i).dot(dist_unit) * jacobian.col(j).dot(dist_unit);
+                }
+                b(i) += weight * jacobian.col(i).dot(dist_unit) * dist;
+            }
+            
+            num_factors++;
+        }
+        
+        return num_factors;
+    }
+    
+    // A-LOAM style surf factors
+    int findSurfFactorsALOAM(const pcl::PointCloud<pcl::PointXYZI>::Ptr& surf_points,
+                           Eigen::Matrix<double, 6, 6>& A, 
+                           Eigen::Matrix<double, 6, 1>& b) {
+        int num_factors = 0;
+        
+        for (const auto& point : surf_points->points) {
+            std::vector<int> point_search_idx;
+            std::vector<float> point_search_sq_dist;
+            
+            kdtree_surf_map_->nearestKSearch(point, 5, point_search_idx, point_search_sq_dist);
+            
+            if (point_search_idx.size() < 5) continue;
+            
+            if (point_search_sq_dist[4] < 0.01) continue; // Too close
+            
+            // Calculate plane parameters using PCA
+            Eigen::Matrix<double, 5, 3> matA0;
+            
+            // Fill matrix with points
+            for (int i = 0; i < 5; i++) {
+                matA0(i, 0) = surf_points_map_local_->points[point_search_idx[i]].x;
+                matA0(i, 1) = surf_points_map_local_->points[point_search_idx[i]].y;
+                matA0(i, 2) = surf_points_map_local_->points[point_search_idx[i]].z;
+            }
+            
+            // Compute centroid
+            Eigen::Vector3d centroid(0, 0, 0);
+            for (int i = 0; i < 5; i++) {
+                centroid += Eigen::Vector3d(matA0(i, 0), matA0(i, 1), matA0(i, 2));
+            }
+            centroid /= 5.0;
+            
+            // Compute covariance
+            Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+            for (int i = 0; i < 5; i++) {
+                Eigen::Vector3d point_i(matA0(i, 0), matA0(i, 1), matA0(i, 2));
+                Eigen::Vector3d zero_mean = point_i - centroid;
+                covariance += zero_mean * zero_mean.transpose();
+            }
+            
+            // Compute eigenvectors
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen_solver(covariance);
+            
+            // Check if the smallest eigenvalue is small enough (indicates a plane)
+            if (eigen_solver.eigenvalues()[0] > 0.02 * eigen_solver.eigenvalues()[2]) {
+                continue; // Not flat enough
+            }
+            
+            // Get the normal (eigenvector of smallest eigenvalue)
+            Eigen::Vector3d normal = eigen_solver.eigenvectors().col(0);
+            
+            // Ensure normal points outward (toward origin)
+            if (normal.dot(centroid) < 0) normal = -normal;
+            
+            // d component of plane equation ax + by + cz + d = 0
+            double d = -normal.dot(centroid);
+            
+            // Current point
+            Eigen::Vector3d curr_point(point.x, point.y, point.z);
+            
+            // Calculate signed point-to-plane distance
+            double dist = normal.dot(curr_point) + d;
+            
+            // Skip if the distance is too large
+            if (std::abs(dist) > 1.0) continue;
+            
+            // Calculate Jacobian
+            Eigen::Matrix<double, 1, 6> jacobian;
+            
+            // Translation part of Jacobian
+            jacobian.block<1, 3>(0, 0) = normal.transpose();
+            
+            // Rotation part
+            {
+                std::lock_guard<std::mutex> lock(pose_mutex_);
+                Eigen::Vector3d point_transformed = q_w_curr_.toRotationMatrix() * curr_point;
+                jacobian.block<1, 3>(0, 3) = (-skewSymmetric(point_transformed) * normal).transpose();
+            }
+            
+            // Weight for robust Gauss-Newton (Huber loss)
+            double weight = 1.0;
+            if (std::abs(dist) > 0.1) {
+                weight = 0.1 / std::abs(dist);
+            }
+            
+            // Update Hessian and gradient
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    A(i, j) += weight * jacobian(0, i) * jacobian(0, j);
+                }
+                b(i) += weight * jacobian(0, i) * dist;
+            }
+            
+            num_factors++;
+        }
+        
+        return num_factors;
+    }
+    
+    // Traditional correspondence finders (from original code)
     int findEdgeFeatureCorrespondences(const pcl::PointCloud<pcl::PointXYZI>::Ptr& edge_points,
                                      Eigen::Matrix<double, 6, 6>& A,
                                      Eigen::Matrix<double, 6, 1>& b) {
@@ -1221,9 +1632,12 @@ private:
         double angle = 2.0 * std::acos(std::min(1.0, std::abs(q_delta.w())));
         double dist = t_delta.norm();
         
-        // Return true if either rotation or translation exceeds threshold
-        if (angle > keyframe_angle_threshold_ || dist > keyframe_distance_threshold_) {
-            ROS_INFO("New keyframe: angle=%.2f, dist=%.2f", angle, dist);
+        // Also make every Nth frame a keyframe to ensure regular updates
+        bool time_keyframe = (frame_count_ % keyframe_time_interval_) == 0;
+        
+        // Return true if either rotation or translation exceeds threshold, or it's a time-based keyframe
+        if (angle > keyframe_angle_threshold_ || dist > keyframe_distance_threshold_ || time_keyframe) {
+            ROS_INFO("New keyframe: angle=%.2f, dist=%.2f, frame=%d", angle, dist, frame_count_);
             return true;
         }
         return false;
@@ -1396,10 +1810,10 @@ private:
 };
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "taslo_node");
+    ros::init(argc, argv, "loam_mapping_node");
     ros::NodeHandle nh("~");
     
-    ROS_INFO("Starting TASLO node optimized for HDL-32E...");
+    ROS_INFO("Starting TASLO node optimized for HDL-32E with A-LOAM/FLOAM approaches...");
     
     TASLO taslo(nh);
     
