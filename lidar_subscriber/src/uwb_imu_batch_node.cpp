@@ -14,6 +14,7 @@
 #include <cmath>
 #include <limits>
 #include <chrono>
+#include <novatel_msgs/INSPVAX.h>  // Added INSPVAX message header
 
 // Custom parameterization for pose (position + quaternion)
 class PoseParameterization : public ceres::LocalParameterization {
@@ -372,6 +373,69 @@ public:
 private:
     Eigen::Quaterniond yaw_only_quat_;
     double weight_;
+};
+
+// ==================== NEW: GPS-RELATED FACTORS ====================
+
+// GPS position factor for Ceres
+class GpsPositionFactor {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    GpsPositionFactor(const Eigen::Vector3d& measured_position, double noise_std)
+        : measured_position_(measured_position), noise_std_(noise_std) {}
+    
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        // Extract position from pose (position + quaternion)
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> position(pose);
+        
+        // Compute position residuals - weighted by noise standard deviation
+        residuals[0] = (position[0] - T(measured_position_[0])) / T(noise_std_);
+        residuals[1] = (position[1] - T(measured_position_[1])) / T(noise_std_);
+        residuals[2] = (position[2] - T(measured_position_[2])) / T(noise_std_);
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Vector3d& measured_position, double noise_std) {
+        return new ceres::AutoDiffCostFunction<GpsPositionFactor, 3, 7>(
+            new GpsPositionFactor(measured_position, noise_std));
+    }
+    
+private:
+    const Eigen::Vector3d measured_position_;
+    const double noise_std_;
+};
+
+// GPS velocity factor for Ceres
+class GpsVelocityFactor {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    GpsVelocityFactor(const Eigen::Vector3d& measured_velocity, double noise_std)
+        : measured_velocity_(measured_velocity), noise_std_(noise_std) {}
+    
+    template <typename T>
+    bool operator()(const T* const velocity, T* residuals) const {
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> vel(velocity);
+        
+        // Compute velocity residuals
+        residuals[0] = (vel[0] - T(measured_velocity_[0])) / T(noise_std_);
+        residuals[1] = (vel[1] - T(measured_velocity_[1])) / T(noise_std_);
+        residuals[2] = (vel[2] - T(measured_velocity_[2])) / T(noise_std_);
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Vector3d& measured_velocity, double noise_std) {
+        return new ceres::AutoDiffCostFunction<GpsVelocityFactor, 3, 3>(
+            new GpsVelocityFactor(measured_velocity, noise_std));
+    }
+    
+private:
+    const Eigen::Vector3d measured_velocity_;
+    const double noise_std_;
 };
 
 // ==================== MARGINALIZATION CLASSES ====================
@@ -940,7 +1004,7 @@ private:
     const double noise_std_;
 };
 
-// Main UWB-IMU fusion class
+// Main UWB/GPS-IMU fusion class
 class UwbImuFusion {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -950,10 +1014,25 @@ public:
         ros::NodeHandle private_nh("~");
         
         // Load topic name parameters
-        private_nh.param<std::string>("imu_topic", imu_topic_, "/sensor_simulator/imu_data");
+        private_nh.param<std::string>("imu_topic", imu_topic_, "/imu/data");
         private_nh.param<std::string>("uwb_topic", uwb_topic_, "/sensor_simulator/UWBPoistionPS");
         private_nh.param<int>("imu_queue_size", imu_queue_size_, 1000);
         private_nh.param<int>("uwb_queue_size", uwb_queue_size_, 100);
+        
+        // Add GPS/UWB mode selection
+        private_nh.param<bool>("use_gps_instead_of_uwb", use_gps_instead_of_uwb_, false);
+        
+        // Load GPS-related parameters
+        private_nh.param<std::string>("gps_topic", gps_topic_, "/novatel_data/inspvax");
+        private_nh.param<int>("gps_queue_size", gps_queue_size_, 100);
+        private_nh.param<double>("gps_position_noise", gps_position_noise_, 0.01); // 1cm - GPS is more accurate than UWB
+        private_nh.param<double>("gps_velocity_noise", gps_velocity_noise_, 0.01); // 1cm/s
+        
+        // Initialize GPS reference point
+        has_gps_reference_ = false;
+        ref_latitude_ = 0.0;
+        ref_longitude_ = 0.0;
+        ref_altitude_ = 0.0;
         
         // Load output topic parameters
         private_nh.param<std::string>("optimized_pose_topic", optimized_pose_topic_, "/uwb_imu_fusion/optimized_pose");
@@ -1030,9 +1109,21 @@ public:
         initial_acc_bias_ = Eigen::Vector3d(initial_acc_bias_x_, initial_acc_bias_y_, initial_acc_bias_z_);
         initial_gyro_bias_ = Eigen::Vector3d(initial_gyro_bias_x_, initial_gyro_bias_y_, initial_gyro_bias_z_);
         
-        // Initialize subscribers and publishers with configurable topics
+        // Initialize subscribers and publishers based on mode
         imu_sub_ = nh.subscribe(imu_topic_, imu_queue_size_, &UwbImuFusion::imuCallback, this);
-        uwb_sub_ = nh.subscribe(uwb_topic_, uwb_queue_size_, &UwbImuFusion::uwbCallback, this);
+        
+        if (use_gps_instead_of_uwb_) {
+            gps_sub_ = nh.subscribe(gps_topic_, gps_queue_size_, &UwbImuFusion::gpsCallback, this);
+            ROS_INFO("Using GPS+IMU fusion mode");
+            ROS_INFO("Subscribing to GPS topic: %s (queue: %d)", gps_topic_.c_str(), gps_queue_size_);
+            ROS_INFO("GPS noise: position=%.3f m, velocity=%.3f m/s", gps_position_noise_, gps_velocity_noise_);
+        } else {
+            uwb_sub_ = nh.subscribe(uwb_topic_, uwb_queue_size_, &UwbImuFusion::uwbCallback, this);
+            ROS_INFO("Using UWB+IMU fusion mode");
+            ROS_INFO("Subscribing to UWB topic: %s (queue: %d)", uwb_topic_.c_str(), uwb_queue_size_);
+            ROS_INFO("UWB position noise: %.3f m", uwb_position_noise_);
+        }
+        
         optimized_pose_pub_ = nh.advertise<nav_msgs::Odometry>(optimized_pose_topic_, optimized_pose_queue_size_);
         imu_pose_pub_ = nh.advertise<nav_msgs::Odometry>(imu_pose_topic_, imu_pose_queue_size_);
         
@@ -1052,9 +1143,8 @@ public:
         optimization_timer_ = nh.createTimer(ros::Duration(1.0/optimization_frequency_), 
                                            &UwbImuFusion::optimizationTimerCallback, this);
         
-        ROS_INFO("UWB-IMU Fusion node initialized with IMU-rate pose publishing");
+        ROS_INFO("UWB/GPS-IMU Fusion node initialized with IMU-rate pose publishing");
         ROS_INFO("Subscribing to IMU topic: %s (queue: %d)", imu_topic_.c_str(), imu_queue_size_);
-        ROS_INFO("Subscribing to UWB topic: %s (queue: %d)", uwb_topic_.c_str(), uwb_queue_size_);
         ROS_INFO("Publishing to optimized pose topic: %s", optimized_pose_topic_.c_str());
         ROS_INFO("Publishing to IMU pose topic: %s", imu_pose_topic_.c_str());
         ROS_INFO("IMU pre-integration using RK4 with max step size: %.4f sec", max_integration_dt_);
@@ -1092,6 +1182,22 @@ public:
     }
 
 private:
+    // GPS/UWB mode selection
+    bool use_gps_instead_of_uwb_;
+    
+    // GPS-related members
+    ros::Subscriber gps_sub_;
+    std::string gps_topic_;
+    int gps_queue_size_;
+    double gps_position_noise_;
+    double gps_velocity_noise_;
+
+    // GPS reference for ENU conversion
+    bool has_gps_reference_;
+    double ref_latitude_;
+    double ref_longitude_;
+    double ref_altitude_;
+
     // ROS subscribers and publishers
     ros::Subscriber imu_sub_;
     ros::Subscriber uwb_sub_;
@@ -1246,11 +1352,245 @@ private:
 
     std::vector<UwbMeasurement> uwb_measurements_;
 
+    // GPS measurements
+    struct GpsMeasurement {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        Eigen::Vector3d position;
+        Eigen::Vector3d velocity;
+        Eigen::Quaterniond orientation;
+        double timestamp;
+    };
+    std::vector<GpsMeasurement> gps_measurements_;
+
     // Mutex for thread safety
     std::mutex data_mutex_;
 
     // Gravity vector in world frame (ENU, Z-up)
     Eigen::Vector3d gravity_world_;
+    
+    // ==================== GPS-RELATED METHODS ====================
+
+    // Convert GPS lat/lon/alt to ENU coordinates
+    Eigen::Vector3d convertGpsToEnu(double latitude, double longitude, double altitude) {
+        // Convert from degrees to radians
+        double lat_rad = latitude * M_PI / 180.0;
+        double lon_rad = longitude * M_PI / 180.0;
+        double ref_lat_rad = ref_latitude_ * M_PI / 180.0;
+        double ref_lon_rad = ref_longitude_ * M_PI / 180.0;
+        
+        // Earth's radius in meters
+        const double R = 6378137.0; // WGS84 equatorial radius
+        
+        // Calculate ENU coordinates
+        // East component
+        double e = (longitude - ref_longitude_) * M_PI / 180.0 * R * cos(ref_lat_rad);
+        
+        // North component
+        double n = (latitude - ref_latitude_) * M_PI / 180.0 * R;
+        
+        // Up component
+        double u = altitude - ref_altitude_;
+        
+        return Eigen::Vector3d(e, n, u);
+    }
+
+    // GPS callback function
+    void gpsCallback(const novatel_msgs::INSPVAX::ConstPtr& msg) {
+        try {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            
+            // Use GPS seconds as timestamp
+            double timestamp = msg->header.gps_week_seconds;
+            
+            // Set reference point if not set yet
+            if (!has_gps_reference_) {
+                ref_latitude_ = msg->latitude;
+                ref_longitude_ = msg->longitude;
+                ref_altitude_ = msg->altitude;
+                has_gps_reference_ = true;
+                ROS_INFO("Set GPS reference: lat=%.7f, lon=%.7f, alt=%.3f", 
+                        ref_latitude_, ref_longitude_, ref_altitude_);
+            }
+            
+            // Convert GPS to ENU
+            Eigen::Vector3d enu_position = convertGpsToEnu(msg->latitude, msg->longitude, msg->altitude);
+            
+            // Get velocity (note: need to convert from NED to ENU)
+            // In ENU: East = X, North = Y, Up = Z
+            // In NED: North = X, East = Y, Down = Z
+            // So we need: ENU(X,Y,Z) = NED(Y,X,-Z)
+            Eigen::Vector3d enu_velocity(msg->east_velocity, msg->north_velocity, -msg->up_velocity);
+            
+            // Get orientation (roll, pitch, azimuth)
+            // Convert azimuth to a proper quaternion
+            // Azimuth is clockwise from North in degrees, need to convert to ENU yaw
+            double roll_rad = msg->roll * M_PI / 180.0;
+            double pitch_rad = msg->pitch * M_PI / 180.0;
+            double azimuth_rad = msg->azimuth * M_PI / 180.0;
+            
+            // Convert NED azimuth to ENU yaw
+            // yaw_enu = pi/2 - azimuth_ned
+            double yaw_enu = M_PI/2.0 - azimuth_rad;
+            
+            // Create quaternion from euler angles
+            Eigen::Quaterniond orientation = 
+                Eigen::AngleAxisd(yaw_enu, Eigen::Vector3d::UnitZ()) *
+                Eigen::AngleAxisd(pitch_rad, Eigen::Vector3d::UnitY()) *
+                Eigen::AngleAxisd(roll_rad, Eigen::Vector3d::UnitX());
+            
+            // Create GPS measurement
+            GpsMeasurement measurement;
+            measurement.position = enu_position;
+            measurement.velocity = enu_velocity;
+            measurement.orientation = orientation;
+            measurement.timestamp = timestamp;
+            
+            // Limit GPS buffer size
+            if (gps_measurements_.size() > 100) {
+                gps_measurements_.erase(gps_measurements_.begin(), gps_measurements_.begin() + 50);
+            }
+            
+            // Add to GPS measurements
+            gps_measurements_.push_back(measurement);
+            
+            // Initialize if not initialized and using GPS
+            if (!is_initialized_ && use_gps_instead_of_uwb_) {
+                ROS_INFO("Initializing system with GPS measurement at timestamp: %f", timestamp);
+                initializeFromGps(measurement);
+                is_initialized_ = true;
+                return;
+            }
+            
+            // Create keyframe if initialized and using GPS
+            if (is_initialized_ && has_imu_data_ && use_gps_instead_of_uwb_) {
+                createKeyframeFromGps(measurement);
+            }
+            
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in gpsCallback: %s", e.what());
+        }
+    }
+
+    // Initialize from GPS measurement
+    void initializeFromGps(const GpsMeasurement& gps) {
+        try {
+            // Initialize state using GPS position
+            current_state_.position = gps.position;
+            
+            // Use GPS orientation directly
+            current_state_.orientation = gps.orientation;
+            
+            // Use GPS velocity directly
+            current_state_.velocity = gps.velocity;
+            
+            // Initialize with proper non-zero biases
+            current_state_.acc_bias = initial_acc_bias_;
+            current_state_.gyro_bias = initial_gyro_bias_;
+            
+            current_state_.timestamp = gps.timestamp;
+            
+            state_window_.clear(); // Ensure clean state window
+            state_window_.push_back(current_state_);
+            
+            // Reset marginalization
+            if (last_marginalization_info_) {
+                delete last_marginalization_info_;
+                last_marginalization_info_ = nullptr;
+            }
+            
+            ROS_INFO("State initialized from GPS at position [%.2f, %.2f, %.2f]", 
+                    current_state_.position.x(), 
+                    current_state_.position.y(), 
+                    current_state_.position.z());
+            ROS_INFO("Initial velocity [%.2f, %.2f, %.2f] m/s",
+                    current_state_.velocity.x(), 
+                    current_state_.velocity.y(), 
+                    current_state_.velocity.z());
+            ROS_INFO("Initial orientation (roll, pitch, yaw) [%.2f, %.2f, %.2f] deg",
+                    quaternionToEulerDegrees(current_state_.orientation).x(), 
+                    quaternionToEulerDegrees(current_state_.orientation).y(), 
+                    quaternionToEulerDegrees(current_state_.orientation).z());
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in initializeFromGps: %s", e.what());
+        }
+    }
+
+    // Create keyframe from GPS measurement
+    void createKeyframeFromGps(const GpsMeasurement& gps) {
+        try {
+            // Skip if we already have a keyframe at this time
+            for (const auto& state : state_window_) {
+                if (std::abs(state.timestamp - gps.timestamp) < 0.005) {
+                    return; // Already have a keyframe for this GPS measurement
+                }
+            }
+            
+            // Skip if the state window is empty
+            if (state_window_.empty()) {
+                // Create initial keyframe from current state
+                State new_state = current_state_;
+                new_state.position = gps.position;
+                new_state.orientation = gps.orientation;
+                new_state.velocity = gps.velocity;
+                new_state.timestamp = gps.timestamp;
+                
+                state_window_.push_back(new_state);
+                ROS_DEBUG("Added first GPS-based keyframe at t=%.3f", gps.timestamp);
+                return;
+            }
+            
+            // Calculate the time difference from the previous keyframe
+            double dt = gps.timestamp - state_window_.back().timestamp;
+            
+            // Skip if the time difference is too small
+            if (dt < 0.01) {
+                return;
+            }
+            
+            // Compute the propagated state at the GPS timestamp
+            State propagated_state = propagateState(state_window_.back(), gps.timestamp);
+            
+            // Set the GPS position, orientation, and velocity
+            propagated_state.position = gps.position;
+            propagated_state.orientation = gps.orientation;
+            propagated_state.velocity = gps.velocity;
+            propagated_state.timestamp = gps.timestamp;
+            
+            // CRITICAL: Ensure biases are reasonable in the new keyframe
+            clampBiases(propagated_state.acc_bias, propagated_state.gyro_bias);
+            
+            // Add to state window, with marginalization if needed
+            if (state_window_.size() >= optimization_window_size_) {
+                if (enable_marginalization_) {
+                    // Prepare marginalization before removing the oldest state
+                    prepareMarginalization();
+                }
+                state_window_.pop_front();
+            }
+            
+            state_window_.push_back(propagated_state);
+            
+            // Update current state
+            current_state_ = propagated_state;
+            
+            // Update preintegration between the last two keyframes
+            if (state_window_.size() >= 2) {
+                size_t n = state_window_.size();
+                double start_time = state_window_[n-2].timestamp;
+                double end_time = state_window_[n-1].timestamp;
+                
+                // Store preintegration data for optimization
+                performPreintegrationBetweenKeyframes(start_time, end_time, 
+                                                     state_window_[n-2].acc_bias, 
+                                                     state_window_[n-2].gyro_bias);
+            }
+            
+        } catch (const std::exception& e) {
+            ROS_ERROR("Exception in createKeyframeFromGps: %s", e.what());
+        }
+    }
+    
+    // ==================== EXISTING METHODS WITH GPS SUPPORT ====================
     
     // Helper functions
     
@@ -1511,8 +1851,15 @@ private:
             
             state_window_.clear();
             uwb_measurements_.clear();
+            gps_measurements_.clear();  // Clear GPS measurements
             imu_buffer_.clear();
             preintegration_map_.clear();
+            
+            // Reset GPS reference point
+            has_gps_reference_ = false;
+            ref_latitude_ = 0.0;
+            ref_longitude_ = 0.0;
+            ref_altitude_ = 0.0;
             
             // Initialize gravity vector in world frame (ENU, Z points up)
             // In ENU frame, gravity points downward along negative Z axis
@@ -1576,6 +1923,11 @@ private:
     void uwbCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
         try {
             std::lock_guard<std::mutex> lock(data_mutex_);
+            
+            // Skip if we're in GPS mode
+            if (use_gps_instead_of_uwb_) {
+                return;
+            }
             
             // Store UWB position measurement
             UwbMeasurement measurement;
@@ -1802,20 +2154,52 @@ private:
                 bias_param2[4] = next_state.gyro_bias.y();
                 bias_param2[5] = next_state.gyro_bias.z();
                 
-                // Add UWB position factor for the oldest state
-                for (const auto& uwb : uwb_measurements_) {
-                    if (std::abs(uwb.timestamp - oldest_state.timestamp) < 0.01) {
-                        // Create UWB factor
-                        ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
-                            uwb.position, uwb_position_noise_);
-                        
-                        std::vector<double*> parameter_blocks = {pose_param1};
-                        std::vector<int> drop_set = {0}; // Drop the pose parameter
-                        
-                        auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                            uwb_factor, nullptr, parameter_blocks, drop_set);
-                        marginalization_info->addResidualBlockInfo(residual_info);
-                        break;
+                // Add position factor for the oldest state based on fusion mode
+                if (use_gps_instead_of_uwb_) {
+                    // Add GPS position factor
+                    for (const auto& gps : gps_measurements_) {
+                        if (std::abs(gps.timestamp - oldest_state.timestamp) < 0.01) {
+                            // Add GPS position factor
+                            ceres::CostFunction* gps_factor = GpsPositionFactor::Create(
+                                gps.position, gps_position_noise_);
+                            
+                            std::vector<double*> parameter_blocks = {pose_param1};
+                            std::vector<int> drop_set = {0}; // Drop the pose parameter
+                            
+                            auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
+                                gps_factor, nullptr, parameter_blocks, drop_set);
+                            marginalization_info->addResidualBlockInfo(residual_info);
+                            
+                            // Also add GPS velocity factor
+                            ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
+                                gps.velocity, gps_velocity_noise_);
+                            
+                            std::vector<double*> vel_parameter_blocks = {vel_param1};
+                            std::vector<int> vel_drop_set = {0}; // Drop the velocity parameter
+                            
+                            auto* vel_residual_info = new MarginalizationInfo::ResidualBlockInfo(
+                                gps_vel_factor, nullptr, vel_parameter_blocks, vel_drop_set);
+                            marginalization_info->addResidualBlockInfo(vel_residual_info);
+                            
+                            break;
+                        }
+                    }
+                } else {
+                    // Add UWB position factor
+                    for (const auto& uwb : uwb_measurements_) {
+                        if (std::abs(uwb.timestamp - oldest_state.timestamp) < 0.01) {
+                            // Create UWB factor
+                            ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
+                                uwb.position, uwb_position_noise_);
+                            
+                            std::vector<double*> parameter_blocks = {pose_param1};
+                            std::vector<int> drop_set = {0}; // Drop the pose parameter
+                            
+                            auto* residual_info = new MarginalizationInfo::ResidualBlockInfo(
+                                uwb_factor, nullptr, parameter_blocks, drop_set);
+                            marginalization_info->addResidualBlockInfo(residual_info);
+                            break;
+                        }
                     }
                 }
                 
@@ -2752,70 +3136,53 @@ private:
                 return;
             }
             
-            // Reset to UWB position if large position drift detected
-            if (!uwb_measurements_.empty() && !state_window_.empty()) {
-                const auto& latest_uwb = uwb_measurements_.back();
-                const auto& latest_state = state_window_.back();
-                
-                double position_error_z = std::abs(latest_state.position.z() - latest_uwb.position.z());
-                double position_error_xy = (latest_state.position.head<2>() - latest_uwb.position.head<2>()).norm();
-                
-                // Adjust position drift threshold for high-speed scenarios
-                double adaptive_drift_threshold = 1.0; // Default threshold
-                double velocity_norm = latest_state.velocity.norm();
-                
-                // Increase allowable drift at higher speeds
-                if (velocity_norm > 10.0) {
-                    adaptive_drift_threshold = 1.0 + (velocity_norm - 10.0) * 0.1;
-                    adaptive_drift_threshold = std::min(adaptive_drift_threshold, 3.0); // Cap at 3 meters
+            // Reset position if large drift detected
+            if (use_gps_instead_of_uwb_) {
+                // Check GPS drift
+                if (!gps_measurements_.empty() && !state_window_.empty()) {
+                    const auto& latest_gps = gps_measurements_.back();
+                    auto& latest_state = state_window_.back();
+                    
+                    double position_error = (latest_state.position - latest_gps.position).norm();
+                    
+                    // Adjust drift threshold based on velocity
+                    double adaptive_drift_threshold = 1.0; // Default threshold
+                    double velocity_norm = latest_state.velocity.norm();
+                    
+                    // Increase allowable drift at higher speeds
+                    if (velocity_norm > 10.0) {
+                        adaptive_drift_threshold = 1.0 + (velocity_norm - 10.0) * 0.1;
+                        adaptive_drift_threshold = std::min(adaptive_drift_threshold, 3.0); // Cap at 3 meters
+                    }
+                    
+                    if (position_error > adaptive_drift_threshold) {
+                        ROS_WARN("Position drift detected in GPS mode: %.2f meters. Resetting position.", position_error);
+                        resetStateToGps(latest_gps);
+                    }
                 }
-                
-                if (position_error_z > adaptive_drift_threshold || position_error_xy > adaptive_drift_threshold) {
-                    ROS_WARN("Position drift detected: Z=%.2f meters, XY=%.2f meters. Resetting to UWB position.", 
-                             position_error_z, position_error_xy);
+            } else {
+                // Check UWB drift
+                if (!uwb_measurements_.empty() && !state_window_.empty()) {
+                    const auto& latest_uwb = uwb_measurements_.back();
+                    auto& latest_state = state_window_.back();
                     
-                    // Create a reset state that keeps orientation and biases but uses UWB position
-                    State reset_state = latest_state;
-                    reset_state.position = latest_uwb.position;
+                    double position_error_z = std::abs(latest_state.position.z() - latest_uwb.position.z());
+                    double position_error_xy = (latest_state.position.head<2>() - latest_uwb.position.head<2>()).norm();
                     
-                    // Keep existing velocity direction but reduce magnitude
-                    if (reset_state.velocity.norm() > 0.1) {
-                        reset_state.velocity.normalize();
-                        reset_state.velocity *= std::min(min_horizontal_velocity_ * 2.0, velocity_norm * 0.5);
-                    } else {
-                        // Initialize with horizontal velocity in direction of orientation if velocity is very small
-                        double yaw = atan2(2.0 * (reset_state.orientation.w() * reset_state.orientation.z() + 
-                                        reset_state.orientation.x() * reset_state.orientation.y()),
-                                 1.0 - 2.0 * (reset_state.orientation.y() * reset_state.orientation.y() + 
-                                          reset_state.orientation.z() * reset_state.orientation.z()));
-                        
-                        reset_state.velocity.x() = min_horizontal_velocity_ * cos(yaw);
-                        reset_state.velocity.y() = min_horizontal_velocity_ * sin(yaw);
-                        reset_state.velocity.z() = 0;
+                    // Adjust position drift threshold for high-speed scenarios
+                    double adaptive_drift_threshold = 1.0; // Default threshold
+                    double velocity_norm = latest_state.velocity.norm();
+                    
+                    // Increase allowable drift at higher speeds
+                    if (velocity_norm > 10.0) {
+                        adaptive_drift_threshold = 1.0 + (velocity_norm - 10.0) * 0.1;
+                        adaptive_drift_threshold = std::min(adaptive_drift_threshold, 3.0); // Cap at 3 meters
                     }
                     
-                    // Reset all states in the window
-                    for (auto& state : state_window_) {
-                        State new_state = reset_state;
-                        new_state.timestamp = state.timestamp;
-                        
-                        // Keep original biases
-                        new_state.acc_bias = state.acc_bias;
-                        new_state.gyro_bias = state.gyro_bias;
-                        
-                        // Ensure biases are reasonable
-                        clampBiases(new_state.acc_bias, new_state.gyro_bias);
-                        
-                        state = new_state;
-                    }
-                    
-                    current_state_ = reset_state;
-                    preintegration_map_.clear();
-                    
-                    // Reset marginalization as well
-                    if (last_marginalization_info_) {
-                        delete last_marginalization_info_;
-                        last_marginalization_info_ = nullptr;
+                    if (position_error_z > adaptive_drift_threshold || position_error_xy > adaptive_drift_threshold) {
+                        ROS_WARN("Position drift detected: Z=%.2f meters, XY=%.2f meters. Resetting to UWB position.", 
+                                position_error_z, position_error_xy);
+                        resetStateToUwb(latest_uwb);
                     }
                 }
             }
@@ -2879,6 +3246,87 @@ private:
         }
     }
 
+    // Reset state to UWB if drift is too large
+    void resetStateToUwb(const UwbMeasurement& uwb) {
+        // Create a reset state that keeps orientation and biases but uses UWB position
+        State reset_state = current_state_;
+        reset_state.position = uwb.position;
+        
+        // Keep existing velocity direction but reduce magnitude
+        double velocity_norm = reset_state.velocity.norm();
+        if (velocity_norm > 0.1) {
+            reset_state.velocity.normalize();
+            reset_state.velocity *= std::min(min_horizontal_velocity_ * 2.0, velocity_norm * 0.5);
+        } else {
+            // Initialize with horizontal velocity in direction of orientation if velocity is very small
+            double yaw = atan2(2.0 * (reset_state.orientation.w() * reset_state.orientation.z() + 
+                           reset_state.orientation.x() * reset_state.orientation.y()),
+                    1.0 - 2.0 * (reset_state.orientation.y() * reset_state.orientation.y() + 
+                             reset_state.orientation.z() * reset_state.orientation.z()));
+            
+            reset_state.velocity.x() = min_horizontal_velocity_ * cos(yaw);
+            reset_state.velocity.y() = min_horizontal_velocity_ * sin(yaw);
+            reset_state.velocity.z() = 0;
+        }
+        
+        // Reset all states in the window
+        for (auto& state : state_window_) {
+            State new_state = reset_state;
+            new_state.timestamp = state.timestamp;
+            
+            // Keep original biases
+            new_state.acc_bias = state.acc_bias;
+            new_state.gyro_bias = state.gyro_bias;
+            
+            // Ensure biases are reasonable
+            clampBiases(new_state.acc_bias, new_state.gyro_bias);
+            
+            state = new_state;
+        }
+        
+        current_state_ = reset_state;
+        preintegration_map_.clear();
+        
+        // Reset marginalization as well
+        if (last_marginalization_info_) {
+            delete last_marginalization_info_;
+            last_marginalization_info_ = nullptr;
+        }
+    }
+
+    // Reset state to GPS if drift is too large
+    void resetStateToGps(const GpsMeasurement& gps) {
+        // Create a reset state that uses GPS data
+        State reset_state = current_state_;
+        reset_state.position = gps.position;
+        reset_state.orientation = gps.orientation;
+        reset_state.velocity = gps.velocity;
+        
+        // Reset all states in the window
+        for (auto& state : state_window_) {
+            State new_state = reset_state;
+            new_state.timestamp = state.timestamp;
+            
+            // Keep original biases
+            new_state.acc_bias = state.acc_bias;
+            new_state.gyro_bias = state.gyro_bias;
+            
+            // Ensure biases are reasonable
+            clampBiases(new_state.acc_bias, new_state.gyro_bias);
+            
+            state = new_state;
+        }
+        
+        current_state_ = reset_state;
+        preintegration_map_.clear();
+        
+        // Reset marginalization as well
+        if (last_marginalization_info_) {
+            delete last_marginalization_info_;
+            last_marginalization_info_ = nullptr;
+        }
+    }
+
     void initializeFromUwb(const UwbMeasurement& uwb) {
         try {
             // Initialize state using UWB position
@@ -2938,7 +3386,7 @@ private:
         }
     }
 
-    // Factor graph optimization with fixed marginalization
+    // Modified optimizeFactorGraph to handle both UWB and GPS data
     bool optimizeFactorGraph() {
         if (state_window_.size() < 2) {
             return false;
@@ -3009,20 +3457,49 @@ private:
                 }
             }
             
-            // Add UWB position factors
-            for (size_t i = 0; i < state_window_.size(); ++i) {
-                double keyframe_time = state_window_[i].timestamp;
-                
-                // Find matching UWB measurement
-                for (const auto& uwb : uwb_measurements_) {
-                    if (std::abs(uwb.timestamp - keyframe_time) < 0.01) { // 10ms tolerance
-                        ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
-                            uwb.position, uwb_position_noise_);
-                        
-                        // Use HuberLoss for robustness
-                        ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1);
-                        problem.AddResidualBlock(uwb_factor, loss_function, variables[i].pose);
-                        break;
+            // Add position measurements based on fusion mode
+            if (use_gps_instead_of_uwb_) {
+                // Add GPS position factors
+                for (size_t i = 0; i < state_window_.size(); ++i) {
+                    double keyframe_time = state_window_[i].timestamp;
+                    
+                    // Find matching GPS measurement
+                    for (const auto& gps : gps_measurements_) {
+                        if (std::abs(gps.timestamp - keyframe_time) < 0.01) { // 10ms tolerance
+                            // Add position factor
+                            ceres::CostFunction* gps_pos_factor = GpsPositionFactor::Create(
+                                gps.position, gps_position_noise_);
+                            
+                            problem.AddResidualBlock(gps_pos_factor, new ceres::HuberLoss(0.1), variables[i].pose);
+                            
+                            // Add velocity factor if velocity constraints are enabled
+                            if (enable_velocity_constraint_) {
+                                ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
+                                    gps.velocity, gps_velocity_noise_);
+                                
+                                problem.AddResidualBlock(gps_vel_factor, new ceres::HuberLoss(0.1), variables[i].velocity);
+                            }
+                            
+                            break;
+                        }
+                    }
+                }
+            } else {
+                // Original UWB position factors
+                for (size_t i = 0; i < state_window_.size(); ++i) {
+                    double keyframe_time = state_window_[i].timestamp;
+                    
+                    // Find matching UWB measurement
+                    for (const auto& uwb : uwb_measurements_) {
+                        if (std::abs(uwb.timestamp - keyframe_time) < 0.01) { // 10ms tolerance
+                            ceres::CostFunction* uwb_factor = UwbPositionFactor::Create(
+                                uwb.position, uwb_position_noise_);
+                            
+                            // Use HuberLoss for robustness
+                            ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1);
+                            problem.AddResidualBlock(uwb_factor, loss_function, variables[i].pose);
+                            break;
+                        }
                     }
                 }
             }

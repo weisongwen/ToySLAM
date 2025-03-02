@@ -30,6 +30,7 @@ find_package(catkin REQUIRED COMPONENTS
 
   geometry_msgs
   sensor_msgs
+  novatel_msgs
 )
 
 find_package(absl REQUIRED)
