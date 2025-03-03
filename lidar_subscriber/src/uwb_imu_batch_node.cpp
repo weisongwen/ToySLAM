@@ -390,6 +390,57 @@ class YawOnlyOrientationFactor {
         double weight_;
     };
 
+// NEW: GPS Orientation Factor for full orientation constraint
+class GpsOrientationFactor {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    
+    GpsOrientationFactor(const Eigen::Quaterniond& measured_orientation, double noise_std)
+        : measured_orientation_(measured_orientation.normalized()), noise_std_(noise_std) {}
+    
+    template <typename T>
+    bool operator()(const T* const pose, T* residuals) const {
+        // Extract orientation quaternion from pose
+        Eigen::Map<const Eigen::Quaternion<T>> q(pose + 3);
+        Eigen::Quaternion<T> q_normalized = q.normalized();
+        
+        // Convert measured orientation to template type
+        Eigen::Quaternion<T> q_measured = measured_orientation_.template cast<T>();
+        
+        // Compute orientation difference
+        Eigen::Quaternion<T> q_diff = q_normalized.conjugate() * q_measured;
+        
+        // Convert to axis-angle representation
+        T angle = T(2.0) * acos(std::min(std::max(q_diff.w(), T(-1.0)), T(1.0)));
+        
+        // Extract rotation axis from quaternion difference
+        Eigen::Matrix<T, 3, 1> axis;
+        T axis_norm = q_diff.vec().norm();
+        
+        if (axis_norm > T(1e-10)) {
+            axis = q_diff.vec() / axis_norm;
+        } else {
+            axis = Eigen::Matrix<T, 3, 1>(T(1.0), T(0.0), T(0.0));
+        }
+        
+        // Residuals are proportional to rotation angle along each axis
+        residuals[0] = (angle * axis[0]) / T(noise_std_);
+        residuals[1] = (angle * axis[1]) / T(noise_std_);
+        residuals[2] = (angle * axis[2]) / T(noise_std_);
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Quaterniond& measured_orientation, double noise_std) {
+        return new ceres::AutoDiffCostFunction<GpsOrientationFactor, 3, 7>(
+            new GpsOrientationFactor(measured_orientation, noise_std));
+    }
+    
+private:
+    const Eigen::Quaterniond measured_orientation_;
+    const double noise_std_;
+};
+
 // ==================== GPS-RELATED FACTORS ====================
 
 // GPS position factor for Ceres
@@ -1042,6 +1093,12 @@ public:
         private_nh.param<int>("gps_queue_size", gps_queue_size_, 100);
         private_nh.param<double>("gps_position_noise", gps_position_noise_, 0.01); // 1cm - GPS is more accurate than UWB
         private_nh.param<double>("gps_velocity_noise", gps_velocity_noise_, 0.01); // 1cm/s
+        private_nh.param<double>("gps_orientation_noise", gps_orientation_noise_, 0.1); // rad
+        
+        // GPS data usage configuration
+        private_nh.param<bool>("use_gps_orientation_as_initial", use_gps_orientation_as_initial_, true);
+        private_nh.param<bool>("use_gps_orientation_as_constraint", use_gps_orientation_as_constraint_, false);
+        private_nh.param<bool>("use_gps_velocity", use_gps_velocity_, true);
         
         // Initialize GPS reference point
         has_gps_reference_ = false;
@@ -1131,7 +1188,12 @@ public:
             gps_sub_ = nh.subscribe(gps_topic_, gps_queue_size_, &UwbImuFusion::gpsCallback, this);
             ROS_INFO("Using GPS+IMU fusion mode");
             ROS_INFO("Subscribing to GPS topic: %s (queue: %d)", gps_topic_.c_str(), gps_queue_size_);
-            ROS_INFO("GPS noise: position=%.3f m, velocity=%.3f m/s", gps_position_noise_, gps_velocity_noise_);
+            ROS_INFO("GPS noise: position=%.3f m, velocity=%.3f m/s, orientation=%.3f rad", 
+                    gps_position_noise_, gps_velocity_noise_, gps_orientation_noise_);
+            ROS_INFO("GPS orientation usage: as initial=%s, as constraint=%s", 
+                    use_gps_orientation_as_initial_ ? "enabled" : "disabled",
+                    use_gps_orientation_as_constraint_ ? "enabled" : "disabled");
+            ROS_INFO("GPS velocity usage: %s", use_gps_velocity_ ? "enabled" : "disabled");
         } else {
             uwb_sub_ = nh.subscribe(uwb_topic_, uwb_queue_size_, &UwbImuFusion::uwbCallback, this);
             ROS_INFO("Using UWB+IMU fusion mode");
@@ -1201,12 +1263,18 @@ private:
     // GPS/UWB mode selection
     bool use_gps_instead_of_uwb_;
     
+    // GPS data usage configuration
+    bool use_gps_orientation_as_initial_;
+    bool use_gps_orientation_as_constraint_;
+    bool use_gps_velocity_;
+    
     // GPS-related members
     ros::Subscriber gps_sub_;
     std::string gps_topic_;
     int gps_queue_size_;
     double gps_position_noise_;
     double gps_velocity_noise_;
+    double gps_orientation_noise_;
 
     // GPS reference for ENU conversion
     bool has_gps_reference_;
@@ -1599,11 +1667,44 @@ private:
             // Initialize state using GPS position
             current_state_.position = gps.position;
             
-            // Use GPS orientation directly
-            current_state_.orientation = gps.orientation;
+            // Use GPS orientation only if configured
+            if (use_gps_orientation_as_initial_) {
+                current_state_.orientation = gps.orientation;
+            } else {
+                // Use a default orientation (or keep previous if available)
+                if (current_state_.orientation.w() == 0) {
+                    current_state_.orientation = Eigen::Quaterniond::Identity();
+                }
+                // Try to find IMU orientation if available
+                sensor_msgs::Imu closest_imu = findClosestImuMeasurement(gps.timestamp);
+                if (closest_imu.header.stamp.toSec() > 0 && 
+                    closest_imu.orientation_covariance[0] != -1) {
+                    current_state_.orientation = Eigen::Quaterniond(
+                        closest_imu.orientation.w,
+                        closest_imu.orientation.x,
+                        closest_imu.orientation.y,
+                        closest_imu.orientation.z
+                    ).normalized();
+                    ROS_INFO("Using IMU orientation for initialization");
+                }
+            }
             
-            // Use GPS velocity directly
-            current_state_.velocity = gps.velocity;
+            // Use GPS velocity only if configured
+            if (use_gps_velocity_) {
+                current_state_.velocity = gps.velocity;
+            } else {
+                // Initialize with minimum horizontal velocity in current orientation direction
+                double yaw = atan2(2.0 * (current_state_.orientation.w() * current_state_.orientation.z() + 
+                                current_state_.orientation.x() * current_state_.orientation.y()),
+                               1.0 - 2.0 * (current_state_.orientation.y() * current_state_.orientation.y() + 
+                                          current_state_.orientation.z() * current_state_.orientation.z()));
+                
+                current_state_.velocity = Eigen::Vector3d(
+                    min_horizontal_velocity_ * cos(yaw),
+                    min_horizontal_velocity_ * sin(yaw),
+                    0.0
+                );
+            }
             
             // Initialize with proper non-zero biases
             current_state_.acc_bias = initial_acc_bias_;
@@ -1627,14 +1728,16 @@ private:
                     current_state_.position.x(), 
                     current_state_.position.y(), 
                     current_state_.position.z());
-            ROS_INFO("Initial velocity [%.2f, %.2f, %.2f] m/s",
+            ROS_INFO("Initial velocity [%.2f, %.2f, %.2f] m/s (%s)",
                     current_state_.velocity.x(), 
                     current_state_.velocity.y(), 
-                    current_state_.velocity.z());
-            ROS_INFO("Initial orientation (roll, pitch, yaw) [%.2f, %.2f, %.2f] deg",
+                    current_state_.velocity.z(),
+                    use_gps_velocity_ ? "from GPS" : "estimated");
+            ROS_INFO("Initial orientation (roll, pitch, yaw) [%.2f, %.2f, %.2f] deg (%s)",
                     quaternionToEulerDegrees(current_state_.orientation).x(), 
                     quaternionToEulerDegrees(current_state_.orientation).y(), 
-                    quaternionToEulerDegrees(current_state_.orientation).z());
+                    quaternionToEulerDegrees(current_state_.orientation).z(),
+                    use_gps_orientation_as_initial_ ? "from GPS" : "from IMU/default");
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in initializeFromGps: %s", e.what());
         }
@@ -1655,8 +1758,27 @@ private:
                 // Create initial keyframe from current state
                 State new_state = current_state_;
                 new_state.position = gps.position;
-                new_state.orientation = gps.orientation;
-                new_state.velocity = gps.velocity;
+                
+                if (use_gps_orientation_as_initial_) {
+                    new_state.orientation = gps.orientation;
+                } else {
+                    // Keep current orientation or try to use IMU
+                    sensor_msgs::Imu closest_imu = findClosestImuMeasurement(gps.timestamp);
+                    if (closest_imu.header.stamp.toSec() > 0 && 
+                        closest_imu.orientation_covariance[0] != -1) {
+                        new_state.orientation = Eigen::Quaterniond(
+                            closest_imu.orientation.w,
+                            closest_imu.orientation.x,
+                            closest_imu.orientation.y,
+                            closest_imu.orientation.z
+                        ).normalized();
+                    }
+                }
+                
+                if (use_gps_velocity_) {
+                    new_state.velocity = gps.velocity;
+                }
+                
                 new_state.timestamp = gps.timestamp;
                 
                 state_window_.push_back(new_state);
@@ -1675,10 +1797,19 @@ private:
             // Compute the propagated state at the GPS timestamp
             State propagated_state = propagateState(state_window_.back(), gps.timestamp);
             
-            // Set the GPS position, orientation, and velocity
+            // Set the GPS position
             propagated_state.position = gps.position;
-            propagated_state.orientation = gps.orientation;
-            propagated_state.velocity = gps.velocity;
+            
+            // Set orientation only if configured to use GPS orientation
+            if (use_gps_orientation_as_initial_) {
+                propagated_state.orientation = gps.orientation;
+            }
+            
+            // Set velocity only if configured to use GPS velocity
+            if (use_gps_velocity_) {
+                propagated_state.velocity = gps.velocity;
+            }
+            
             propagated_state.timestamp = gps.timestamp;
             
             // CRITICAL: Ensure biases are reasonable in the new keyframe
@@ -2385,16 +2516,31 @@ private:
                                 gps_factor, nullptr, parameter_blocks, drop_set);
                             marginalization_info->addResidualBlockInfo(residual_info);
                             
-                            // Also add GPS velocity factor
-                            ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
-                                gps.velocity, gps_velocity_noise_);
+                            // Also add GPS velocity factor if enabled
+                            if (use_gps_velocity_) {
+                                ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
+                                    gps.velocity, gps_velocity_noise_);
+                                
+                                std::vector<double*> vel_parameter_blocks = {vel_param1};
+                                std::vector<int> vel_drop_set = {0}; // Drop the velocity parameter
+                                
+                                auto* vel_residual_info = new MarginalizationInfo::ResidualBlockInfo(
+                                    gps_vel_factor, nullptr, vel_parameter_blocks, vel_drop_set);
+                                marginalization_info->addResidualBlockInfo(vel_residual_info);
+                            }
                             
-                            std::vector<double*> vel_parameter_blocks = {vel_param1};
-                            std::vector<int> vel_drop_set = {0}; // Drop the velocity parameter
-                            
-                            auto* vel_residual_info = new MarginalizationInfo::ResidualBlockInfo(
-                                gps_vel_factor, nullptr, vel_parameter_blocks, vel_drop_set);
-                            marginalization_info->addResidualBlockInfo(vel_residual_info);
+                            // Add GPS orientation factor if enabled
+                            if (use_gps_orientation_as_constraint_) {
+                                ceres::CostFunction* orientation_factor = GpsOrientationFactor::Create(
+                                    gps.orientation, gps_orientation_noise_);
+                                
+                                std::vector<double*> ori_parameter_blocks = {pose_param1};
+                                std::vector<int> ori_drop_set = {0}; // Drop the pose parameter
+                                
+                                auto* ori_residual_info = new MarginalizationInfo::ResidualBlockInfo(
+                                    orientation_factor, nullptr, ori_parameter_blocks, ori_drop_set);
+                                marginalization_info->addResidualBlockInfo(ori_residual_info);
+                            }
                             
                             break;
                         }
@@ -3609,8 +3755,31 @@ ROS_ERROR("Exception in performPreintegrationBetweenKeyframes: %s", e.what());
         // Create a reset state that uses GPS data
         State reset_state = current_state_;
         reset_state.position = gps.position;
-        reset_state.orientation = gps.orientation;
-        reset_state.velocity = gps.velocity;
+        
+        if (use_gps_orientation_as_initial_) {
+            reset_state.orientation = gps.orientation;
+        }
+        
+        if (use_gps_velocity_) {
+            reset_state.velocity = gps.velocity;
+        } else {
+            // Keep existing velocity direction but reduce magnitude
+            double velocity_norm = reset_state.velocity.norm();
+            if (velocity_norm > 0.1) {
+                reset_state.velocity.normalize();
+                reset_state.velocity *= std::min(min_horizontal_velocity_ * 2.0, velocity_norm * 0.5);
+            } else {
+                // Initialize with horizontal velocity in direction of orientation if velocity is very small
+                double yaw = atan2(2.0 * (reset_state.orientation.w() * reset_state.orientation.z() + 
+                               reset_state.orientation.x() * reset_state.orientation.y()),
+                        1.0 - 2.0 * (reset_state.orientation.y() * reset_state.orientation.y() + 
+                                 reset_state.orientation.z() * reset_state.orientation.z()));
+                
+                reset_state.velocity.x() = min_horizontal_velocity_ * cos(yaw);
+                reset_state.velocity.y() = min_horizontal_velocity_ * sin(yaw);
+                reset_state.velocity.z() = 0;
+            }
+        }
         
         // Reset all states in the window
         for (auto& state : state_window_) {
@@ -3635,6 +3804,10 @@ ROS_ERROR("Exception in performPreintegrationBetweenKeyframes: %s", e.what());
             delete last_marginalization_info_;
             last_marginalization_info_ = nullptr;
         }
+        
+        ROS_INFO("State reset to GPS: position=[%.2f, %.2f, %.2f], using orientation=%s, velocity=%s",
+                reset_state.position.x(), reset_state.position.y(), reset_state.position.z(),
+                use_gps_orientation_as_initial_ ? "true" : "false", use_gps_velocity_ ? "true" : "false");
     }
 
     void initializeFromUwb(const UwbMeasurement& uwb) {
@@ -3800,12 +3973,20 @@ ROS_ERROR("Exception in performPreintegrationBetweenKeyframes: %s", e.what());
                             
                             problem.AddResidualBlock(gps_pos_factor, new ceres::HuberLoss(0.1), variables[i].pose);
                             
-                            // Add velocity factor if velocity constraints are enabled
-                            if (enable_velocity_constraint_) {
+                            // Add velocity factor if configured to use GPS velocity
+                            if (use_gps_velocity_ && enable_velocity_constraint_) {
                                 ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
                                     gps.velocity, gps_velocity_noise_);
                                 
                                 problem.AddResidualBlock(gps_vel_factor, new ceres::HuberLoss(0.1), variables[i].velocity);
+                            }
+                            
+                            // Add orientation factor if configured to use GPS orientation as constraint
+                            if (use_gps_orientation_as_constraint_) {
+                                ceres::CostFunction* orientation_factor = GpsOrientationFactor::Create(
+                                    gps.orientation, gps_orientation_noise_);
+                                
+                                problem.AddResidualBlock(orientation_factor, new ceres::HuberLoss(0.2), variables[i].pose);
                             }
                             
                             break;
@@ -4176,7 +4357,7 @@ ROS_ERROR("Exception in performPreintegrationBetweenKeyframes: %s", e.what());
 
 int main(int argc, char **argv) {
     try {
-        ros::init(argc, argv, "uwb_imu_fusion_node");
+        ros::init(argc, argv, "uwb_imu_batch_node");
         
         {
             UwbImuFusion fusion; 

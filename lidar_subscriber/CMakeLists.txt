@@ -156,6 +156,14 @@ target_link_libraries(RangingRC ${catkin_LIBRARIES} ${CERES_LIBRARIES}
   OpenMP::OpenMP_CXX
 )
 
+add_executable(user_teleop_node src/user_teleop.cpp)
+target_link_libraries(user_teleop_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+)
+
 
 add_executable(uwb_imu_batch_node src/uwb_imu_batch_node.cpp)
 target_link_libraries(uwb_imu_batch_node ${catkin_LIBRARIES} ${CERES_LIBRARIES}

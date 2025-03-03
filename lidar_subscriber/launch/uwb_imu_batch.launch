@@ -1,36 +1,31 @@
 <launch>
-    <!-- Mode Selection -->
-    <arg name="use_gps_instead_of_uwb" default="true" /> <!-- Set to true for GPS/IMU mode, false for UWB/IMU mode -->
+    <!-- Mode selection -->
+    <arg name="use_gps" default="true" />
     
-    <!-- Node Configuration -->
+    <!-- GPS data usage configuration -->
+    <arg name="use_gps_orientation_as_initial" default="true" 
+         doc="Use GPS orientation as initial guess for keyframes" />
+    <arg name="use_gps_orientation_as_constraint" default="false" 
+         doc="Use GPS orientation as a constraint in optimization" />
+    <arg name="use_gps_velocity" default="false" 
+         doc="Use GPS velocity as measurement" />
+
+    <!-- Topic names -->
     <arg name="imu_topic" default="/imu/data" />
+    <arg name="gps_topic" default="/novatel_data/inspvax" />
     <arg name="uwb_topic" default="/sensor_simulator/UWBPoistionPS" />
-    <arg name="gps_topic" default="/novatel_data/inspvax" /> <!-- Added GPS topic -->
-    <arg name="imu_queue_size" default="1000" />
-    <arg name="uwb_queue_size" default="100" />
-    <arg name="gps_queue_size" default="100" /> <!-- Added GPS queue size -->
-    
-    <!-- Output topics -->
-    <arg name="optimized_pose_topic" default="/uwb_imu_fusion/optimized_pose" />
-    <arg name="imu_pose_topic" default="/uwb_imu_fusion/imu_pose" />
     
     <!-- Frame IDs -->
     <arg name="world_frame_id" default="map" />
     <arg name="body_frame_id" default="base_link" />
     
-    <!-- Core Parameters -->
-    <arg name="gravity_magnitude" default="9.81" />
-    <arg name="optimization_window_size" default="20" />
-    <arg name="max_iterations" default="10" />
-    <arg name="optimization_frequency" default="10.0" />
-    
-    <!-- IMU parameters -->
-    <arg name="imu_acc_noise" default="0.03" />
-    <arg name="imu_gyro_noise" default="0.002" />
-    <arg name="imu_acc_bias_noise" default="0.0001" />
-    <arg name="imu_gyro_bias_noise" default="0.00001" />
-    <arg name="acc_bias_max" default="0.1" />
-    <arg name="gyro_bias_max" default="0.01" />
+    <!-- Noise parameters -->
+    <arg name="imu_acc_noise" default="0.03" />    <!-- m/s² -->
+    <arg name="imu_gyro_noise" default="0.002" />  <!-- rad/s -->
+    <arg name="gps_position_noise" default="0.1" /> <!-- m -->
+    <arg name="gps_velocity_noise" default="0.1" /> <!-- m/s -->
+    <arg name="gps_orientation_noise" default="0.1" /> <!-- rad -->
+    <arg name="uwb_position_noise" default="0.1" /> <!-- m -->
     
     <!-- Initial bias values -->
     <arg name="initial_acc_bias_x" default="0.05" />
@@ -40,19 +35,12 @@
     <arg name="initial_gyro_bias_y" default="-0.001" />
     <arg name="initial_gyro_bias_z" default="0.001" />
     
-    <!-- UWB parameters -->
-    <arg name="uwb_position_noise" default="0.05" />
+    <!-- Optimization parameters -->
+    <arg name="optimization_window_size" default="20" />
+    <arg name="optimization_frequency" default="10.0" />
+    <arg name="max_iterations" default="10" />
     
-    <!-- GPS parameters -->
-    <arg name="gps_position_noise" default="0.01" /> <!-- Added GPS position noise (cm-level) -->
-    <arg name="gps_velocity_noise" default="0.01" /> <!-- Added GPS velocity noise -->
-    
-    <!-- Velocity and motion constraints -->
-    <arg name="max_velocity" default="25.0" /> <!-- 90 km/h max velocity -->
-    <arg name="min_horizontal_velocity" default="0.5" />
-    <arg name="max_imu_dt" default="0.5" />
-    
-    <!-- Feature toggles -->
+    <!-- Enable/disable features -->
     <arg name="enable_bias_estimation" default="true" />
     <arg name="enable_marginalization" default="true" />
     <arg name="enable_roll_pitch_constraint" default="true" />
@@ -60,9 +48,17 @@
     <arg name="enable_orientation_smoothness_factor" default="true" />
     <arg name="enable_velocity_constraint" default="true" />
     <arg name="enable_horizontal_velocity_incentive" default="true" />
-    <arg name="enable_imu_orientation_factor" default="true" />
+    <arg name="enable_imu_orientation_factor" default="false" />
+
+    <!-- Velocity constraints -->
+    <arg name="max_velocity" default="25.0" /> <!-- m/s = 90 km/h -->
+    <arg name="min_horizontal_velocity" default="0.5" /> <!-- m/s -->
     
-    <!-- Constraint weights -->
+    <!-- Integration parameters -->
+    <arg name="max_integration_dt" default="0.005" />
+    <arg name="bias_correction_threshold" default="0.05" />
+    
+    <!-- Factor weights -->
     <arg name="roll_pitch_weight" default="300.0" />
     <arg name="imu_orientation_weight" default="50.0" />
     <arg name="bias_constraint_weight" default="1000.0" />
@@ -70,45 +66,31 @@
     <arg name="horizontal_velocity_weight" default="10.0" />
     <arg name="orientation_smoothness_weight" default="100.0" />
     <arg name="gravity_alignment_weight" default="150.0" />
-    
-    <!-- Integration parameters -->
-    <arg name="max_integration_dt" default="0.005" /> <!-- Reduced for high-speed scenarios -->
-    <arg name="min_integration_dt" default="1e-8" />
-    <arg name="bias_correction_threshold" default="0.05" />
-    <arg name="imu_buffer_time_length" default="10.0" />
 
-    <!-- Launch the fusion node with all configurable parameters -->
-    <node pkg="ToySLAM" type="uwb_imu_batch_node" name="uwb_imu_batch_node" output="screen">
-        <!-- Fusion Mode Selection -->
-        <param name="use_gps_instead_of_uwb" value="$(arg use_gps_instead_of_uwb)" />
-        
-        <!-- Topic Configuration -->
+    <!-- UWB/GPS-IMU Fusion Node with correct package and node name -->
+    <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen">
+        <!-- Topic configuration -->
         <param name="imu_topic" value="$(arg imu_topic)" />
-        <param name="uwb_topic" value="$(arg uwb_topic)" />
         <param name="gps_topic" value="$(arg gps_topic)" />
-        <param name="imu_queue_size" value="$(arg imu_queue_size)" />
-        <param name="uwb_queue_size" value="$(arg uwb_queue_size)" />
-        <param name="gps_queue_size" value="$(arg gps_queue_size)" />
-        <param name="optimized_pose_topic" value="$(arg optimized_pose_topic)" />
-        <param name="imu_pose_topic" value="$(arg imu_pose_topic)" />
-        
-        <!-- Frame IDs -->
+        <param name="uwb_topic" value="$(arg uwb_topic)" />
         <param name="world_frame_id" value="$(arg world_frame_id)" />
         <param name="body_frame_id" value="$(arg body_frame_id)" />
         
-        <!-- Core Parameters -->
-        <param name="gravity_magnitude" value="$(arg gravity_magnitude)" />
-        <param name="optimization_window_size" value="$(arg optimization_window_size)" />
-        <param name="max_iterations" value="$(arg max_iterations)" />
-        <param name="optimization_frequency" value="$(arg optimization_frequency)" />
+        <!-- Mode selection -->
+        <param name="use_gps_instead_of_uwb" value="$(arg use_gps)" />
         
-        <!-- IMU parameters -->
+        <!-- GPS data usage configuration -->
+        <param name="use_gps_orientation_as_initial" value="$(arg use_gps_orientation_as_initial)" />
+        <param name="use_gps_orientation_as_constraint" value="$(arg use_gps_orientation_as_constraint)" />
+        <param name="use_gps_velocity" value="$(arg use_gps_velocity)" />
+        
+        <!-- Noise parameters -->
         <param name="imu_acc_noise" value="$(arg imu_acc_noise)" />
         <param name="imu_gyro_noise" value="$(arg imu_gyro_noise)" />
-        <param name="imu_acc_bias_noise" value="$(arg imu_acc_bias_noise)" />
-        <param name="imu_gyro_bias_noise" value="$(arg imu_gyro_bias_noise)" />
-        <param name="acc_bias_max" value="$(arg acc_bias_max)" />
-        <param name="gyro_bias_max" value="$(arg gyro_bias_max)" />
+        <param name="gps_position_noise" value="$(arg gps_position_noise)" />
+        <param name="gps_velocity_noise" value="$(arg gps_velocity_noise)" />
+        <param name="gps_orientation_noise" value="$(arg gps_orientation_noise)" />
+        <param name="uwb_position_noise" value="$(arg uwb_position_noise)" />
         
         <!-- Initial bias values -->
         <param name="initial_acc_bias_x" value="$(arg initial_acc_bias_x)" />
@@ -118,19 +100,12 @@
         <param name="initial_gyro_bias_y" value="$(arg initial_gyro_bias_y)" />
         <param name="initial_gyro_bias_z" value="$(arg initial_gyro_bias_z)" />
         
-        <!-- UWB parameters -->
-        <param name="uwb_position_noise" value="$(arg uwb_position_noise)" />
+        <!-- Optimization parameters -->
+        <param name="optimization_window_size" value="$(arg optimization_window_size)" />
+        <param name="optimization_frequency" value="$(arg optimization_frequency)" />
+        <param name="max_iterations" value="$(arg max_iterations)" />
         
-        <!-- GPS parameters -->
-        <param name="gps_position_noise" value="$(arg gps_position_noise)" />
-        <param name="gps_velocity_noise" value="$(arg gps_velocity_noise)" />
-        
-        <!-- Velocity and motion constraints -->
-        <param name="max_velocity" value="$(arg max_velocity)" />
-        <param name="min_horizontal_velocity" value="$(arg min_horizontal_velocity)" />
-        <param name="max_imu_dt" value="$(arg max_imu_dt)" />
-        
-        <!-- Feature toggles -->
+        <!-- Enable/disable features -->
         <param name="enable_bias_estimation" value="$(arg enable_bias_estimation)" />
         <param name="enable_marginalization" value="$(arg enable_marginalization)" />
         <param name="enable_roll_pitch_constraint" value="$(arg enable_roll_pitch_constraint)" />
@@ -139,8 +114,16 @@
         <param name="enable_velocity_constraint" value="$(arg enable_velocity_constraint)" />
         <param name="enable_horizontal_velocity_incentive" value="$(arg enable_horizontal_velocity_incentive)" />
         <param name="enable_imu_orientation_factor" value="$(arg enable_imu_orientation_factor)" />
+
+        <!-- Velocity constraints -->
+        <param name="max_velocity" value="$(arg max_velocity)" />
+        <param name="min_horizontal_velocity" value="$(arg min_horizontal_velocity)" />
         
-        <!-- Constraint weights -->
+        <!-- Integration parameters -->
+        <param name="max_integration_dt" value="$(arg max_integration_dt)" />
+        <param name="bias_correction_threshold" value="$(arg bias_correction_threshold)" />
+        
+        <!-- Factor weights -->
         <param name="roll_pitch_weight" value="$(arg roll_pitch_weight)" />
         <param name="imu_orientation_weight" value="$(arg imu_orientation_weight)" />
         <param name="bias_constraint_weight" value="$(arg bias_constraint_weight)" />
@@ -148,11 +131,5 @@
         <param name="horizontal_velocity_weight" value="$(arg horizontal_velocity_weight)" />
         <param name="orientation_smoothness_weight" value="$(arg orientation_smoothness_weight)" />
         <param name="gravity_alignment_weight" value="$(arg gravity_alignment_weight)" />
-        
-        <!-- Integration parameters -->
-        <param name="max_integration_dt" value="$(arg max_integration_dt)" />
-        <param name="min_integration_dt" value="$(arg min_integration_dt)" />
-        <param name="bias_correction_threshold" value="$(arg bias_correction_threshold)" />
-        <param name="imu_buffer_time_length" value="$(arg imu_buffer_time_length)" />
     </node>
 </launch>
