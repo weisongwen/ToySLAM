@@ -1,53 +1,45 @@
 <launch>
-  <!-- Launch UWB Ray Tracer Node -->
+  <!-- Launch UWB Ray Tracing Node with Moving User -->
   <node name="RangingRC" pkg="ToySLAM" type="RangingRC" output="screen">
     <!-- Ray tracing parameters -->
-    <param name="max_reflections" value="3"/>
-    <param name="max_distance" value="200.0"/>
-    <param name="min_signal_power" value="-95.0"/>  <!-- More lenient signal threshold -->
+    <param name="max_reflections" value="2"/>
+    <param name="max_distance" value="150.0"/>
+    <param name="min_signal_power" value="-90.0"/>
     <param name="noise_floor" value="-100.0"/>
-    <param name="update_rate" value="10.0"/>
     <param name="fixed_frame" value="map"/>
-    
-    <!-- Debug mode to print additional information -->
     <param name="debug_mode" value="true"/>
+    <param name="slow_mode" value="true"/>
+    <param name="force_reflections" value="true"/>
+    <param name="special_check_enabled" value="true"/>
+    <param name="penetration_samples" value="20"/>
     
-    <!-- Visualization parameters with enhanced visibility -->
-    <param name="building_alpha" value="0.5"/>  <!-- More transparent buildings -->
-    <param name="path_width" value="0.2"/>      <!-- Thicker paths for better visibility -->
-    <param name="show_building_faces" value="true"/> <!-- Show building faces -->
+    <!-- Visualization parameters -->
+    <param name="building_alpha" value="0.5"/>
+    <param name="path_width" value="0.2"/>
     
-    <!-- Environment parameters -->
-    <param name="road_length" value="150.0"/>
-    <param name="road_width" value="8.0"/>
+    <!-- Road and environment parameters -->
+    <param name="road_length" value="100.0"/>
+    <param name="road_width" value="10.0"/>
     <param name="sidewalk_width" value="3.0"/>
-    <param name="building_spacing" value="5.0"/>
-    <param name="building_height_min" value="5.0"/>
-    <param name="building_height_max" value="15.0"/>
+    <param name="building_height_min" value="10.0"/>
+    <param name="building_height_max" value="20.0"/>
     <param name="building_width_min" value="10.0"/>
-    <param name="building_width_max" value="25.0"/>
-    <param name="building_depth_min" value="10.0"/>
-    <param name="building_depth_max" value="15.0"/>
-    <param name="buildings_per_side" value="6.0"/>
-    <param name="beacon_height" value="12.0"/>  <!-- Higher beacons -->
+    <param name="building_width_max" value="15.0"/>
+    <param name="building_depth_min" value="8.0"/>
+    <param name="building_depth_max" value="12.0"/>
+    <param name="buildings_per_side" value="12.0"/>
+    <param name="beacon_height" value="15.0"/>
     
-    <!-- Beacon parameters -->
-    <param name="beacon_range" value="200.0"/>  <!-- Increased range -->
-    <param name="beacon_frequency" value="6500.0"/> <!-- 6.5 GHz -->
-    <param name="beacon_power" value="20.0"/>  <!-- Higher power for better reflections -->
+    <!-- User movement parameters -->
+    <param name="enable_user_movement" value="true"/>
+    <param name="movement_type" value="circuit"/> <!-- Options: circuit, circle, figure8 -->
+    <param name="movement_speed" value="0.5"/> <!-- meters per second, slow enough for ray tracing -->
+    <param name="movement_radius" value="4.0"/> <!-- Used for circle and figure8 paths -->
+    <param name="movement_height" value="1.7"/> <!-- Height of user (meters) -->
+    <param name="movement_period" value="60.0"/> <!-- Time to complete one cycle (seconds) -->
     
-    <!-- Enhanced reflection visibility -->
-    <param name="force_reflections" value="true"/>  <!-- Force reflection paths to be shown -->
-    <param name="high_contrast_colors" value="true"/>  <!-- Use high contrast colors -->
-  </node>
-  
-  <!-- Add a simple user position controller that moves in a figure-8 pattern -->
-  <node name="user_teleop_node" pkg="ToySLAM" type="user_teleop_node" output="screen">
-    <param name="path_length" value="80.0"/>
-    <param name="path_width" value="6.0"/>
-    <param name="z_height" value="1.7"/>
-    <param name="speed" value="0.1"/>  <!-- Slower movement for better observation -->
-    <param name="update_rate" value="30.0"/>
+    <!-- Update rates -->
+    <param name="update_rate" value="2.0"/> <!-- Visualization update rate -->
   </node>
   
   <!-- Launch RViz with configuration -->

@@ -22,7 +22,7 @@
     <!-- Noise parameters -->
     <arg name="imu_acc_noise" default="0.03" />    <!-- m/s² -->
     <arg name="imu_gyro_noise" default="0.002" />  <!-- rad/s -->
-    <arg name="gps_position_noise" default="0.1" /> <!-- m -->
+    <arg name="gps_position_noise" default="0.5" /> <!-- m -->
     <arg name="gps_velocity_noise" default="0.1" /> <!-- m/s -->
     <arg name="gps_orientation_noise" default="0.1" /> <!-- rad -->
     <arg name="uwb_position_noise" default="0.1" /> <!-- m -->
@@ -66,6 +66,12 @@
     <arg name="horizontal_velocity_weight" default="10.0" />
     <arg name="orientation_smoothness_weight" default="100.0" />
     <arg name="gravity_alignment_weight" default="150.0" />
+    
+    <!-- Add visualization parameter -->
+    <arg name="rviz" default="true" />
+
+    <!-- Launch RViz with a configuration for trajectory visualization -->
+    <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(find ToySLAM)/rviz/gps_trajectory.rviz" />
 
     <!-- UWB/GPS-IMU Fusion Node with correct package and node name -->
     <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen">
