@@ -1,13 +1,15 @@
 /**
- * UWB Ray Tracing ROS Node - With Moving User and Building Penetration Prevention
+ * GPS Satellite Signal Simulator ROS Node - With Rigorous Range Measurements
  * 
  * Features:
+ * - Precise physical calculation of pseudorange measurements
+ * - Accurate modeling of all error sources (ionosphere, troposphere, multipath, clock bias)
  * - User moves along a configurable slow trajectory
- * - Fixed building penetration detection for all paths
- * - Signal paths update as user moves
- * - Reflections follow the laws of physics
- * - 10 UWB beacons with direct and reflection paths
- * - Visualization of all signal paths and reflection points
+ * - Buildings on both sides affect satellite signals
+ * - At least 8 GPS satellites with realistic orbital positions, all with positive elevation
+ * - Simulates direct line-of-sight, blocked signals, and multipath
+ * - Signal strength calculation based on satellite elevation and building blockage
+ * - Comprehensive visualization of GPS signal characteristics
  */
 
  #include <ros/ros.h>
@@ -34,7 +36,10 @@
      Eigen::Vector3d center;
      Eigen::Vector3d dimensions;
      Eigen::Vector3d color;
-     double reflectivity;
+     double signal_attenuation; // Signal attenuation in dB
+     double reflectivity;       // Reflection coefficient (0-1)
+     
+     Building() : signal_attenuation(30.0), reflectivity(0.6) {}
      
      Eigen::Vector3d min() const {
          return center - dimensions/2;
@@ -51,7 +56,6 @@
          Eigen::Vector3d dimensions; // Dimensions of the face (width, height)
          Eigen::Vector3d tangent;    // Tangent vector (horizontal)
          Eigen::Vector3d bitangent;  // Bitangent vector (vertical)
-         bool is_active;             // Whether this face is currently reflecting
      };
      
      std::vector<BuildingFace> getFaces() const {
@@ -65,8 +69,7 @@
              Eigen::Vector3d(0, -1, 0),                           // Normal
              Eigen::Vector3d(dimensions.x(), dimensions.z(), 0),  // Dimensions (width, height)
              Eigen::Vector3d(1, 0, 0),                            // Tangent (x-direction)
-             Eigen::Vector3d(0, 0, 1),                            // Bitangent (z-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 0, 1)                             // Bitangent (z-direction)
          });
          
          // Back face (normal = +y)
@@ -75,8 +78,7 @@
              Eigen::Vector3d(0, 1, 0),                            // Normal
              Eigen::Vector3d(dimensions.x(), dimensions.z(), 0),  // Dimensions (width, height)
              Eigen::Vector3d(1, 0, 0),                            // Tangent (x-direction)
-             Eigen::Vector3d(0, 0, 1),                            // Bitangent (z-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 0, 1)                             // Bitangent (z-direction)
          });
          
          // Left face (normal = -x)
@@ -85,8 +87,7 @@
              Eigen::Vector3d(-1, 0, 0),                           // Normal
              Eigen::Vector3d(dimensions.y(), dimensions.z(), 0),  // Dimensions (width, height)
              Eigen::Vector3d(0, 1, 0),                            // Tangent (y-direction)
-             Eigen::Vector3d(0, 0, 1),                            // Bitangent (z-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 0, 1)                             // Bitangent (z-direction)
          });
          
          // Right face (normal = +x)
@@ -95,8 +96,7 @@
              Eigen::Vector3d(1, 0, 0),                            // Normal
              Eigen::Vector3d(dimensions.y(), dimensions.z(), 0),  // Dimensions (width, height)
              Eigen::Vector3d(0, 1, 0),                            // Tangent (y-direction)
-             Eigen::Vector3d(0, 0, 1),                            // Bitangent (z-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 0, 1)                             // Bitangent (z-direction)
          });
          
          // Bottom face (normal = -z)
@@ -105,8 +105,7 @@
              Eigen::Vector3d(0, 0, -1),                           // Normal
              Eigen::Vector3d(dimensions.x(), dimensions.y(), 0),  // Dimensions (width, depth)
              Eigen::Vector3d(1, 0, 0),                            // Tangent (x-direction)
-             Eigen::Vector3d(0, 1, 0),                            // Bitangent (y-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 1, 0)                             // Bitangent (y-direction)
          });
          
          // Top face (normal = +z)
@@ -115,8 +114,7 @@
              Eigen::Vector3d(0, 0, 1),                            // Normal
              Eigen::Vector3d(dimensions.x(), dimensions.y(), 0),  // Dimensions (width, depth)
              Eigen::Vector3d(1, 0, 0),                            // Tangent (x-direction)
-             Eigen::Vector3d(0, 1, 0),                            // Bitangent (y-direction)
-             false                                                // Not active initially
+             Eigen::Vector3d(0, 1, 0)                             // Bitangent (y-direction)
          });
          
          return faces;
@@ -133,166 +131,511 @@
      }
  };
  
- // Structure to represent a UWB Beacon
- struct UWBBeacon {
-     std::string id;
-     Eigen::Vector3d position;
-     double range;         // Max range in meters
-     double frequency;     // Signal frequency in MHz
-     double power;         // Transmit power in dBm
+ // Structure to represent a GPS satellite in Earth-centered, Earth-fixed (ECEF) coordinates
+ struct GPSSatellite {
+     std::string id;                  // Satellite ID (e.g., G01, G02, etc.)
+     Eigen::Vector3d position;        // Position in ECEF coordinates (meters)
+     Eigen::Vector3d velocity;        // Velocity in ECEF coordinates (m/s)
      
-     UWBBeacon() : range(150.0), frequency(6500.0), power(20.0) {}
+     // Satellite orbital parameters
+     double semi_major_axis;          // Semi-major axis of orbit (meters)
+     double eccentricity;             // Eccentricity of orbit
+     double inclination;              // Inclination angle (radians)
+     double right_ascension;          // Right ascension of ascending node (radians)
+     double argument_of_perigee;      // Argument of perigee (radians)
+     double mean_anomaly;             // Mean anomaly (radians)
+     double mean_motion;              // Mean motion (radians/second)
+     
+     // Satellite state
+     double clock_bias;               // Clock bias in meters
+     double clock_drift;              // Clock drift in meters/second
+     double elevation;                // Elevation angle from user's perspective (degrees)
+     double azimuth;                  // Azimuth angle from user's perspective (degrees)
+     
+     // Signal characteristics
+     double frequency_l1;             // L1 carrier frequency (Hz)
+     double frequency_l2;             // L2 carrier frequency (Hz)
+     double power_l1;                 // Transmit power L1 (dBW)
+     double power_l2;                 // Transmit power L2 (dBW)
+     
+     // Constellation characteristics
+     std::string constellation;       // GPS, GLONASS, Galileo, etc.
+     int prn;                         // Pseudo-Random Number code
+     
+     GPSSatellite() : 
+         semi_major_axis(26559710.0),  // ~20,200 km + earth radius
+         eccentricity(0.01),
+         inclination(0.97738438),      // ~56 degrees
+         right_ascension(0.0),
+         argument_of_perigee(0.0),
+         mean_anomaly(0.0),
+         mean_motion(1.45824263e-4),   // ~2 orbits per sidereal day
+         clock_bias(0.0),
+         clock_drift(0.0),
+         elevation(0.0),
+         azimuth(0.0),
+         frequency_l1(1575.42e6),      // 1575.42 MHz
+         frequency_l2(1227.60e6),      // 1227.60 MHz
+         power_l1(-157.0),             // dBW at Earth's surface
+         power_l2(-160.0),             // dBW at Earth's surface
+         constellation("GPS"),
+         prn(1) {}
+     
+     // Update satellite position and clock based on the given time (since epoch)
+     void updateState(double time) {
+         // Update mean anomaly for current time
+         double M = mean_anomaly + mean_motion * time;
+         
+         // Solve Kepler's equation for eccentric anomaly
+         double E = solveKepler(M, eccentricity);
+         
+         // Calculate true anomaly
+         double nu = 2.0 * std::atan2(std::sqrt(1.0 + eccentricity) * std::sin(E/2.0), 
+                                      std::sqrt(1.0 - eccentricity) * std::cos(E/2.0));
+         
+         // Calculate radius from focus
+         double r = semi_major_axis * (1.0 - eccentricity * std::cos(E));
+         
+         // Calculate position in orbital plane
+         double x_orbit = r * std::cos(nu);
+         double y_orbit = r * std::sin(nu);
+         
+         // Rotate to ECEF frame (simplified transformation for visualization)
+         double cos_inc = std::cos(inclination);
+         double sin_inc = std::sin(inclination);
+         double cos_raan = std::cos(right_ascension);
+         double sin_raan = std::sin(right_ascension);
+         double cos_aop = std::cos(argument_of_perigee);
+         double sin_aop = std::sin(argument_of_perigee);
+         
+         double cos_aop_nu = std::cos(argument_of_perigee + nu);
+         double sin_aop_nu = std::sin(argument_of_perigee + nu);
+         
+         // Convert orbital position to ECEF
+         double x_ecef = r * (cos_raan * cos_aop_nu - sin_raan * sin_aop_nu * cos_inc);
+         double y_ecef = r * (sin_raan * cos_aop_nu + cos_raan * sin_aop_nu * cos_inc);
+         double z_ecef = r * sin_aop_nu * sin_inc;
+         
+         position = Eigen::Vector3d(x_ecef, y_ecef, z_ecef);
+         
+         // Calculate velocity (analytical derivative of position)
+         double p = semi_major_axis * (1.0 - eccentricity * eccentricity);
+         double h = std::sqrt(p * mean_motion * semi_major_axis * semi_major_axis);
+         
+         double vr = h * eccentricity * std::sin(nu) / p;
+         double vnu = h / r;
+         
+         double vx_orbit = vr * std::cos(nu) - vnu * std::sin(nu);
+         double vy_orbit = vr * std::sin(nu) + vnu * std::cos(nu);
+         
+         // Rotate velocity to ECEF
+         double vx_ecef = vx_orbit * (cos_raan * cos_aop - sin_raan * sin_aop * cos_inc) - 
+                         vy_orbit * (cos_raan * sin_aop + sin_raan * cos_aop * cos_inc);
+         double vy_ecef = vx_orbit * (sin_raan * cos_aop + cos_raan * sin_aop * cos_inc) - 
+                         vy_orbit * (sin_raan * sin_aop - cos_raan * cos_aop * cos_inc);
+         double vz_ecef = vx_orbit * sin_inc * sin_aop + vy_orbit * sin_inc * cos_aop;
+         
+         velocity = Eigen::Vector3d(vx_ecef, vy_ecef, vz_ecef);
+         
+         // Update clock error (based on a simple polynomial model)
+         // Clock bias in meters, typical drift is ~1-2ns/s which is ~0.3-0.6 m/s
+         double clock_bias_rate = 0.0;    // Constant for clock bias
+         double clock_drift_rate = 1e-9;  // Small acceleration term
+         
+         clock_bias += clock_drift * time + 0.5 * clock_drift_rate * time * time;
+         clock_drift += clock_drift_rate * time;
+     }
+     
+     // Solve Kepler's equation for eccentric anomaly
+     double solveKepler(double M, double e) {
+         // Initialize with a reasonable guess
+         double E = M;
+         
+         // Use Newton-Raphson iteration to solve Kepler's equation
+         for (int i = 0; i < 10; i++) {
+             double E_next = E - (E - e * std::sin(E) - M) / (1.0 - e * std::cos(E));
+             if (std::abs(E_next - E) < 1e-12) {
+                 return E_next;
+             }
+             E = E_next;
+         }
+         
+         return E;
+     }
  };
  
- // Structure for signal path segment
- struct PathSegment {
-     Eigen::Vector3d start;
-     Eigen::Vector3d end;
-     int reflection_count;
-     double path_loss;     // Path loss in dB
-     double total_distance; // Total distance to this point
-     double reflectivity;  // Product of reflectivity coefficients
-     int reflection_building_id;  // ID of building causing reflection, -1 if no reflection
-     int reflection_face_id;     // ID of the face causing reflection, -1 if no reflection
-     double incident_angle;      // Angle of incidence (degrees)
-     bool penetrates_building;   // Flag to indicate if this segment penetrates any building
+ // Structure for storing ionospheric delay model parameters (Klobuchar model)
+ struct IonoParameters {
+     double alpha[4];  // Ionospheric parameters alpha0, alpha1, alpha2, alpha3
+     double beta[4];   // Ionospheric parameters beta0, beta1, beta2, beta3
      
-     PathSegment(const Eigen::Vector3d& s, const Eigen::Vector3d& e, int rc, 
-                 double pl, double d, double r, int b_id = -1, int f_id = -1, double angle = 0.0) 
-         : start(s), end(e), reflection_count(rc), 
-           path_loss(pl), total_distance(d), reflectivity(r),
-           reflection_building_id(b_id), reflection_face_id(f_id),
-           incident_angle(angle), penetrates_building(false) {}
+     IonoParameters() {
+         // Default Klobuchar parameters (these would normally come from navigation message)
+         alpha[0] = 0.1397e-7;
+         alpha[1] = 0.0;
+         alpha[2] = -0.5960e-7;
+         alpha[3] = 0.0;
+         
+         beta[0] = 0.1045e6;
+         beta[1] = 0.3277e6;
+         beta[2] = -0.1966e6;
+         beta[3] = 0.0;
+     }
  };
  
- // Structure for a ray tracing path
- struct SignalPath {
-     std::vector<PathSegment> segments;
-     double total_path_loss;   // Total path loss in dB
-     double total_distance;    // Total path length in meters
-     int reflection_count;     // Number of reflections
-     bool valid;               // Whether path is valid (not blocked)
-     std::string beacon_id;    // ID of the source beacon
-     bool forced;              // Whether this is a forced path
-     bool penetrates_building; // Whether any segment penetrates a building
+ // Signal path segment
+ struct SignalSegment {
+     Eigen::Vector3d start;          // Start point of segment
+     Eigen::Vector3d end;            // End point of segment
+     bool direct;                    // Whether this is a direct (LOS) path
+     bool penetrates_building;       // Whether this segment penetrates a building
+     double signal_strength;         // Signal strength in dB
+     double path_length;             // Geometric length of the segment
      
-     SignalPath() : total_path_loss(0.0), total_distance(0.0), 
-                   reflection_count(0), valid(true), beacon_id("unknown"),
-                   forced(false), penetrates_building(false) {}
+     SignalSegment(const Eigen::Vector3d& s, const Eigen::Vector3d& e, 
+                 bool is_direct, double strength = 0.0) 
+         : start(s), end(e), direct(is_direct), 
+           penetrates_building(false), signal_strength(strength) {
+         path_length = (end - start).norm();
+     }
+ };
+ 
+ // Complete signal path from satellite to user with pseudorange errors
+ struct SatelliteSignal {
+     std::string satellite_id;          // ID of the satellite
+     std::vector<SignalSegment> segments; // Path segments
+     bool is_los;                       // Line of sight available
+     bool is_multipath;                 // Whether multipath is present
+     double signal_strength;            // Signal strength in dB-Hz (C/N0)
      
-     void addSegment(const PathSegment& segment) {
+     // Pseudorange components in meters
+     double geometric_range;            // True geometric distance
+     double pseudorange;                // Measured pseudorange
+     double satellite_clock_error;      // Satellite clock bias/drift
+     double ionospheric_delay;          // Ionospheric delay
+     double tropospheric_delay;         // Tropospheric delay
+     double receiver_clock_bias;        // Receiver clock bias
+     double multipath_error;            // Multipath error
+     double receiver_noise;             // Receiver noise
+     double signal_travel_time;         // Signal travel time (seconds)
+     
+     SatelliteSignal() : is_los(false), is_multipath(false), 
+                        signal_strength(0.0), geometric_range(0.0), 
+                        pseudorange(0.0), satellite_clock_error(0.0),
+                        ionospheric_delay(0.0), tropospheric_delay(0.0),
+                        receiver_clock_bias(0.0), multipath_error(0.0),
+                        receiver_noise(0.0), signal_travel_time(0.0) {}
+     
+     // Add a segment to the path
+     void addSegment(const SignalSegment& segment) {
          segments.push_back(segment);
-         total_path_loss += segment.path_loss;
-         total_distance = segment.total_distance;
-         reflection_count = segment.reflection_count;
-         if (segment.penetrates_building) {
-             penetrates_building = true;
+     }
+     
+     // Total path length
+     double getTotalPathLength() const {
+         double total = 0.0;
+         for (const auto& segment : segments) {
+             total += segment.path_length;
          }
+         return total;
+     }
+     
+     // Total path error (difference between pseudorange and geometric range)
+     double getTotalError() const {
+         return pseudorange - geometric_range;
+     }
+     
+     // Get all path errors combined
+     double getCombinedErrors() const {
+         return satellite_clock_error + ionospheric_delay + tropospheric_delay + 
+                receiver_clock_bias + multipath_error + receiver_noise;
      }
  };
  
- // Ray-tracing specific constants and calculations
- namespace RayTracing {
-     constexpr double SPEED_OF_LIGHT = 299792458.0;
-     constexpr double EPSILON = 1e-4;         // Epsilon for numerical stability
-     constexpr double ANGLE_EPSILON = 0.15;   // Angle verification tolerance
-     constexpr double FACE_EPSILON = 0.25;    // Face boundary tolerance
+ // GPS physics constants and calculations
+ namespace GPSPhysics {
+     constexpr double SPEED_OF_LIGHT = 299792458.0;    // m/s
+     constexpr double GPS_L1_FREQUENCY = 1575.42e6;    // L1 frequency in Hz
+     constexpr double GPS_L2_FREQUENCY = 1227.60e6;    // L2 frequency in Hz
+     constexpr double GPS_WAVELENGTH_L1 = SPEED_OF_LIGHT / GPS_L1_FREQUENCY; // ~19cm
+     constexpr double GPS_WAVELENGTH_L2 = SPEED_OF_LIGHT / GPS_L2_FREQUENCY; // ~24cm
+     constexpr double EARTH_RADIUS = 6371000.0;        // Earth radius in meters
+     constexpr double GPS_ORBIT_RADIUS = 26559710.0;   // GPS orbit semi-major axis
+     constexpr double GPS_EARTH_ROTATION_RATE = 7.2921151467e-5; // rad/s
+     constexpr double GPS_EARTH_GM = 3.986005e14;      // Earth's gravitational parameter
+     constexpr double MIN_ELEVATION_ANGLE = 5.0;       // Minimum usable elevation (degrees)
+     constexpr double CARRIER_TO_CODE_NOISE_RATIO = 50.0; // dB
+     constexpr double EPSILON = 1e-6;                  // Small constant for calculations
+     constexpr double BOLTZMANN_CONSTANT = 1.38064852e-23; // J/K
+     constexpr double RECEIVER_TEMP = 290.0;           // K
+     constexpr double RECEIVER_BANDWIDTH = 1.0e6;      // Hz
      
-     double calculateWavelength(double frequency_mhz) {
-         return SPEED_OF_LIGHT / (frequency_mhz * 1e6);
+     // WGS84 Parameters for coordinate transformations
+     constexpr double WGS84_a = 6378137.0;             // Semi-major axis
+     constexpr double WGS84_f = 1.0/298.257223563;     // Flattening
+     constexpr double WGS84_e2 = 2*WGS84_f - WGS84_f*WGS84_f; // Eccentricity squared
+     
+     // Convert degrees to radians
+     double deg2rad(double degrees) {
+         return degrees * M_PI / 180.0;
      }
      
-     double calculateFreeSpacePathLoss(double distance, double frequency_mhz) {
-         // FSPL (dB) = 20*log10(d) + 20*log10(f) + 32.44
-         // where d is distance in km and f is frequency in MHz
-         double distance_km = distance / 1000.0;
-         return 20.0 * std::log10(distance_km) + 20.0 * std::log10(frequency_mhz) + 32.44;
+     // Convert radians to degrees
+     double rad2deg(double radians) {
+         return radians * 180.0 / M_PI;
      }
      
-     double calculateReflectionCoefficient(double incident_angle_rad, double surface_reflectivity) {
-         double grazing_factor = std::sin(incident_angle_rad);
-         return surface_reflectivity * grazing_factor;
+     // Calculate free space path loss
+     double calculateFreeSpacePathLoss(double distance_m, double frequency_hz) {
+         // FSPL (dB) = 20*log10(4π*d*f/c)
+         // where d is distance in m, f is frequency in Hz, c is speed of light
+         return 20.0 * std::log10(4.0 * M_PI * distance_m * frequency_hz / SPEED_OF_LIGHT);
      }
      
-     Eigen::Vector3d calculateReflection(const Eigen::Vector3d& incident, 
-                                         const Eigen::Vector3d& normal) {
-         // Ensure normal is normalized
-         Eigen::Vector3d unit_normal = normal.normalized();
-         
-         // Calculate reflection vector: r = i - 2(i·n)n
-         return incident - 2 * incident.dot(unit_normal) * unit_normal;
+     // Calculate satellite signal power at receiver (dBW)
+     double calculateReceivedPower(double transmitted_power_dbw, double path_loss_db, 
+                                   double satellite_gain_db, double receiver_gain_db) {
+         return transmitted_power_dbw - path_loss_db + satellite_gain_db + receiver_gain_db;
      }
      
-     double calculateIncidentAngle(const Eigen::Vector3d& incident, 
-                                    const Eigen::Vector3d& normal) {
-         // Calculate angle between incident ray and normal
-         // Make sure vectors are normalized
-         Eigen::Vector3d unit_incident = incident.normalized();
-         Eigen::Vector3d unit_normal = normal.normalized();
-         
-         // Get cosine of angle between vectors
-         double cos_angle = std::abs(unit_incident.dot(unit_normal));
-         
-         // Return angle in radians
-         return std::acos(cos_angle);
+     // Calculate C/N0 (Carrier-to-Noise density ratio) in dB-Hz
+     double calculateCN0(double received_power_dbw) {
+         // N0 = k * T where k is Boltzmann's constant and T is system noise temperature
+         double noise_density_dbw_hz = 10.0 * std::log10(BOLTZMANN_CONSTANT * RECEIVER_TEMP);
+         return received_power_dbw - noise_density_dbw_hz;
      }
      
-     // Verify reflection satisfies the law of reflection
-     bool verifyReflectionLaw(
-         const Eigen::Vector3d& incident,
-         const Eigen::Vector3d& reflected,
-         const Eigen::Vector3d& normal,
-         double tolerance = ANGLE_EPSILON) {
+     // Calculate C/N0 based on elevation angle (empirical model)
+     double calculateCN0FromElevation(double elevation_deg, double path_loss_db) {
+         // Typical GPS L1 C/A signal power at receiver is around -157 dBW at 5° elevation
+         // and improves to about -153 dBW at 90° elevation
+         double min_power_dbw = -157.0; // At 5° elevation
+         double max_power_dbw = -153.0; // At 90° elevation
          
-         // Normalize all vectors
-         Eigen::Vector3d unit_incident = incident.normalized();
-         Eigen::Vector3d unit_reflected = reflected.normalized();
-         Eigen::Vector3d unit_normal = normal.normalized();
+         // Linear interpolation based on elevation
+         double elevation_factor = (elevation_deg - 5.0) / 85.0; // 0 at 5°, 1 at 90°
+         elevation_factor = std::max(0.0, std::min(1.0, elevation_factor));
          
-         // Compute theoretical reflection
-         Eigen::Vector3d theoretical_reflection = calculateReflection(unit_incident, unit_normal);
+         double received_power = min_power_dbw + elevation_factor * (max_power_dbw - min_power_dbw);
          
-         // Check if actual reflection matches theoretical
-         double deviation = (theoretical_reflection - unit_reflected).norm();
+         // Adjust for path losses
+         received_power -= path_loss_db;
          
-         return deviation < tolerance;
+         // Calculate C/N0
+         return calculateCN0(received_power);
      }
      
-     // Check if a point is within a rectangular face
-     bool isPointOnFace(
-         const Eigen::Vector3d& point,
-         const Eigen::Vector3d& face_center,
-         const Eigen::Vector3d& face_normal,
-         const Eigen::Vector3d& face_tangent,
-         const Eigen::Vector3d& face_bitangent,
-         const Eigen::Vector3d& face_dimensions,
-         double epsilon = FACE_EPSILON) {
-         
-         // Check if point is on the plane
-         double distance_from_plane = std::abs((point - face_center).dot(face_normal));
-         if (distance_from_plane > epsilon) {
-             return false;
+     // Calculate pseudorange standard deviation from C/N0
+     double calculatePseudorangeStdDev(double cn0_db_hz) {
+         // Simplified model: sigma = a / sqrt(10^(CN0/10))
+         // where CN0 is in dB-Hz and a is an empirical constant (~20-30 for GPS C/A code)
+         double a = 25.0;
+         return a / std::sqrt(std::pow(10.0, cn0_db_hz/10.0));
+     }
+     
+     // Calculate receiver noise error based on C/N0
+     double calculateReceiverNoiseError(double cn0_db_hz, std::mt19937& rng) {
+         double sigma = calculatePseudorangeStdDev(cn0_db_hz);
+         std::normal_distribution<double> noise_dist(0.0, sigma);
+         return noise_dist(rng);
+     }
+     
+     // Calculate multipath error based on environment and elevation
+     double calculateMultipathError(double elevation_deg, double cn0_db_hz, bool is_multipath, std::mt19937& rng) {
+         if (!is_multipath) {
+             return 0.0;
          }
          
-         // Project point onto face plane
-         Eigen::Vector3d point_on_plane = point - face_normal * 
-                                         ((point - face_center).dot(face_normal));
+         // Multipath error model based on elevation angle
+         // Lower elevation angles experience more multipath
+         double max_error = 15.0;  // Maximum multipath error in meters
+         double elevation_factor = std::max(0.0, (90.0 - elevation_deg) / 90.0);
          
-         // Calculate vector from face center to projected point
-         Eigen::Vector3d to_point = point_on_plane - face_center;
+         // Scale by signal quality - weaker signals create worse multipath
+         double cn0_factor = std::max(0.0, (50.0 - cn0_db_hz) / 30.0);
+         cn0_factor = std::min(1.0, cn0_factor);
          
-         // Project this vector onto tangent and bitangent
-         double tangent_proj = to_point.dot(face_tangent);
-         double bitangent_proj = to_point.dot(face_bitangent);
+         // Calculate mean error
+         double mean_error = elevation_factor * cn0_factor * max_error;
          
-         // Check if projected point is within the face bounds
-         double half_width = face_dimensions.x() / 2.0 + epsilon;
-         double half_height = face_dimensions.y() / 2.0 + epsilon;
-         
-         return (std::abs(tangent_proj) <= half_width) && 
-                (std::abs(bitangent_proj) <= half_height);
+         // Add some randomness (often multipath is biased positive)
+         std::exponential_distribution<double> exp_dist(1.0/mean_error);
+         return exp_dist(rng);
      }
- 
+     
+     // Calculate tropospheric delay using Saastamoinen model
+     double calculateTroposphericDelay(double elevation_deg, double height_m = 0.0) {
+         // Saastamoinen model parameters
+         double pressure = 1013.25 * std::exp(-height_m/8500.0); // Pressure at height (mbar)
+         double temp = 288.15 - 0.0065 * height_m; // Temperature at height (K)
+         double e = 6.108 * std::exp((17.15 * temp - 4684.0)/(temp - 38.45)); // Water vapor pressure
+         
+         // Convert elevation to radians
+         double elevation_rad = deg2rad(elevation_deg);
+         
+         // Zenith tropospheric delay
+         double Zhydro = 0.0022768 * pressure / (1.0 - 0.00266 * std::cos(2.0 * 0.0) - 0.00028 * height_m/1000.0);
+         
+         // Mapping function (simple 1/sin(el) approximation)
+         double mapping = 1.0 / std::sin(elevation_rad);
+         
+         // Total tropospheric delay in meters
+         return Zhydro * mapping;
+     }
+     
+     // Calculate ionospheric delay using Klobuchar model
+     double calculateIonosphericDelay(double elevation_deg, double azimuth_deg, 
+                                    double lat_deg, double lon_deg, 
+                                    const IonoParameters& params, double gps_time_s) {
+         // Convert to radians
+         double elevation_rad = deg2rad(elevation_deg);
+         double azimuth_rad = deg2rad(azimuth_deg);
+         double lat_rad = deg2rad(lat_deg);
+         double lon_rad = deg2rad(lon_deg);
+         
+         // Earth's central angle between user and ionospheric pierce point
+         double psi = 0.0137 / (elevation_rad + 0.11) - 0.022;
+         
+         // Latitude of the ionospheric pierce point
+         double lat_i = lat_rad + psi * std::cos(azimuth_rad);
+         if (lat_i > 0.416) lat_i = 0.416;
+         if (lat_i < -0.416) lat_i = -0.416;
+         
+         // Longitude of the ionospheric pierce point
+         double lon_i = lon_rad + psi * std::sin(azimuth_rad) / std::cos(lat_i);
+         
+         // Geomagnetic latitude of the ionospheric pierce point
+         double lat_m = lat_i + 0.064 * std::cos(lon_i - 1.617);
+         
+         // Local time at the ionospheric pierce point
+         double t = 43200.0 * lon_i / M_PI + gps_time_s;
+         while (t >= 86400.0) t -= 86400.0;
+         while (t < 0.0) t += 86400.0;
+         
+         // Slant factor
+         double slant = 1.0 / std::sqrt(1.0 - std::pow(0.9782 * std::cos(elevation_rad), 2));
+         
+         // Amplitude of ionospheric delay
+         double amp = params.alpha[0] + params.alpha[1] * lat_m + 
+                     params.alpha[2] * lat_m * lat_m + params.alpha[3] * lat_m * lat_m * lat_m;
+         if (amp < 0.0) amp = 0.0;
+         
+         // Period of ionospheric delay
+         double per = params.beta[0] + params.beta[1] * lat_m + 
+                     params.beta[2] * lat_m * lat_m + params.beta[3] * lat_m * lat_m * lat_m;
+         if (per < 72000.0) per = 72000.0;
+         
+         // Phase of ionospheric delay
+         double x = 2.0 * M_PI * (t - 50400.0) / per;
+         
+         // Ionospheric delay
+         double iono;
+         if (std::abs(x) > 1.57) {
+             iono = slant * 5.0e-9 * SPEED_OF_LIGHT;
+         } else {
+             iono = slant * (5.0e-9 + amp * (1.0 - x*x/2.0 + x*x*x*x/24.0)) * SPEED_OF_LIGHT;
+         }
+         
+         return iono;
+     }
+     
+     // Convert ECEF coordinates to geodetic (WGS84)
+     void ecef2geodetic(const Eigen::Vector3d& ecef, double& lat, double& lon, double& height) {
+         double x = ecef.x();
+         double y = ecef.y();
+         double z = ecef.z();
+         
+         double p = std::sqrt(x*x + y*y);
+         double theta = std::atan2(z * WGS84_a, p * WGS84_a * (1.0 - WGS84_e2));
+         
+         lon = std::atan2(y, x);
+         lat = std::atan2(z + WGS84_e2 * WGS84_a * std::pow(std::sin(theta), 3), 
+                          p - WGS84_e2 * WGS84_a * std::pow(std::cos(theta), 3));
+         
+         double N = WGS84_a / std::sqrt(1.0 - WGS84_e2 * std::sin(lat) * std::sin(lat));
+         height = p / std::cos(lat) - N;
+         
+         // Convert to degrees
+         lat = rad2deg(lat);
+         lon = rad2deg(lon);
+     }
+     
+     // Convert ECEF coordinates to ENU at given reference point
+     Eigen::Vector3d ecef2enu(const Eigen::Vector3d& ecef, const Eigen::Vector3d& ref_ecef, 
+                           double ref_lat, double ref_lon) {
+         // Convert reference lat/lon to radians
+         double lat_rad = deg2rad(ref_lat);
+         double lon_rad = deg2rad(ref_lon);
+         
+         // Rotation matrix from ECEF to ENU
+         double sin_lat = std::sin(lat_rad);
+         double cos_lat = std::cos(lat_rad);
+         double sin_lon = std::sin(lon_rad);
+         double cos_lon = std::cos(lon_rad);
+         
+         // Calculate ECEF offset
+         Eigen::Vector3d delta_ecef = ecef - ref_ecef;
+         
+         // Rotate to ENU
+         Eigen::Vector3d enu;
+         enu.x() = -sin_lon * delta_ecef.x() + cos_lon * delta_ecef.y();
+         enu.y() = -sin_lat * cos_lon * delta_ecef.x() - sin_lat * sin_lon * delta_ecef.y() + cos_lat * delta_ecef.z();
+         enu.z() = cos_lat * cos_lon * delta_ecef.x() + cos_lat * sin_lon * delta_ecef.y() + sin_lat * delta_ecef.z();
+         
+         return enu;
+     }
+     
+     // Convert ENU coordinates to ECEF at given reference point
+     Eigen::Vector3d enu2ecef(const Eigen::Vector3d& enu, const Eigen::Vector3d& ref_ecef, 
+                           double ref_lat, double ref_lon) {
+         // Convert reference lat/lon to radians
+         double lat_rad = deg2rad(ref_lat);
+         double lon_rad = deg2rad(ref_lon);
+         
+         // Rotation matrix from ENU to ECEF
+         double sin_lat = std::sin(lat_rad);
+         double cos_lat = std::cos(lat_rad);
+         double sin_lon = std::sin(lon_rad);
+         double cos_lon = std::cos(lon_rad);
+         
+         // Rotate from ENU to ECEF
+         Eigen::Vector3d delta_ecef;
+         delta_ecef.x() = -sin_lon * enu.x() - sin_lat * cos_lon * enu.y() + cos_lat * cos_lon * enu.z();
+         delta_ecef.y() = cos_lon * enu.x() - sin_lat * sin_lon * enu.y() + cos_lat * sin_lon * enu.z();
+         delta_ecef.z() = cos_lat * enu.y() + sin_lat * enu.z();
+         
+         // Add to reference ECEF
+         return ref_ecef + delta_ecef;
+     }
+     
+     // Calculate satellite elevation and azimuth from user position
+     void calculateElevationAzimuth(const Eigen::Vector3d& user_ecef, 
+                                   const Eigen::Vector3d& satellite_ecef,
+                                   double& elevation, double& azimuth) {
+         // Convert user ECEF to geodetic (lat, lon, height)
+         double lat, lon, height;
+         ecef2geodetic(user_ecef, lat, lon, height);
+         
+         // Convert to ENU coordinates
+         Eigen::Vector3d sat_enu = ecef2enu(satellite_ecef, user_ecef, lat, lon);
+         
+         // Calculate elevation and azimuth
+         elevation = 90.0 - rad2deg(std::acos(sat_enu.z() / sat_enu.norm()));
+         azimuth = rad2deg(std::atan2(sat_enu.x(), sat_enu.y()));
+         if (azimuth < 0.0) azimuth += 360.0;
+     }
+     
+     // Calculate satellite clock relativistic correction
+     double calculateRelativisticCorrection(const GPSSatellite& satellite) {
+         // Relativistic correction due to orbital eccentricity
+         double rel_corr = -2.0 * satellite.position.dot(satellite.velocity) / SPEED_OF_LIGHT;
+         
+         // Relativistic correction due to Earth's gravitational potential
+         // This is usually incorporated into the satellite clock bias
+         
+         return rel_corr;
+     }
+     
      // Safe calculation of inverse with checks for division by zero
      double safeInverse(double value) {
          const double MIN_VALUE = 1e-10;
@@ -301,9 +644,38 @@
          }
          return 1.0 / value;
      }
- }
+     
+     // Check if a ray intersects a surface
+     bool rayIntersectsSurface(const Eigen::Vector3d& ray_origin, 
+                              const Eigen::Vector3d& ray_dir,
+                              const Eigen::Vector3d& plane_point,
+                              const Eigen::Vector3d& plane_normal,
+                              double& t,
+                              Eigen::Vector3d& intersection_point) {
+         
+         double denom = ray_dir.dot(plane_normal);
+         
+         // Check if ray is parallel to plane
+         if (std::abs(denom) < EPSILON) {
+             return false;
+         }
+         
+         // Calculate t
+         t = (plane_point - ray_origin).dot(plane_normal) / denom;
+         
+         // Check if intersection is in front of ray origin
+         if (t < 0.0) {
+             return false;
+         }
+         
+         // Calculate intersection point
+         intersection_point = ray_origin + t * ray_dir;
+         
+         return true;
+     }
+ };
  
- class UWBRayTracer {
+ class GPSSimulator {
  private:
      ros::NodeHandle nh_;
      ros::NodeHandle private_nh_;
@@ -311,40 +683,43 @@
      // Publishers
      ros::Publisher building_pub_;
      ros::Publisher road_pub_;
-     ros::Publisher beacon_pub_;
+     ros::Publisher satellite_pub_;
      ros::Publisher user_pub_;
-     ros::Publisher path_pub_;
-     ros::Publisher reflection_pub_;
-     ros::Publisher reflection_surface_pub_;
+     ros::Publisher signal_pub_;
+     ros::Publisher measurement_pub_;
      ros::Publisher text_pub_;
      ros::Publisher debug_pub_;
      ros::Publisher trajectory_pub_;
+     ros::Publisher skyplot_pub_;
+     ros::Publisher pseudorange_pub_;
      
      // Timers
      ros::Timer update_timer_;
      ros::Timer movement_timer_;
+     ros::Timer satellite_motion_timer_;
      
      // TF broadcaster
      tf::TransformBroadcaster tf_broadcaster_;
      
      // Lists of objects
      std::vector<Building> buildings_;
-     std::vector<UWBBeacon> beacons_;
+     std::vector<GPSSatellite> satellites_;
      Eigen::Vector3d user_position_;
-     std::vector<SignalPath> signal_paths_;
+     std::vector<SatelliteSignal> satellite_signals_;
      std::vector<Eigen::Vector3d> user_trajectory_;
+     IonoParameters iono_params_;  // Ionospheric delay parameters
      
-     // Track actively reflecting faces for visualization
-     std::vector<std::pair<int, int>> active_reflection_faces_; // (building_idx, face_idx)
-     
-     // Debug visualization
-     std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> debug_penetration_points_;
+     // User and simulation state
+     double user_lat_;           // User latitude (degrees)
+     double user_lon_;           // User longitude (degrees)
+     double user_height_;        // User height above WGS84 (meters)
+     double receiver_clock_bias_;    // Receiver clock bias (meters)
+     double receiver_clock_drift_;   // Receiver clock drift (meters/second)
+     double gps_time_;               // Current GPS time of week (seconds)
      
      // Parameters
-     int max_reflections_;     
-     double max_distance_;     
-     double min_signal_power_; 
-     double noise_floor_;      
+     double max_signal_distance_;     // Maximum satellite distance to consider
+     double min_cn0_threshold_;       // Minimum C/N0 for usable signal
      
      // Road parameters
      double road_length_;
@@ -359,7 +734,6 @@
      
      // Environment parameters
      double sidewalk_width_;
-     double beacon_height_;
      
      // User movement parameters
      bool enable_user_movement_;
@@ -372,55 +746,68 @@
      double current_time_;
      int current_trajectory_point_;
      
+     // Satellite motion parameters
+     double satellite_motion_rate_;
+     double orbital_radius_;
+     double simulation_scale_;
+     
      // Visualization parameters
      std::string fixed_frame_;
      double building_alpha_;
-     double path_width_;
+     double signal_width_;
      bool debug_mode_;
      bool slow_mode_;
-     bool force_reflections_;
-     bool special_check_enabled_;
-     int penetration_samples_;
+     bool show_multipath_;
+     double signal_update_rate_;
+     
+     // GPS measurement simulation parameters
+     double pseudorange_base_noise_;
+     double multipath_probability_;
+     double signal_penetration_loss_;
      
      // Random number generator
      std::mt19937 rng_;
      std::uniform_real_distribution<double> height_dist_;
      std::uniform_real_distribution<double> width_dist_;
      std::uniform_real_distribution<double> depth_dist_;
-     std::uniform_real_distribution<double> reflectivity_dist_;
+     std::uniform_real_distribution<double> attenuation_dist_;
      std::uniform_real_distribution<double> color_dist_;
+     std::uniform_real_distribution<double> uniform_dist_;
  
  public:
-     UWBRayTracer() : private_nh_("~"), 
-                      rng_(std::random_device()()),
-                      current_time_(0.0),
-                      current_trajectory_point_(0) {
+     GPSSimulator() : private_nh_("~"), 
+                    rng_(std::random_device()()),
+                    current_time_(0.0),
+                    current_trajectory_point_(0),
+                    user_lat_(0.0),
+                    user_lon_(0.0),
+                    user_height_(0.0),
+                    receiver_clock_bias_(0.0),
+                    receiver_clock_drift_(0.0),
+                    gps_time_(0.0),
+                    uniform_dist_(0.0, 1.0) {
          // Get parameters
-         private_nh_.param<int>("max_reflections", max_reflections_, 2);
-         private_nh_.param<double>("max_distance", max_distance_, 150.0);
-         private_nh_.param<double>("min_signal_power", min_signal_power_, -90.0);
-         private_nh_.param<double>("noise_floor", noise_floor_, -100.0);
+         private_nh_.param<double>("max_signal_distance", max_signal_distance_, 25000000.0);
+         private_nh_.param<double>("min_cn0_threshold", min_cn0_threshold_, 20.0);
          private_nh_.param<std::string>("fixed_frame", fixed_frame_, "map");
          private_nh_.param<double>("building_alpha", building_alpha_, 0.5);
-         private_nh_.param<double>("path_width", path_width_, 0.2);
+         private_nh_.param<double>("signal_width", signal_width_, 0.2);
          private_nh_.param<bool>("debug_mode", debug_mode_, true);
          private_nh_.param<bool>("slow_mode", slow_mode_, true);
-         private_nh_.param<bool>("force_reflections", force_reflections_, true);
-         private_nh_.param<bool>("special_check_enabled", special_check_enabled_, true);
-         private_nh_.param<int>("penetration_samples", penetration_samples_, 20);
+         private_nh_.param<bool>("show_multipath", show_multipath_, true);
+         private_nh_.param<double>("signal_update_rate", signal_update_rate_, 1.0);
          
          // Road and environment parameters
          private_nh_.param<double>("road_length", road_length_, 100.0);
-         private_nh_.param<double>("road_width", road_width_, 10.0);
+         private_nh_.param<double>("road_width", road_width_, 15.0);
          private_nh_.param<double>("sidewalk_width", sidewalk_width_, 3.0);
          private_nh_.param<double>("building_height_min", building_height_min_, 10.0);
-         private_nh_.param<double>("building_height_max", building_height_max_, 20.0);
+         private_nh_.param<double>("building_height_max", building_height_max_, 25.0);
          private_nh_.param<double>("building_width_min", building_width_min_, 10.0);
-         private_nh_.param<double>("building_width_max", building_width_max_, 15.0);
+         private_nh_.param<double>("building_width_max", building_width_max_, 20.0);
          private_nh_.param<double>("building_depth_min", building_depth_min_, 8.0);
-         private_nh_.param<double>("building_depth_max", building_depth_max_, 12.0);
-         private_nh_.param<double>("buildings_per_side", buildings_per_side_, 12.0);
-         private_nh_.param<double>("beacon_height", beacon_height_, 15.0);
+         private_nh_.param<double>("building_depth_max", building_depth_max_, 15.0);
+         private_nh_.param<double>("buildings_per_side", buildings_per_side_, 8.0);
          
          // User movement parameters
          private_nh_.param<bool>("enable_user_movement", enable_user_movement_, true);
@@ -430,6 +817,16 @@
          private_nh_.param<double>("movement_height", movement_height_, 1.7);
          private_nh_.param<double>("movement_period", movement_period_, 60.0);  // seconds for one cycle
          private_nh_.param<double>("movement_phase", movement_phase_, 0.0);
+         
+         // Satellite motion parameters
+         private_nh_.param<double>("satellite_motion_rate", satellite_motion_rate_, 0.005);
+         private_nh_.param<double>("orbital_radius", orbital_radius_, 500.0);  // Scaled for visualization
+         private_nh_.param<double>("simulation_scale", simulation_scale_, 50000.0);  // Scale factor from real world to visualization
+         
+         // GPS measurement simulation parameters
+         private_nh_.param<double>("pseudorange_base_noise", pseudorange_base_noise_, 2.0);
+         private_nh_.param<double>("multipath_probability", multipath_probability_, 0.4);
+         private_nh_.param<double>("signal_penetration_loss", signal_penetration_loss_, 30.0);
          
          // Initialize user position to starting position based on movement type
          if (movement_type_ == "figure8") {
@@ -448,26 +845,27 @@
          height_dist_ = std::uniform_real_distribution<double>(building_height_min_, building_height_max_);
          width_dist_ = std::uniform_real_distribution<double>(building_width_min_, building_width_max_);
          depth_dist_ = std::uniform_real_distribution<double>(building_depth_min_, building_depth_max_);
-         reflectivity_dist_ = std::uniform_real_distribution<double>(0.6, 0.9);
+         attenuation_dist_ = std::uniform_real_distribution<double>(20.0, 40.0);
          color_dist_ = std::uniform_real_distribution<double>(0.0, 1.0);
          
          // Publishers
-         building_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/buildings", 1);
-         road_pub_ = nh_.advertise<visualization_msgs::Marker>("uwb_ray_tracer/road", 1);
-         beacon_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/beacons", 1);
-         user_pub_ = nh_.advertise<visualization_msgs::Marker>("uwb_ray_tracer/user", 1);
-         path_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/paths", 1);
-         reflection_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/reflections", 1);
-         reflection_surface_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/reflection_surfaces", 1);
-         text_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/text_info", 1);
-         debug_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("uwb_ray_tracer/debug", 1);
-         trajectory_pub_ = nh_.advertise<visualization_msgs::Marker>("uwb_ray_tracer/trajectory", 1);
+         building_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/buildings", 1);
+         road_pub_ = nh_.advertise<visualization_msgs::Marker>("gps_simulator/road", 1);
+         satellite_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/satellites", 1);
+         user_pub_ = nh_.advertise<visualization_msgs::Marker>("gps_simulator/user", 1);
+         signal_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/signals", 1);
+         measurement_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/measurements", 1);
+         text_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/text_info", 1);
+         debug_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/debug", 1);
+         trajectory_pub_ = nh_.advertise<visualization_msgs::Marker>("gps_simulator/trajectory", 1);
+         skyplot_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/skyplot", 1);
+         pseudorange_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("gps_simulator/pseudoranges", 1);
          
          // Generate environment
          generateEnvironment();
          
-         // Create 10 UWB beacons
-         createTenBeacons();
+         // Create GPS satellites
+         createGPSSatellites();
          
          // Generate trajectory if using circuit mode
          if (movement_type_ == "circuit") {
@@ -475,85 +873,65 @@
          }
          
          // Create a timer for updates - slower in slow mode
-         double update_rate = slow_mode_ ? 2.0 : 10.0;
-         private_nh_.param<double>("update_rate", update_rate, update_rate);
+         double update_rate = signal_update_rate_;
          update_timer_ = nh_.createTimer(ros::Duration(1.0/update_rate), 
-                                         &UWBRayTracer::updateCallback, this);
+                                        &GPSSimulator::updateCallback, this);
          
          // Create a timer for movement - faster updates for smoother motion
          double movement_update_rate = 10.0;
          if (enable_user_movement_) {
              movement_timer_ = nh_.createTimer(ros::Duration(1.0/movement_update_rate), 
-                                           &UWBRayTracer::movementCallback, this);
+                                          &GPSSimulator::movementCallback, this);
          }
          
-         ROS_INFO("UWB Ray Tracer initialized with %zu buildings and %zu beacons", 
-                 buildings_.size(), beacons_.size());
+         // Create a timer for satellite motion
+         satellite_motion_timer_ = nh_.createTimer(ros::Duration(1.0/10.0), 
+                                                 &GPSSimulator::satelliteMotionCallback, this);
+         
+         ROS_INFO("GPS Simulator initialized with %zu buildings and %zu satellites", 
+                 buildings_.size(), satellites_.size());
          ROS_INFO("User will move with %s trajectory at %.2f m/s", 
                  movement_type_.c_str(), movement_speed_);
      }
      
-     ~UWBRayTracer() {
+     ~GPSSimulator() {
          clearVisualizations();
      }
      
      void updateCallback(const ros::TimerEvent& event) {
-         // Clear debug markers
-         debug_penetration_points_.clear();
-         
-         // Clear paths when user moves significantly
-         static Eigen::Vector3d last_compute_position = user_position_;
-         double distance_moved = (user_position_ - last_compute_position).norm();
-         
-         if (distance_moved > 1.0 || signal_paths_.empty()) {
-             // User has moved enough to require recomputing paths
-             signal_paths_.clear();
-             last_compute_position = user_position_;
-             
-             // In slow mode, add artificial delay for easier visualization
-             if (slow_mode_) {
-                 ROS_INFO("Computing signal paths for user at (%.2f, %.2f, %.2f)...", 
-                          user_position_.x(), user_position_.y(), user_position_.z());
-                 ros::Duration(0.1).sleep();  // Add delay to simulate computation time
-             }
-             
-             // Compute paths
-             computeSignalPaths();
-             
-             // Verify all paths don't pass through buildings
-             validateAllPaths();
-             
-             // Ensure direct paths exist for all beacons
-             ensureDirectPaths();
-             
-             // If not enough reflection paths found, add more
-             if (force_reflections_ && !hasEnoughReflectionPaths()) {
-                 ROS_INFO("Adding more reflection paths for visualization...");
-                 addForcedReflections();
-                 
-                 // Re-validate all paths
-                 validateAllPaths();
-             }
+         // Update simulation time
+         double dt = event.current_real.toSec() - event.last_real.toSec();
+         gps_time_ += dt;
+         while (gps_time_ >= 604800.0) {  // GPS week rollover (7 days)
+             gps_time_ -= 604800.0;
          }
+         
+         // Update receiver clock errors
+         updateReceiverClock(dt);
+         
+         // Update user geodetic coordinates
+         GPSPhysics::ecef2geodetic(user_position_, user_lat_, user_lon_, user_height_);
+         
+         // Clear old signals
+         satellite_signals_.clear();
+         
+         // Compute GPS signals and pseudoranges
+         computeGPSSignals();
          
          // Publish visualizations
          publishRoad();
          publishBuildings();
-         publishBeacons();
+         publishSatellites();
          publishUser();
-         publishReflectionSurfaces();
-         publishSignalPaths();
-         publishReflectionPoints();
+         publishGPSSignals();
+         publishMeasurements();
+         publishPseudoranges();
          publishTextInfo();
+         publishSkyplot();
          
          // Publish trajectory visualization
          if (movement_type_ == "circuit" && !user_trajectory_.empty()) {
              publishTrajectory();
-         }
-         
-         // Publish debug visualizations
-         if (debug_mode_) {
-             publishDebugMarkers();
          }
          
          // Broadcast TF frames
@@ -576,6 +954,43 @@
          } else if (movement_type_ == "circuit") {
              updateCircuitMotion(dt);
          }
+     }
+     
+     void satelliteMotionCallback(const ros::TimerEvent& event) {
+         // Update satellite positions to simulate orbital motion
+         double dt = event.current_real.toSec() - event.last_real.toSec();
+         
+         // Update satellite positions based on their orbital parameters
+         for (auto& sat : satellites_) {
+             // Update satellite state
+             sat.updateState(gps_time_);
+             
+             // Update elevation and azimuth relative to user
+             double elevation, azimuth;
+             GPSPhysics::calculateElevationAzimuth(user_position_, sat.position, elevation, azimuth);
+             sat.elevation = elevation;
+             sat.azimuth = azimuth;
+         }
+     }
+     
+     void updateReceiverClock(double dt) {
+         // Simulate receiver clock errors
+         // Typical low-cost GPS receiver clock stability is around 1e-9 (1 ns/s)
+         double clock_drift_rate = 1.0e-9;  // Clock drift rate in s/s
+         double clock_drift_noise = 1.0e-12;  // Random walk noise
+         
+         // Update receiver clock bias and drift
+         receiver_clock_bias_ += receiver_clock_drift_ * dt;
+         receiver_clock_drift_ += clock_drift_rate * dt + clock_drift_noise * std::sqrt(dt) * standard_normal(rng_);
+         
+         // Convert to meters (for bias) and m/s (for drift)
+         receiver_clock_bias_ *= GPSPhysics::SPEED_OF_LIGHT;
+         receiver_clock_drift_ *= GPSPhysics::SPEED_OF_LIGHT;
+     }
+     
+     double standard_normal(std::mt19937& rng) {
+         static std::normal_distribution<double> dist(0.0, 1.0);
+         return dist(rng);
      }
      
      void updateFigure8Motion(double dt) {
@@ -714,73 +1129,17 @@
          }
      }
      
-     void validateAllPaths() {
-         int invalid_paths = 0;
-         
-         for (auto& path : signal_paths_) {
-             bool valid_path = true;
-             
-             for (auto& segment : path.segments) {
-                 // Check segment for building penetration using our improved method
-                 if (checkSegmentPenetration(
-                     segment.start, segment.end, 
-                     segment.reflection_building_id, -1)) {
-                     
-                     segment.penetrates_building = true;
-                     valid_path = false;
-                     
-                     if (debug_mode_) {
-                         ROS_WARN("Path from beacon %s has a segment that penetrates a building",
-                                  path.beacon_id.c_str());
-                     }
-                 }
-             }
-             
-             path.penetrates_building = !valid_path;
-             if (path.penetrates_building) {
-                 invalid_paths++;
-             }
-         }
-         
-         // Remove penetrating paths
-         auto it = std::remove_if(signal_paths_.begin(), signal_paths_.end(),
-                                  [](const SignalPath& path) {
-                                      return path.penetrates_building;
-                                  });
-         
-         if (it != signal_paths_.end()) {
-             signal_paths_.erase(it, signal_paths_.end());
-             
-             if (invalid_paths > 0) {
-                 ROS_INFO("Removed %d paths that penetrate buildings", invalid_paths);
-             }
-         }
-     }
-     
-     bool hasEnoughReflectionPaths() {
-         int reflection_paths = 0;
-         
-         for (const auto& path : signal_paths_) {
-             if (path.reflection_count > 0) {
-                 reflection_paths++;
-                 if (reflection_paths >= 5) { // At least 5 reflection paths
-                     return true;
-                 }
-             }
-         }
-         return false;
-     }
-     
      void clearVisualizations() {
          // Create empty marker arrays to clear visualizations
          visualization_msgs::MarkerArray empty_array;
          building_pub_.publish(empty_array);
-         beacon_pub_.publish(empty_array);
-         path_pub_.publish(empty_array);
-         reflection_pub_.publish(empty_array);
-         reflection_surface_pub_.publish(empty_array);
+         satellite_pub_.publish(empty_array);
+         signal_pub_.publish(empty_array);
+         measurement_pub_.publish(empty_array);
          text_pub_.publish(empty_array);
          debug_pub_.publish(empty_array);
+         skyplot_pub_.publish(empty_array);
+         pseudorange_pub_.publish(empty_array);
          
          // Delete user and road markers
          visualization_msgs::Marker empty_marker;
@@ -791,7 +1150,7 @@
      }
      
      void generateEnvironment() {
-         ROS_INFO("Generating environment with buildings on both sides...");
+         ROS_INFO("Generating urban environment with buildings on both sides...");
          
          // Clear any existing buildings
          buildings_.clear();
@@ -806,12 +1165,16 @@
          // 1. LEFT SIDE (negative Y)
          for (int i = 0; i < num_buildings; ++i) {
              // Create a building with specific spacing
-             double building_width = width_dist_(rng_) * 0.8;  // Slightly narrower
+             double building_width = width_dist_(rng_);
              double building_depth = depth_dist_(rng_);
              double building_height = height_dist_(rng_);
              
              // Position building with clear gap from road
              double building_x = -road_length_/2.0 + (i + 0.5) * segment_length;
+             
+             // Add some random offset in X to make the street less uniform
+             double x_offset = std::uniform_real_distribution<double>(-segment_length * 0.2, segment_length * 0.2)(rng_);
+             building_x += x_offset;
              
              Building building;
              building.id = "left_" + std::to_string(i);
@@ -822,21 +1185,34 @@
              );
              building.dimensions = Eigen::Vector3d(building_width, building_depth, building_height);
              
-             // Red-ish color for left side buildings
-             building.color = Eigen::Vector3d(0.8, 0.2, 0.2);
-             building.reflectivity = 0.8;
+             // Brown-ish color for left side buildings, but with variation
+             double r = 0.6 + 0.3 * color_dist_(rng_);
+             double g = 0.3 + 0.2 * color_dist_(rng_);
+             double b = 0.1 + 0.2 * color_dist_(rng_);
+             building.color = Eigen::Vector3d(r, g, b);
+             
+             // Assign signal attenuation characteristics
+             building.signal_attenuation = attenuation_dist_(rng_);
+             
+             // Assign reflection coefficients (0.4 - 0.7 is typical for buildings)
+             building.reflectivity = 0.4 + 0.3 * color_dist_(rng_);
+             
              buildings_.push_back(building);
          }
          
          // 2. RIGHT SIDE (positive Y)
          for (int i = 0; i < num_buildings; ++i) {
              // Create a building with specific spacing
-             double building_width = width_dist_(rng_) * 0.8;
+             double building_width = width_dist_(rng_);
              double building_depth = depth_dist_(rng_);
              double building_height = height_dist_(rng_);
              
              // Position building with clear gap from road and offset from left side
              double building_x = -road_length_/2.0 + (i + 0.3) * segment_length;
+             
+             // Add some random offset in X to make the street less uniform
+             double x_offset = std::uniform_real_distribution<double>(-segment_length * 0.2, segment_length * 0.2)(rng_);
+             building_x += x_offset;
              
              Building building;
              building.id = "right_" + std::to_string(i);
@@ -847,821 +1223,433 @@
              );
              building.dimensions = Eigen::Vector3d(building_width, building_depth, building_height);
              
-             // Blue-ish color for right side buildings
-             building.color = Eigen::Vector3d(0.2, 0.2, 0.8);
-             building.reflectivity = 0.8;
+             // Gray-ish color for right side buildings, with variation
+             double r = 0.3 + 0.2 * color_dist_(rng_);
+             double g = 0.3 + 0.2 * color_dist_(rng_);
+             double b = 0.3 + 0.3 * color_dist_(rng_);
+             building.color = Eigen::Vector3d(r, g, b);
+             
+             // Assign signal attenuation characteristics
+             building.signal_attenuation = attenuation_dist_(rng_);
+             
+             // Assign reflection coefficients (0.4 - 0.7 is typical for buildings)
+             building.reflectivity = 0.4 + 0.3 * color_dist_(rng_);
+             
              buildings_.push_back(building);
          }
          
-         ROS_INFO("Created %zu buildings with clear spacing between them", buildings_.size());
+         // 3. Add some tall buildings at the ends for more signal blockage
+         // Tall building at positive X end
+         Building tall_building_1;
+         tall_building_1.id = "tall_end_1";
+         tall_building_1.center = Eigen::Vector3d(
+             road_length_/2.0 + 15.0, 0.0, 30.0/2.0
+         );
+         tall_building_1.dimensions = Eigen::Vector3d(30.0, 40.0, 30.0);
+         tall_building_1.color = Eigen::Vector3d(0.2, 0.3, 0.5);
+         tall_building_1.signal_attenuation = 40.0;
+         tall_building_1.reflectivity = 0.7;  // Higher reflectivity for glass/steel buildings
+         buildings_.push_back(tall_building_1);
+         
+         // Tall building at negative X end
+         Building tall_building_2;
+         tall_building_2.id = "tall_end_2";
+         tall_building_2.center = Eigen::Vector3d(
+             -road_length_/2.0 - 15.0, 0.0, 35.0/2.0
+         );
+         tall_building_2.dimensions = Eigen::Vector3d(30.0, 40.0, 35.0);
+         tall_building_2.color = Eigen::Vector3d(0.5, 0.3, 0.2);
+         tall_building_2.signal_attenuation = 40.0;
+         tall_building_2.reflectivity = 0.65;
+         buildings_.push_back(tall_building_2);
+         
+         ROS_INFO("Created %zu buildings with varied heights and signal attenuation", buildings_.size());
      }
      
-     void createTenBeacons() {
-         ROS_INFO("Creating exactly 10 UWB beacons...");
+     void createGPSSatellites() {
+         ROS_INFO("Creating GPS satellites with realistic orbital parameters...");
          
-         // Clear any existing beacons
-         beacons_.clear();
+         // Clear any existing satellites
+         satellites_.clear();
          
-         // Distance from centerline to beacon position
-         double road_side = road_width_ / 2.0 + 1.0;  // 1m into sidewalk
+         // PRN numbers for identification - using 12 satellites to ensure we get at least 8 visible
+         std::vector<int> prns = {1, 3, 7, 8, 11, 15, 19, 22, 24, 27, 30, 32};
          
-         // Create 5 beacons on each side of the road
-         // LEFT SIDE beacons (negative Y)
-         for (int i = 0; i < 5; ++i) {
-             double beacon_x = -road_length_/2.0 + (i + 0.5) * road_length_/5.0;
+         // Create satellites with orbital parameters optimized for high visibility
+         for (int i = 0; i < prns.size(); i++) {
+             GPSSatellite satellite;
+             satellite.id = "G" + std::to_string(prns[i]);
+             satellite.prn = prns[i];
              
-             UWBBeacon beacon;
-             beacon.id = "beacon_left_" + std::to_string(i);
-             beacon.position = Eigen::Vector3d(beacon_x, -road_side, beacon_height_);
-             beacon.range = max_distance_;
-             beacon.frequency = 6500.0;
-             beacon.power = 20.0;
+             // Assign orbital parameters to distribute satellites for good geometry and visibility
+             satellite.semi_major_axis = GPSPhysics::GPS_ORBIT_RADIUS;
+             satellite.eccentricity = 0.01 + 0.005 * uniform_dist_(rng_);  // 0.01-0.015
              
-             beacons_.push_back(beacon);
+             // Inclination around 55° with some variation (in radians)
+             satellite.inclination = GPSPhysics::deg2rad(55.0 + 2.0 * (uniform_dist_(rng_) - 0.5));
              
-             ROS_INFO("Created beacon %s at (%.2f, %.2f, %.2f)", 
-                      beacon.id.c_str(), beacon.position.x(), beacon.position.y(), beacon.position.z());
+             // Distribute satellites across orbital planes for good visibility
+             // Use 30 degree spacing for better coverage
+             satellite.right_ascension = GPSPhysics::deg2rad(30.0 * i);
+             
+             // For optimal visibility, place more satellites at higher elevations
+             // Use phase differences to ensure better distribution
+             double phase_offset = 30.0 * i + 120.0 * uniform_dist_(rng_);
+             
+             // For the first 8 satellites, ensure they're highly visible by giving them
+             // better mean anomaly values that will result in higher elevations
+             if (i < 8) {
+                 // For these satellites, we'll place them strategically to ensure positive elevation
+                 // by adjusting their mean anomaly and argument of perigee
+                 satellite.argument_of_perigee = GPSPhysics::deg2rad(45.0 + 90.0 * uniform_dist_(rng_));
+                 satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset + 30.0 * i);
+             } else {
+                 // For additional satellites, use more random distribution
+                 satellite.argument_of_perigee = GPSPhysics::deg2rad(360.0 * uniform_dist_(rng_));
+                 satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset);
+             }
+             
+             // Mean motion is inversely related to orbital period (approximately 12 hours)
+             satellite.mean_motion = std::sqrt(GPSPhysics::GPS_EARTH_GM / 
+                                      std::pow(satellite.semi_major_axis, 3));
+             
+             // Initialize satellite position
+             satellite.updateState(gps_time_);
+             
+             // Calculate initial elevation and azimuth
+             double elevation, azimuth;
+             GPSPhysics::calculateElevationAzimuth(user_position_, satellite.position, elevation, azimuth);
+             satellite.elevation = elevation;
+             satellite.azimuth = azimuth;
+             
+             // Assign random initial clock bias (-10 to 10 meters)
+             satellite.clock_bias = 20.0 * (uniform_dist_(rng_) - 0.5);
+             
+             // Assign random clock drift (-0.01 to 0.01 m/s)
+             satellite.clock_drift = 0.02 * (uniform_dist_(rng_) - 0.5);
+             
+             // Add the satellite
+             satellites_.push_back(satellite);
+             
+             ROS_INFO("Created satellite %s at initial position (%.2f, %.2f, %.2f), elevation: %.1f°", 
+                      satellite.id.c_str(), satellite.position.x(), satellite.position.y(), 
+                      satellite.position.z(), satellite.elevation);
          }
          
-         // RIGHT SIDE beacons (positive Y)
-         for (int i = 0; i < 5; ++i) {
-             double beacon_x = -road_length_/2.0 + (i + 0.5) * road_length_/5.0 - 4.0;  // Offset by 4m
-             
-             UWBBeacon beacon;
-             beacon.id = "beacon_right_" + std::to_string(i);
-             beacon.position = Eigen::Vector3d(beacon_x, road_side, beacon_height_);
-             beacon.range = max_distance_;
-             beacon.frequency = 6500.0;
-             beacon.power = 20.0;
-             
-             beacons_.push_back(beacon);
-             
-             ROS_INFO("Created beacon %s at (%.2f, %.2f, %.2f)", 
-                      beacon.id.c_str(), beacon.position.x(), beacon.position.y(), beacon.position.z());
+         // Check if we have enough visible satellites (above MIN_ELEVATION_ANGLE)
+         int visible_count = 0;
+         for (const auto& sat : satellites_) {
+             if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                 visible_count++;
+             }
          }
          
-         ROS_INFO("Created exactly %zu UWB beacons", beacons_.size());
-     }
-     
-     void computeSignalPaths() {
-         ROS_INFO("Computing signal paths with robust building penetration prevention...");
-         
-         signal_paths_.clear();
-         active_reflection_faces_.clear();
-         
-         for (const auto& beacon : beacons_) {
-             // Compute direct path first
-             computeDirectPath(beacon);
+         // If we don't have at least 8 visible satellites, adjust some orbital parameters
+         if (visible_count < 8) {
+             ROS_WARN("Only %d satellites visible, adjusting orbital parameters...", visible_count);
              
-             // Compute reflected paths
-             for (int reflection_count = 1; reflection_count <= max_reflections_; ++reflection_count) {
-                 if (slow_mode_) {
-                     ros::Duration(0.05).sleep();
+             // Adjust satellites with negative or low elevation
+             for (auto& sat : satellites_) {
+                 if (sat.elevation < GPSPhysics::MIN_ELEVATION_ANGLE) {
+                     // Adjust the satellite's position to have higher elevation
+                     // Move it above horizon by adjusting its argument of perigee and mean anomaly
+                     double current_elev = sat.elevation;
+                     
+                     // Try different orbital parameters until we get better elevation
+                     int attempts = 0;
+                     while (sat.elevation < GPSPhysics::MIN_ELEVATION_ANGLE + 5.0 && attempts < 10) {
+                         // Adjust orbital parameters to move satellite higher
+                         sat.argument_of_perigee = GPSPhysics::deg2rad(45.0 + 90.0 * uniform_dist_(rng_));
+                         sat.mean_anomaly = GPSPhysics::deg2rad(180.0 * uniform_dist_(rng_));
+                         
+                         // Update position with new parameters
+                         sat.updateState(gps_time_);
+                         
+                         // Recalculate elevation
+                         double new_elev, new_azim;
+                         GPSPhysics::calculateElevationAzimuth(user_position_, sat.position, new_elev, new_azim);
+                         sat.elevation = new_elev;
+                         sat.azimuth = new_azim;
+                         
+                         attempts++;
+                     }
+                     
+                     ROS_INFO("Adjusted satellite %s: elevation changed from %.1f° to %.1f°", 
+                             sat.id.c_str(), current_elev, sat.elevation);
                  }
-                 computeReflectedPaths(beacon, reflection_count);
              }
-         }
-         
-         // Sort paths by total path loss (best signal first)
-         std::sort(signal_paths_.begin(), signal_paths_.end(), 
-               [](const SignalPath& a, const SignalPath& b) {
-                   return a.total_path_loss < b.total_path_loss;
-               });
-         
-         // Keep only paths with signal above threshold and no building penetration
-         auto it = std::remove_if(signal_paths_.begin(), signal_paths_.end(),
-                               [this](const SignalPath& path) {
-                                   if (path.penetrates_building) {
-                                       return true;  // Remove paths that penetrate buildings
-                                   }
-                                   
-                                   if (path.forced) {
-                                       return false;  // Keep forced paths regardless of signal power
-                                   }
-                                   
-                                   return path.total_path_loss > (min_signal_power_ - noise_floor_);
-                               });
-         
-         signal_paths_.erase(it, signal_paths_.end());
-         
-         // Limit number of paths to visualize for clarity
-         const int max_paths_to_keep = 50;
-         
-         if (signal_paths_.size() > max_paths_to_keep) {
-             signal_paths_.resize(max_paths_to_keep);
-         }
-         
-         // Count paths by type
-         int direct_paths = 0;
-         int single_reflection = 0;
-         int double_reflection = 0;
-         int forced_paths = 0;
-         
-         for (const auto& path : signal_paths_) {
-             if (path.forced) {
-                 forced_paths++;
-             } else if (path.reflection_count == 0) {
-                 direct_paths++;
-             } else if (path.reflection_count == 1) {
-                 single_reflection++;
-             } else if (path.reflection_count == 2) {
-                 double_reflection++;
+             
+             // Recount visible satellites
+             visible_count = 0;
+             for (const auto& sat : satellites_) {
+                 if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                     visible_count++;
+                 }
              }
+             
+             ROS_INFO("After adjustment: %d satellites visible", visible_count);
          }
          
-         ROS_INFO("Computed %zu valid signal paths (%d direct, %d single, %d double, %d forced)",
-                 signal_paths_.size(), direct_paths, single_reflection, double_reflection, forced_paths);
+         ROS_INFO("Created %zu GPS satellites with realistic orbits, %d visible", 
+                  satellites_.size(), visible_count);
      }
      
-     void ensureDirectPaths() {
-         // Make sure every beacon has a direct path to the user if not blocked by buildings
-         std::set<std::string> beacons_with_direct_paths;
+     void computeGPSSignals() {
+         ROS_INFO("Computing GPS satellite signals and pseudorange measurements...");
          
-         // Find beacons that already have direct paths
-         for (const auto& path : signal_paths_) {
-             if (path.reflection_count == 0) {
-                 beacons_with_direct_paths.insert(path.beacon_id);
-             }
-         }
+         satellite_signals_.clear();
          
-         // For every beacon without a direct path, check if one is possible
-         for (const auto& beacon : beacons_) {
-             if (beacons_with_direct_paths.find(beacon.id) != beacons_with_direct_paths.end()) {
-                 continue;  // Already has a direct path
-             }
-             
-             // Check if there's a clear direct path
-             double distance = (user_position_ - beacon.position).norm();
-             
-             // Skip if outside range
-             if (distance > beacon.range || distance > max_distance_) {
+         for (const auto& satellite : satellites_) {
+             // Skip satellites below horizon
+             if (satellite.elevation < GPSPhysics::MIN_ELEVATION_ANGLE) {
                  continue;
              }
              
-             // Check for building penetration
-             bool penetrates = checkSegmentPenetration(beacon.position, user_position_);
+             // Compute direct path
+             SatelliteSignal signal;
+             signal.satellite_id = satellite.id;
              
-             if (!penetrates) {
-                 // Clear path exists, add it
-                 double path_loss = RayTracing::calculateFreeSpacePathLoss(distance, beacon.frequency);
-                 path_loss -= beacon.power;  // Adjust for beacon power
-                 
-                 SignalPath path;
-                 path.beacon_id = beacon.id;
-                 
-                 PathSegment segment(beacon.position, user_position_, 0, path_loss, distance, 1.0);
-                 segment.penetrates_building = false;  // We verified it doesn't penetrate
-                 
-                 path.addSegment(segment);
-                 signal_paths_.push_back(path);
-                 
-                 if (debug_mode_) {
-                     ROS_INFO("Added direct path from beacon %s, distance=%.2f m", 
-                              beacon.id.c_str(), distance);
-                 }
-             }
-         }
-     }
-     
-     void addForcedReflections() {
-         // For each beacon with no reflections, try to find a valid reflection path
-         std::map<std::string, int> beacon_reflection_counts;
-         
-         for (const auto& path : signal_paths_) {
-             if (path.reflection_count > 0) {
-                 beacon_reflection_counts[path.beacon_id]++;
-             }
-         }
-         
-         for (const auto& beacon : beacons_) {
-             if (beacon_reflection_counts[beacon.id] > 0) {
-                 continue;  // Already has reflection paths
-             }
+             // Calculate geometric range (true distance)
+             double distance = (satellite.position - user_position_).norm();
+             signal.geometric_range = distance;
              
-             // Find a valid reflection path
-             addForcedReflectionForBeacon(beacon);
-         }
-     }
-     
-     void addForcedReflectionForBeacon(const UWBBeacon& beacon) {
-         // Try to find the best building and face for a reflection
-         size_t best_building_idx = SIZE_MAX;
-         size_t best_face_idx = SIZE_MAX;
-         Eigen::Vector3d best_reflection_point;
-         double best_score = -std::numeric_limits<double>::max();
-         
-         // Try each building
-         for (size_t building_idx = 0; building_idx < buildings_.size(); building_idx++) {
-             const auto& building = buildings_[building_idx];
-             auto faces = building.getFaces();
+             // Calculate signal travel time (in seconds)
+             signal.signal_travel_time = distance / GPSPhysics::SPEED_OF_LIGHT;
              
-             // Try each face
-             for (size_t face_idx = 0; face_idx < faces.size(); face_idx++) {
-                 const auto& face = faces[face_idx];
-                 
-                 // Skip bottom face
-                 if (face.normal.z() < -0.9) {
-                     continue;
-                 }
-                 
-                 // Try several points on the face to find a good reflection
-                 const int grid_size = 3;  // 3x3 grid
-                 double width = face.dimensions.x();
-                 double height = face.dimensions.y();
-                 
-                 for (int i = 0; i < grid_size; i++) {
-                     for (int j = 0; j < grid_size; j++) {
-                         // Calculate grid point
-                         double u = (2.0 * i / (grid_size - 1.0) - 1.0) * (width / 2.0 * 0.8);
-                         double v = (2.0 * j / (grid_size - 1.0) - 1.0) * (height / 2.0 * 0.8);
-                         
-                         Eigen::Vector3d reflection_point = face.center + u * face.tangent + v * face.bitangent;
-                         
-                         // Calculate segments
-                         double dist1 = (reflection_point - beacon.position).norm();
-                         double dist2 = (user_position_ - reflection_point).norm();
-                         double total_dist = dist1 + dist2;
-                         
-                         // Skip if too far
-                         if (total_dist > max_distance_ * 1.2) {
-                             continue;
-                         }
-                         
-                         // Check if both segments are clear of buildings
-                         bool segment1_penetrates = checkSegmentPenetration(
-                             beacon.position, reflection_point, building_idx);
-                         
-                         if (segment1_penetrates) {
-                             continue;  // First segment penetrates a building
-                         }
-                         
-                         bool segment2_penetrates = checkSegmentPenetration(
-                             reflection_point, user_position_, building_idx);
-                         
-                         if (segment2_penetrates) {
-                             continue;  // Second segment penetrates a building
-                         }
-                         
-                         // Calculate score (lower distance = better, less building penetration risk)
-                         double score = 1000.0 / total_dist;
-                         
-                         if (score > best_score) {
-                             best_score = score;
-                             best_building_idx = building_idx;
-                             best_face_idx = face_idx;
-                             best_reflection_point = reflection_point;
-                         }
-                     }
-                 }
-             }
-         }
-         
-         // If found a good reflection point, create a forced path
-         if (best_building_idx != SIZE_MAX) {
-             const auto& building = buildings_[best_building_idx];
-             auto faces = building.getFaces();
-             const auto& face = faces[best_face_idx];
+             // Check if line of sight is available
+             bool line_of_sight = !checkSignalBlockage(satellite.position, user_position_);
+             signal.is_los = line_of_sight;
              
-             double dist1 = (best_reflection_point - beacon.position).norm();
-             double dist2 = (user_position_ - best_reflection_point).norm();
-             double total_dist = dist1 + dist2;
+             // Calculate signal strength based on elevation, distance
+             double path_loss = GPSPhysics::calculateFreeSpacePathLoss(distance, satellite.frequency_l1);
              
-             // Calculate incident angle
-             Eigen::Vector3d dir1 = (best_reflection_point - beacon.position).normalized();
-             double incident_angle_rad = RayTracing::calculateIncidentAngle(dir1, face.normal);
-             double incident_angle_deg = incident_angle_rad * 180.0 / M_PI;
+             // Base signal strength for direct path
+             double signal_strength = 0.0;
              
-             // Create the path
-             SignalPath path;
-             path.beacon_id = beacon.id;
-             path.forced = true;
+             // Pre-compute satellite-specific errors
+             // 1. Satellite clock error
+             signal.satellite_clock_error = satellite.clock_bias + satellite.clock_drift * signal.signal_travel_time;
              
-             // First segment: beacon to reflection point
-             PathSegment segment1(
-                 beacon.position, best_reflection_point, 0, 30.0,  // Fixed loss for visualization
-                 dist1, 1.0, -1, -1, 0.0);
+             // 2. Relativistic correction
+             signal.satellite_clock_error += GPSPhysics::calculateRelativisticCorrection(satellite);
              
-             // Set penetration flag
-             segment1.penetrates_building = checkSegmentPenetration(
-                 beacon.position, best_reflection_point, best_building_idx);
+             // 3. Ionospheric delay
+             signal.ionospheric_delay = GPSPhysics::calculateIonosphericDelay(
+                 satellite.elevation, satellite.azimuth, user_lat_, user_lon_, iono_params_, gps_time_);
              
-             path.addSegment(segment1);
+             // 4. Tropospheric delay
+             signal.tropospheric_delay = GPSPhysics::calculateTroposphericDelay(
+                 satellite.elevation, user_height_);
              
-             // Second segment: reflection point to user
-             PathSegment segment2(
-                 best_reflection_point, user_position_, 1, 20.0,  // Fixed loss for visualization
-                 total_dist, 0.8, best_building_idx, best_face_idx, incident_angle_deg);
+             // 5. Receiver clock bias
+             signal.receiver_clock_bias = receiver_clock_bias_;
              
-             // Set penetration flag
-             segment2.penetrates_building = checkSegmentPenetration(
-                 best_reflection_point, user_position_, best_building_idx);
-             
-             path.addSegment(segment2);
-             
-             // Double-check paths with our advanced penetration algorithm
-             bool path_ok = true;
-             for (const auto& segment : path.segments) {
-                 // Final validation with most rigorous test
-                 if (checkSegmentPenetration(segment.start, segment.end, 
-                                          segment.reflection_building_id)) {
-                     path_ok = false;
-                     break;
-                 }
-             }
-             
-             // Only add the path if it's valid
-             if (path_ok) {
-                 signal_paths_.push_back(path);
+             if (line_of_sight) {
+                 // Direct line of sight available
+                 signal_strength = GPSPhysics::calculateCN0FromElevation(satellite.elevation, 0.0);
                  
-                 // Mark face as active
-                 active_reflection_faces_.push_back(std::make_pair(best_building_idx, best_face_idx));
+                 // Create a direct path segment
+                 SignalSegment direct_segment(
+                     satellite.position,
+                     user_position_,
+                     true,
+                     signal_strength
+                 );
                  
-                 if (debug_mode_) {
-                     ROS_INFO("Added forced reflection path for beacon %s via building %s face %zu",
-                              beacon.id.c_str(), building.id.c_str(), best_face_idx);
-                 }
-             } else if (debug_mode_) {
-                 ROS_WARN("Forced reflection path for beacon %s would penetrate a building, not adding",
-                          beacon.id.c_str());
-             }
-         }
-     }
-     
-     void computeDirectPath(const UWBBeacon& beacon) {
-         // Direct line-of-sight path from beacon to user
-         Eigen::Vector3d direction = (user_position_ - beacon.position).normalized();
-         double distance = (user_position_ - beacon.position).norm();
-         
-         // Skip if outside beacon range
-         if (distance > beacon.range || distance > max_distance_) {
-             if (debug_mode_) {
-                 ROS_INFO("Beacon %s: Direct path distance %.2f exceeds range %.2f", 
-                          beacon.id.c_str(), distance, beacon.range);
-             }
-             return;
-         }
-         
-         // Check if the direct path penetrates any building
-         bool penetrates = checkSegmentPenetration(beacon.position, user_position_);
-         
-         if (penetrates) {
-             if (debug_mode_) {
-                 ROS_INFO("Beacon %s: Direct path blocked by building", beacon.id.c_str());
-             }
-             return;
-         }
-         
-         // Calculate path loss
-         double path_loss = RayTracing::calculateFreeSpacePathLoss(distance, beacon.frequency);
-         path_loss -= beacon.power;  // Adjust for beacon transmit power
-         
-         // Create the signal path
-         SignalPath path;
-         path.beacon_id = beacon.id;
-         
-         PathSegment segment(beacon.position, user_position_, 0, path_loss, distance, 1.0);
-         segment.penetrates_building = false;  // We verified it doesn't penetrate
-         
-         path.addSegment(segment);
-         signal_paths_.push_back(path);
-         
-         if (debug_mode_) {
-             ROS_INFO("Beacon %s: Added direct path, distance=%.2f m, loss=%.2f dB", 
-                      beacon.id.c_str(), distance, path_loss);
-         }
-     }
-     
-     void computeReflectedPaths(const UWBBeacon& beacon, int reflection_count) {
-         if (reflection_count <= 0 || reflection_count > max_reflections_) {
-             return;
-         }
-         
-         if (debug_mode_) {
-             ROS_INFO("Searching for %s reflection paths from beacon %s...", 
-                      (reflection_count == 1) ? "single" : "double",
-                      beacon.id.c_str());
-         }
-         
-         if (reflection_count == 1) {
-             computeSingleReflectionPaths(beacon);
-         } else if (reflection_count == 2) {
-             computeDoubleReflectionPaths(beacon);
-         }
-     }
-     
-     void computeSingleReflectionPaths(const UWBBeacon& beacon) {
-         int paths_found = 0;
-         
-         // For each building
-         for (size_t building_idx = 0; building_idx < buildings_.size(); building_idx++) {
-             const auto& building = buildings_[building_idx];
-             auto faces = building.getFaces();
-             
-             // For each face
-             for (size_t face_idx = 0; face_idx < faces.size(); face_idx++) {
-                 const auto& face = faces[face_idx];
+                 signal.addSegment(direct_segment);
+                 signal.signal_strength = signal_strength;
                  
-                 // Skip bottom face
-                 if (face.normal.z() < -0.9) {
-                     continue;
-                 }
+                 // 6. Receiver noise error (depends on signal strength)
+                 signal.receiver_noise = GPSPhysics::calculateReceiverNoiseError(signal_strength, rng_);
                  
-                 // Try a grid of points on the face for better reflection finding
-                 const int grid_size = 3;
-                 double width = face.dimensions.x();
-                 double height = face.dimensions.y();
+                 // 7. No multipath for direct LOS
+                 signal.multipath_error = 0.0;
+             } else {
+                 // Line of sight blocked - try to find if signal penetrates buildings
+                 // Find buildings that block the signal
+                 std::vector<int> blocking_buildings = findBlockingBuildings(satellite.position, user_position_);
                  
-                 for (int i = 0; i < grid_size; i++) {
-                     for (int j = 0; j < grid_size; j++) {
-                         // Calculate grid point
-                         double u = (2.0 * i / (grid_size - 1.0) - 1.0) * (width / 2.0 * 0.8);
-                         double v = (2.0 * j / (grid_size - 1.0) - 1.0) * (height / 2.0 * 0.8);
-                         
-                         Eigen::Vector3d reflection_point = face.center + u * face.tangent + v * face.bitangent;
-                         
-                         // Calculate directions
-                         Eigen::Vector3d dir1 = (reflection_point - beacon.position).normalized();
-                         Eigen::Vector3d dir2 = (user_position_ - reflection_point).normalized();
-                         
-                         // Calculate incident angle
-                         double incident_angle_rad = RayTracing::calculateIncidentAngle(dir1, face.normal);
-                         
-                         // Verify reflection law
-                         if (!RayTracing::verifyReflectionLaw(-dir1, dir2, face.normal)) {
-                             continue;  // Law of reflection not satisfied
-                         }
-                         
-                         // Calculate distances
-                         double distance1 = (reflection_point - beacon.position).norm();
-                         double distance2 = (user_position_ - reflection_point).norm();
-                         double total_distance = distance1 + distance2;
-                         
-                         // Skip if too far
-                         if (total_distance > beacon.range || total_distance > max_distance_) {
-                             continue;
-                         }
-                         
-                         // Critical: check for building penetration
-                         bool segment1_penetrates = checkSegmentPenetration(
-                             beacon.position, reflection_point, building_idx);
-                         
-                         if (segment1_penetrates) {
-                             continue;  // First segment penetrates a building
-                         }
-                         
-                         bool segment2_penetrates = checkSegmentPenetration(
-                             reflection_point, user_position_, building_idx);
-                         
-                         if (segment2_penetrates) {
-                             continue;  // Second segment penetrates a building
-                         }
-                         
-                         // Convert incident angle to degrees for display
-                         double incident_angle_deg = incident_angle_rad * 180.0 / M_PI;
-                         
-                         // Calculate reflection coefficient
-                         double reflection_coef = RayTracing::calculateReflectionCoefficient(
-                             incident_angle_rad, building.reflectivity);
-                         
-                         // Calculate path losses
-                         double path_loss1 = RayTracing::calculateFreeSpacePathLoss(distance1, beacon.frequency);
-                         double path_loss2 = RayTracing::calculateFreeSpacePathLoss(distance2, beacon.frequency);
-                         
-                         // Reflection loss (based on reflection coefficient)
-                         double reflection_loss = -20.0 * std::log10(reflection_coef);
-                         
-                         // Total loss adjusted for beacon power
-                         double total_loss = path_loss1 + path_loss2 + reflection_loss - beacon.power;
-                         
-                         // Create the signal path
-                         SignalPath path;
-                         path.beacon_id = beacon.id;
-                         
-                         // First segment: beacon to reflection point
-                         PathSegment segment1(
-                             beacon.position, reflection_point, 0, path_loss1, 
-                             distance1, 1.0, -1, -1, 0.0);
-                         
-                         segment1.penetrates_building = segment1_penetrates;
-                         path.addSegment(segment1);
-                         
-                         // Second segment: reflection point to user
-                         PathSegment segment2(
-                             reflection_point, user_position_, 1, path_loss2 + reflection_loss, 
-                             total_distance, reflection_coef, building_idx, face_idx, incident_angle_deg);
-                         
-                         segment2.penetrates_building = segment2_penetrates;
-                         path.addSegment(segment2);
-                         
-                         signal_paths_.push_back(path);
-                         
-                         // Mark face as active
-                         active_reflection_faces_.push_back(std::make_pair(building_idx, face_idx));
-                         
-                         paths_found++;
-                         
-                         if (debug_mode_) {
-                             ROS_INFO("Beacon %s: Found reflection on building %s face %zu, angle=%.1f°, loss=%.1f dB",
-                                      beacon.id.c_str(), building.id.c_str(), face_idx, 
-                                      incident_angle_deg, total_loss);
-                         }
-                     }
-                 }
-             }
-         }
-         
-         if (debug_mode_) {
-             ROS_INFO("Beacon %s: Found %d single reflection paths", beacon.id.c_str(), paths_found);
-         }
-     }
-     
-     void computeDoubleReflectionPaths(const UWBBeacon& beacon) {
-         int paths_found = 0;
-         
-         // For first reflection building
-         for (size_t building1_idx = 0; building1_idx < buildings_.size() && paths_found < 2; building1_idx++) {
-             const auto& building1 = buildings_[building1_idx];
-             auto faces1 = building1.getFaces();
-             
-             // For first reflection face
-             for (size_t face1_idx = 0; face1_idx < faces1.size() && paths_found < 2; face1_idx++) {
-                 const auto& face1 = faces1[face1_idx];
-                 
-                 // Skip bottom face
-                 if (face1.normal.z() < -0.9) {
-                     continue;
-                 }
-                 
-                 // Try a point in the center of the face for simplicity
-                 Eigen::Vector3d reflection_point1 = face1.center;
-                 
-                 // Check if beacon can see this point
-                 Eigen::Vector3d dir1 = (reflection_point1 - beacon.position).normalized();
-                 double dist1 = (reflection_point1 - beacon.position).norm();
-                 
-                 // Check if segment from beacon to first reflection penetrates any building
-                 bool segment1_penetrates = checkSegmentPenetration(
-                     beacon.position, reflection_point1, building1_idx);
-                 
-                 if (segment1_penetrates) {
-                     continue;  // First segment penetrates a building
-                 }
-                 
-                 // Calculate incident angle and reflection direction
-                 double incident_angle1 = RayTracing::calculateIncidentAngle(dir1, face1.normal);
-                 Eigen::Vector3d reflection_dir1 = RayTracing::calculateReflection(dir1, face1.normal);
-                 
-                 // For second reflection building
-                 for (size_t building2_idx = 0; building2_idx < buildings_.size() && paths_found < 2; building2_idx++) {
-                     // Skip same building unless it's in a special geometry
-                     if (building1_idx == building2_idx) {
-                         continue;
+                 if (!blocking_buildings.empty()) {
+                     // Calculate attenuated signal strength
+                     double total_attenuation = 0.0;
+                     for (int building_idx : blocking_buildings) {
+                         total_attenuation += buildings_[building_idx].signal_attenuation;
                      }
                      
-                     const auto& building2 = buildings_[building2_idx];
-                     auto faces2 = building2.getFaces();
+                     // Attenuated signal strength
+                     signal_strength = GPSPhysics::calculateCN0FromElevation(satellite.elevation, total_attenuation);
                      
-                     // For second reflection face
-                     for (size_t face2_idx = 0; face2_idx < faces2.size() && paths_found < 2; face2_idx++) {
-                         const auto& face2 = faces2[face2_idx];
+                     // Create an attenuated direct path if signal strength is above threshold
+                     if (signal_strength > min_cn0_threshold_) {
+                         SignalSegment attenuated_segment(
+                             satellite.position,
+                             user_position_,
+                             false,  // Not a direct LOS
+                             signal_strength
+                         );
                          
-                         // Skip bottom face
-                         if (face2.normal.z() < -0.9) {
-                             continue;
-                         }
+                         attenuated_segment.penetrates_building = true;
+                         signal.addSegment(attenuated_segment);
+                         signal.signal_strength = signal_strength;
                          
-                         // Find intersection with second face plane
-                         double d2 = face2.normal.dot(face2.center);
-                         double nd2 = face2.normal.dot(reflection_dir1);
+                         // 6. Receiver noise error (higher for attenuated signals)
+                         signal.receiver_noise = GPSPhysics::calculateReceiverNoiseError(signal_strength, rng_);
                          
-                         // Skip if parallel
-                         if (std::abs(nd2) < RayTracing::EPSILON) {
-                             continue;
-                         }
-                         
-                         // Calculate intersection parameter
-                         double t2 = (d2 - face2.normal.dot(reflection_point1)) / nd2;
-                         
-                         // Skip if intersection is behind first reflection
-                         if (t2 < 0) {
-                             continue;
-                         }
-                         
-                         // Calculate second reflection point
-                         Eigen::Vector3d reflection_point2 = reflection_point1 + t2 * reflection_dir1;
-                         
-                         // Check if point is on the face
-                         if (!RayTracing::isPointOnFace(
-                             reflection_point2, face2.center, face2.normal,
-                             face2.tangent, face2.bitangent, face2.dimensions)) {
-                             continue;
-                         }
-                         
-                         // Calculate directions and distances
-                         Eigen::Vector3d dir2 = (reflection_point2 - reflection_point1).normalized();
-                         double dist2 = (reflection_point2 - reflection_point1).norm();
-                         
-                         // Check if segment from first to second reflection penetrates any building
-                         bool segment2_penetrates = checkSegmentPenetration(
-                             reflection_point1, reflection_point2, building1_idx, building2_idx);
-                         
-                         if (segment2_penetrates) {
-                             continue;  // Second segment penetrates a building
-                         }
-                         
-                         // Calculate second incident angle and reflection
-                         double incident_angle2 = RayTracing::calculateIncidentAngle(dir2, face2.normal);
-                         Eigen::Vector3d reflection_dir2 = RayTracing::calculateReflection(dir2, face2.normal);
-                         
-                         // Calculate direction to user
-                         Eigen::Vector3d dir3 = (user_position_ - reflection_point2).normalized();
-                         double dist3 = (user_position_ - reflection_point2).norm();
-                         
-                         // Verify reflection law
-                         if (!RayTracing::verifyReflectionLaw(-dir2, dir3, face2.normal)) {
-                             continue;  // Law of reflection not satisfied
-                         }
-                         
-                         // Check if segment from second reflection to user penetrates any building
-                         bool segment3_penetrates = checkSegmentPenetration(
-                             reflection_point2, user_position_, building2_idx);
-                         
-                         if (segment3_penetrates) {
-                             continue;  // Third segment penetrates a building
-                         }
-                         
-                         // Calculate total distance
-                         double total_dist = dist1 + dist2 + dist3;
-                         
-                         // Skip if too far
-                         if (total_dist > beacon.range || total_dist > max_distance_) {
-                             continue;
-                         }
-                         
-                         // Calculate angles in degrees for display
-                         double incident_angle1_deg = incident_angle1 * 180.0 / M_PI;
-                         double incident_angle2_deg = incident_angle2 * 180.0 / M_PI;
-                         
-                         // Calculate reflection coefficients
-                         double reflection_coef1 = RayTracing::calculateReflectionCoefficient(
-                             incident_angle1, building1.reflectivity);
-                         double reflection_coef2 = RayTracing::calculateReflectionCoefficient(
-                             incident_angle2, building2.reflectivity);
-                         
-                         // Path losses
-                         double path_loss1 = RayTracing::calculateFreeSpacePathLoss(dist1, beacon.frequency);
-                         double path_loss2 = RayTracing::calculateFreeSpacePathLoss(dist2, beacon.frequency);
-                         double path_loss3 = RayTracing::calculateFreeSpacePathLoss(dist3, beacon.frequency);
-                         
-                         // Reflection losses
-                         double reflection_loss1 = -20.0 * std::log10(reflection_coef1);
-                         double reflection_loss2 = -20.0 * std::log10(reflection_coef2);
-                         
-                         // Total loss
-                         double total_loss = path_loss1 + path_loss2 + path_loss3 + 
-                                           reflection_loss1 + reflection_loss2 - beacon.power;
-                         
-                         // Create the path
-                         SignalPath path;
-                         path.beacon_id = beacon.id;
-                         
-                         // First segment: beacon to first reflection
-                         PathSegment segment1(
-                             beacon.position, reflection_point1, 0, path_loss1, 
-                             dist1, 1.0, -1, -1, 0.0);
-                         
-                         segment1.penetrates_building = segment1_penetrates;
-                         path.addSegment(segment1);
-                         
-                         // Second segment: first to second reflection
-                         PathSegment segment2(
-                             reflection_point1, reflection_point2, 1, 
-                             path_loss2 + reflection_loss1, 
-                             dist1 + dist2, reflection_coef1, 
-                             building1_idx, face1_idx, incident_angle1_deg);
-                         
-                         segment2.penetrates_building = segment2_penetrates;
-                         path.addSegment(segment2);
-                         
-                         // Third segment: second reflection to user
-                         PathSegment segment3(
-                             reflection_point2, user_position_, 2, 
-                             path_loss3 + reflection_loss2, 
-                             total_dist, reflection_coef1 * reflection_coef2, 
-                             building2_idx, face2_idx, incident_angle2_deg);
-                         
-                         segment3.penetrates_building = segment3_penetrates;
-                         path.addSegment(segment3);
-                         
-                         signal_paths_.push_back(path);
-                         
-                         // Mark both faces as active
-                         active_reflection_faces_.push_back(std::make_pair(building1_idx, face1_idx));
-                         active_reflection_faces_.push_back(std::make_pair(building2_idx, face2_idx));
-                         
-                         paths_found++;
-                         
-                         if (debug_mode_) {
-                             ROS_INFO("Beacon %s: Found double reflection path via buildings %s→%s, loss=%.1f dB",
-                                      beacon.id.c_str(), 
-                                      building1.id.c_str(), building2.id.c_str(),
-                                      total_loss);
-                         }
+                         // 7. Small multipath error possible even with attenuated signals
+                         signal.multipath_error = 0.5 * GPSPhysics::calculateMultipathError(
+                             satellite.elevation, signal_strength, false, rng_);
+                     } else {
+                         // Signal too weak after attenuation
+                         signal_strength = 0.0;
                      }
                  }
              }
-         }
-         
-         if (debug_mode_) {
-             ROS_INFO("Beacon %s: Found %d double reflection paths", beacon.id.c_str(), paths_found);
-         }
-     }
-     
-     // Completely revised building penetration check
-     bool checkSegmentPenetration(
-         const Eigen::Vector3d& start, 
-         const Eigen::Vector3d& end,
-         int exclude_building_idx = -1,
-         int exclude_building_idx2 = -1) {
-         
-         // Calculate ray direction and length
-         Eigen::Vector3d direction = end - start;
-         double segment_length = direction.norm();
-         
-         // Normalize direction (avoid division by zero)
-         if (segment_length < 1e-6) {
-             return false;  // Extremely short segment, not penetrating
-         }
-         direction.normalize();
-         
-         // Special case for problematic geometries
-         if (special_check_enabled_) {
-             for (size_t i = 0; i < buildings_.size(); i++) {
-                 if (static_cast<int>(i) == exclude_building_idx || 
-                     static_cast<int>(i) == exclude_building_idx2) {
-                     continue;  // Skip excluded buildings
-                 }
+             
+             // Check for multipath if enabled
+             if (show_multipath_ && 
+                 (line_of_sight || signal_strength > min_cn0_threshold_) && 
+                 uniform_dist_(rng_) < multipath_probability_) {
                  
-                 const auto& building = buildings_[i];
+                 // Find a potential reflector
+                 int reflector_idx = findPotentialReflector(satellite.position, user_position_);
                  
-                 // Special intense check for known problem cases
-                 if (building.id == "left_5" || building.id == "left_6") {
-                     // Do a very thorough multi-point check along this segment
-                     const int extra_samples = penetration_samples_;  // High sample count
-                     for (int j = 1; j < extra_samples; j++) {
-                         double t = static_cast<double>(j) / extra_samples;  // Avoid endpoints
-                         Eigen::Vector3d sample_point = start + t * (end - start);
+                 if (reflector_idx >= 0) {
+                     // Calculate reflection point
+                     Eigen::Vector3d reflection_point = calculateReflectionPoint(
+                         satellite.position, user_position_, reflector_idx);
+                     
+                     // Verify reflection path is not blocked
+                     bool path1_blocked = checkSignalBlockage(satellite.position, reflection_point);
+                     bool path2_blocked = checkSignalBlockage(reflection_point, user_position_);
+                     
+                     if (!path1_blocked && !path2_blocked) {
+                         // Calculate multipath signal strength (weaker than direct)
+                         double refl_distance1 = (reflection_point - satellite.position).norm();
+                         double refl_distance2 = (user_position_ - reflection_point).norm();
+                         double total_refl_distance = refl_distance1 + refl_distance2;
                          
-                         if (building.containsPoint(sample_point, 0.05)) {
-                             if (debug_mode_&&false) {
-                                 debug_penetration_points_.push_back(
-                                     std::make_pair(sample_point, building.color));
+                         // Calculate path loss for the reflection path
+                         double refl_path_loss = GPSPhysics::calculateFreeSpacePathLoss(
+                             total_refl_distance, satellite.frequency_l1);
+                         
+                         // Add additional loss for reflection (based on building reflectivity)
+                         double reflection_coef = buildings_[reflector_idx].reflectivity;
+                         double reflection_loss = -20.0 * std::log10(reflection_coef);  // Convert to dB
+                         
+                         // Calculate multipath signal strength
+                         double multipath_strength = GPSPhysics::calculateCN0FromElevation(
+                             satellite.elevation, refl_path_loss + reflection_loss);
+                         
+                         // Only add if strength is above threshold
+                         if (multipath_strength > min_cn0_threshold_) {
+                             // Create reflection segments
+                             SignalSegment refl_segment1(
+                                 satellite.position,
+                                 reflection_point,
+                                 false,
+                                 multipath_strength
+                             );
+                             
+                             SignalSegment refl_segment2(
+                                 reflection_point,
+                                 user_position_,
+                                 false,
+                                 multipath_strength
+                             );
+                             
+                             // If we have a direct LOS signal, keep it and add multipath
+                             if (signal.is_los || signal.segments.size() > 0) {
+                                 SatelliteSignal multipath_signal = signal;  // Copy existing signal
                                  
-                                 ROS_WARN("Special case: Segment penetrates building %s at sample point %d/%d",
-                                          building.id.c_str(), j, extra_samples);
+                                 // Update signal info for multipath
+                                 multipath_signal.is_multipath = true;
+                                 multipath_signal.signal_strength = multipath_strength;
+                                 
+                                 // Clear existing segments and add multipath segments
+                                 multipath_signal.segments.clear();
+                                 multipath_signal.addSegment(refl_segment1);
+                                 multipath_signal.addSegment(refl_segment2);
+                                 
+                                 // Calculate multipath error (code error)
+                                 multipath_signal.multipath_error = GPSPhysics::calculateMultipathError(
+                                     satellite.elevation, multipath_strength, true, rng_);
+                                 
+                                 // Calculate receiver noise based on multipath signal strength
+                                 multipath_signal.receiver_noise = GPSPhysics::calculateReceiverNoiseError(
+                                     multipath_strength, rng_);
+                                 
+                                 // Add multipath signal as a separate entry
+                                 satellite_signals_.push_back(multipath_signal);
+                                 
+                                 // Continue with the main signal
+                                 signal.is_multipath = false;
+                             } else {
+                                 // No direct signal, use multipath only
+                                 signal.is_multipath = true;
+                                 signal.addSegment(refl_segment1);
+                                 signal.addSegment(refl_segment2);
+                                 signal.signal_strength = multipath_strength;
+                                 
+                                 // Calculate multipath error
+                                 signal.multipath_error = GPSPhysics::calculateMultipathError(
+                                     satellite.elevation, multipath_strength, true, rng_);
+                                 
+                                 // Recalculate receiver noise for multipath signal
+                                 signal.receiver_noise = GPSPhysics::calculateReceiverNoiseError(
+                                     multipath_strength, rng_);
                              }
-                             return true;
                          }
                      }
                  }
              }
-         }
-         
-         // Method 1: Check if any building contains points along the segment
-         // Use more sample points for better accuracy
-         int sample_count = std::max(5, std::min(10, static_cast<int>(segment_length / 2.0)));
-         
-         for (int i = 1; i < sample_count; i++) {  // Skip endpoints to avoid false positives
-             double t = static_cast<double>(i) / sample_count;
-             Eigen::Vector3d sample_point = start + t * (end - start);
              
-             for (size_t j = 0; j < buildings_.size(); j++) {
-                 if (static_cast<int>(j) == exclude_building_idx || 
-                     static_cast<int>(j) == exclude_building_idx2) {
-                     continue;  // Skip excluded buildings
-                 }
+             // If we have any usable signal segments, calculate pseudorange
+             if (!signal.segments.empty() && signal.signal_strength > min_cn0_threshold_) {
+                 // Calculate true range + errors = pseudorange
+                 signal.pseudorange = signal.geometric_range + 
+                                     signal.satellite_clock_error + 
+                                     signal.ionospheric_delay + 
+                                     signal.tropospheric_delay + 
+                                     signal.receiver_clock_bias + 
+                                     signal.multipath_error + 
+                                     signal.receiver_noise;
                  
-                 const auto& building = buildings_[j];
+                 // Add the signal to our collection
+                 satellite_signals_.push_back(signal);
                  
-                 if (building.containsPoint(sample_point)) {
-                     if (debug_mode_ &&false) {
-                         debug_penetration_points_.push_back(std::make_pair(sample_point, building.color));
-                         
-                         ROS_WARN("Segment penetrates building %s (point containment)",
-                                  building.id.c_str());
-                     }
-                     return true;
+                 if (debug_mode_) {
+                     ROS_INFO("Satellite %s: %s, C/N0: %.1f dB-Hz, Range: %.1f m, Total Error: %.2f m",
+                              signal.satellite_id.c_str(),
+                              signal.is_los ? "LOS" : (signal.is_multipath ? "Multipath" : "Attenuated"),
+                              signal.signal_strength,
+                              signal.pseudorange,
+                              signal.pseudorange - signal.geometric_range);
                  }
              }
          }
          
-         // Method 2: Use ray-AABB intersection for more precision
+         // Count signals by type
+         int los_count = 0;
+         int attenuated_count = 0;
+         int multipath_count = 0;
+         
+         for (const auto& signal : satellite_signals_) {
+             if (signal.is_los) los_count++;
+             else if (signal.is_multipath) multipath_count++;
+             else attenuated_count++;
+         }
+         
+         ROS_INFO("Computed %zu usable satellite signals (%d LOS, %d attenuated, %d multipath)",
+                 satellite_signals_.size(), los_count, attenuated_count, multipath_count);
+     }
+     
+     bool checkSignalBlockage(const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
+         // Create a ray from start to end
+         Eigen::Vector3d direction = (end - start).normalized();
+         double segment_length = (end - start).norm();
+         
+         // Check if this ray intersects any building
          for (size_t i = 0; i < buildings_.size(); i++) {
-             if (static_cast<int>(i) == exclude_building_idx || 
-                 static_cast<int>(i) == exclude_building_idx2) {
-                 continue;  // Skip excluded buildings
-             }
-             
              const auto& building = buildings_[i];
              
              // Skip if either endpoint is inside or very close to this building
@@ -1671,19 +1659,156 @@
              
              // Check for ray-AABB intersection
              if (rayIntersectsAABB(start, direction, segment_length, building)) {
-                 if (debug_mode_&&false) {
-                     // Calculate an approximate penetration point for visualization
-                     Eigen::Vector3d mid_point = (start + end) * 0.5;
-                     debug_penetration_points_.push_back(std::make_pair(mid_point, building.color));
-                     
-                     ROS_WARN("Segment penetrates building %s (ray-AABB intersection)",
-                              building.id.c_str());
-                 }
-                 return true;
+                 return true;  // Signal is blocked
              }
          }
          
-         return false;  // No penetration detected
+         return false;  // No blockage detected
+     }
+     
+     std::vector<int> findBlockingBuildings(const Eigen::Vector3d& start, const Eigen::Vector3d& end) {
+         std::vector<int> blocking_buildings;
+         
+         // Create a ray from start to end
+         Eigen::Vector3d direction = (end - start).normalized();
+         double segment_length = (end - start).norm();
+         
+         // Check all buildings for intersection
+         for (size_t i = 0; i < buildings_.size(); i++) {
+             const auto& building = buildings_[i];
+             
+             // Skip if either endpoint is inside or very close to this building
+             if (building.containsPoint(start, 0.1) || building.containsPoint(end, 0.1)) {
+                 continue;
+             }
+             
+             // Check for ray-AABB intersection
+             if (rayIntersectsAABB(start, direction, segment_length, building)) {
+                 blocking_buildings.push_back(i);
+             }
+         }
+         
+         return blocking_buildings;
+     }
+     
+     int findPotentialReflector(const Eigen::Vector3d& satellite_pos, const Eigen::Vector3d& user_pos) {
+         // Find a building that could serve as reflector for multipath
+         // Strategy: Look for buildings near the user, but not directly in the LOS path
+         
+         int best_reflector = -1;
+         double best_score = -1.0;
+         
+         // Direction from user to satellite
+         Eigen::Vector3d sat_direction = (satellite_pos - user_pos).normalized();
+         
+         // Check each building as a potential reflector
+         for (size_t i = 0; i < buildings_.size(); i++) {
+             const auto& building = buildings_[i];
+             
+             // Vector from user to building center
+             Eigen::Vector3d to_building = (building.center - user_pos);
+             double distance_to_building = to_building.norm();
+             
+             // Skip buildings too far away
+             if (distance_to_building > 50.0) {
+                 continue;
+             }
+             
+             // Normalize
+             to_building.normalize();
+             
+             // Calculate angle between satellite direction and building direction
+             double dot_product = sat_direction.dot(to_building);
+             
+             // We want buildings roughly perpendicular to the satellite direction 
+             // (dot product near 0) for good reflections
+             double angle_factor = 1.0 - std::abs(dot_product);
+             
+             // Also prefer closer buildings
+             double distance_factor = 1.0 / (1.0 + distance_to_building / 10.0);
+             
+             // Use building reflectivity in scoring
+             double reflectivity_factor = building.reflectivity;
+             
+             // Calculate score (higher is better)
+             double score = angle_factor * distance_factor * reflectivity_factor;
+             
+             if (score > best_score) {
+                 best_score = score;
+                 best_reflector = i;
+             }
+         }
+         
+         return best_reflector;
+     }
+     
+     Eigen::Vector3d calculateReflectionPoint(
+         const Eigen::Vector3d& satellite_pos, 
+         const Eigen::Vector3d& user_pos,
+         int building_idx) {
+         
+         // Find a suitable reflection point on a building face
+         const auto& building = buildings_[building_idx];
+         auto faces = building.getFaces();
+         
+         // Find the face most suitable for reflection
+         int best_face_idx = -1;
+         Eigen::Vector3d best_reflection_point;
+         double best_score = -1.0;
+         
+         // Direction from satellite to user (not normalized)
+         Eigen::Vector3d sat_to_user = user_pos - satellite_pos;
+         
+         // Check each face
+         for (size_t face_idx = 0; face_idx < faces.size(); face_idx++) {
+             const auto& face = faces[face_idx];
+             
+             // Skip bottom face as it's unlikely to reflect GPS signals
+             if (face.normal.z() < -0.9) {
+                 continue;
+             }
+             
+             // Calculate a reflection point near the center of the face
+             // For simplicity, we'll use a point slightly offset from center
+             Eigen::Vector3d reflection_point = face.center + 
+                                           face.tangent * (uniform_dist_(rng_) - 0.5) * face.dimensions.x() * 0.7 +
+                                           face.bitangent * (uniform_dist_(rng_) - 0.5) * face.dimensions.y() * 0.7;
+             
+             // Calculate vectors from satellite to reflection point and from reflection point to user
+             Eigen::Vector3d sat_to_refl = reflection_point - satellite_pos;
+             Eigen::Vector3d refl_to_user = user_pos - reflection_point;
+             
+             // Normalize for angle calculations
+             Eigen::Vector3d sat_to_refl_norm = sat_to_refl.normalized();
+             Eigen::Vector3d refl_to_user_norm = refl_to_user.normalized();
+             
+             // Calculate reflection angle (lower is better)
+             double incident_angle = std::acos(std::abs(sat_to_refl_norm.dot(face.normal)));
+             double reflection_angle = std::acos(std::abs(refl_to_user_norm.dot(face.normal)));
+             
+             // Score based on how well the law of reflection is satisfied
+             double angle_diff = std::abs(incident_angle - reflection_angle);
+             double reflection_score = 1.0 / (1.0 + angle_diff);
+             
+             // Also consider path length (shorter is better)
+             double path_length = sat_to_refl.norm() + refl_to_user.norm();
+             double length_score = 1.0 / (1.0 + path_length / 100.0);
+             
+             // Consider building reflectivity
+             double reflectivity_score = building.reflectivity;
+             
+             // Calculate total score (higher is better)
+             double score = reflection_score * length_score * reflectivity_score;
+             
+             if (score > best_score) {
+                 best_score = score;
+                 best_face_idx = face_idx;
+                 best_reflection_point = reflection_point;
+             }
+         }
+         
+         // Return the best reflection point
+         return best_reflection_point;
      }
      
      bool rayIntersectsAABB(
@@ -1696,9 +1821,9 @@
          const Eigen::Vector3d max_pt = building.max();
          
          // Calculate inverses safely
-         const double invDirX = RayTracing::safeInverse(ray_dir.x());
-         const double invDirY = RayTracing::safeInverse(ray_dir.y());
-         const double invDirZ = RayTracing::safeInverse(ray_dir.z());
+         const double invDirX = GPSPhysics::safeInverse(ray_dir.x());
+         const double invDirY = GPSPhysics::safeInverse(ray_dir.y());
+         const double invDirZ = GPSPhysics::safeInverse(ray_dir.z());
          
          // Calculate slab intersections
          double tx1 = (min_pt.x() - ray_origin.x()) * invDirX;
@@ -1738,7 +1863,7 @@
          return true;
      }
      
-     // Visualization methods remain the same as before, providing clean visualization
+     // Visualization methods
      void publishRoad() {
          visualization_msgs::Marker road_marker;
          road_marker.header.frame_id = fixed_frame_;
@@ -1760,9 +1885,9 @@
          road_marker.scale.z = 0.1; // Thin plane
          
          // Color (dark gray)
-         road_marker.color.r = 0.2;
-         road_marker.color.g = 0.2;
-         road_marker.color.b = 0.2;
+         road_marker.color.r = 0.3;
+         road_marker.color.g = 0.3;
+         road_marker.color.b = 0.3;
          road_marker.color.a = 1.0;
          
          road_pub_.publish(road_marker);
@@ -1787,9 +1912,9 @@
          sidewalk_left.scale.z = 0.1; // Thin plane
          
          // Color (light gray)
-         sidewalk_left.color.r = 0.6;
-         sidewalk_left.color.g = 0.6;
-         sidewalk_left.color.b = 0.6;
+         sidewalk_left.color.r = 0.7;
+         sidewalk_left.color.g = 0.7;
+         sidewalk_left.color.b = 0.7;
          sidewalk_left.color.a = 1.0;
          
          road_pub_.publish(sidewalk_left);
@@ -1800,6 +1925,33 @@
          sidewalk_right.pose.position.y = (road_width_ / 2.0 + sidewalk_width_ / 2.0);
          
          road_pub_.publish(sidewalk_right);
+         
+         // Add road markings for additional visual interest
+         visualization_msgs::Marker center_line;
+         center_line.header = road_marker.header;
+         center_line.ns = "road_markings";
+         center_line.id = 3;
+         center_line.type = visualization_msgs::Marker::CUBE;
+         center_line.action = visualization_msgs::Marker::ADD;
+         
+         // Position (center line)
+         center_line.pose.position.x = 0.0;
+         center_line.pose.position.y = 0.0;
+         center_line.pose.position.z = -0.04; // Just above road
+         center_line.pose.orientation.w = 1.0;
+         
+         // Scale
+         center_line.scale.x = road_length_;
+         center_line.scale.y = 0.3; // Thin line
+         center_line.scale.z = 0.01; // Very thin
+         
+         // Color (white)
+         center_line.color.r = 1.0;
+         center_line.color.g = 1.0;
+         center_line.color.b = 1.0;
+         center_line.color.a = 1.0;
+         
+         road_pub_.publish(center_line);
      }
      
      void publishBuildings() {
@@ -1918,84 +2070,64 @@
          marker.points.push_back(p2);
      }
      
-     void publishBeacons() {
-         visualization_msgs::MarkerArray beacon_markers;
+     void publishSatellites() {
+         visualization_msgs::MarkerArray satellite_markers;
          int id = 0;
          
-         for (const auto& beacon : beacons_) {
-             // Beacon sphere
+         for (const auto& satellite : satellites_) {
+             // Satellite sphere
              visualization_msgs::Marker marker;
              marker.header.frame_id = fixed_frame_;
              marker.header.stamp = ros::Time::now();
-             marker.ns = "beacons";
+             marker.ns = "satellites";
              marker.id = id++;
              marker.type = visualization_msgs::Marker::SPHERE;
              marker.action = visualization_msgs::Marker::ADD;
              
              // Position
-             marker.pose.position.x = beacon.position.x();
-             marker.pose.position.y = beacon.position.y();
-             marker.pose.position.z = beacon.position.z();
+             marker.pose.position.x = satellite.position.x();
+             marker.pose.position.y = satellite.position.y();
+             marker.pose.position.z = satellite.position.z();
              marker.pose.orientation.w = 1.0;
              
              // Scale
-             marker.scale.x = 0.8;
-             marker.scale.y = 0.8;
-             marker.scale.z = 0.8;
+             marker.scale.x = 10.0;
+             marker.scale.y = 10.0;
+             marker.scale.z = 10.0;
              
-             // Color - gold for beacons
-             marker.color.r = 1.0;
-             marker.color.g = 0.84;
+             // Color based on elevation (higher elevation = greener)
+             double elevation_ratio = std::max(0.0, std::min(1.0, (satellite.elevation - 5.0) / 85.0));
+             
+             // Red for low elevation, yellow for medium, green for high
+             marker.color.r = 1.0 - elevation_ratio * 0.7;
+             marker.color.g = 0.3 + elevation_ratio * 0.7;
              marker.color.b = 0.0;
              marker.color.a = 1.0;
              
-             beacon_markers.markers.push_back(marker);
+             // Make satellites below horizon semi-transparent
+             if (satellite.elevation < GPSPhysics::MIN_ELEVATION_ANGLE) {
+                 marker.color.a = 0.3;
+             }
              
-             // Add vertical pole for the beacon
-             visualization_msgs::Marker pole_marker;
-             pole_marker.header.frame_id = fixed_frame_;
-             pole_marker.header.stamp = ros::Time::now();
-             pole_marker.ns = "beacon_poles";
-             pole_marker.id = id++;
-             pole_marker.type = visualization_msgs::Marker::CYLINDER;
-             pole_marker.action = visualization_msgs::Marker::ADD;
+             satellite_markers.markers.push_back(marker);
              
-             // Position (pole center is halfway between ground and beacon)
-             pole_marker.pose.position.x = beacon.position.x();
-             pole_marker.pose.position.y = beacon.position.y();
-             pole_marker.pose.position.z = beacon.position.z() / 2.0;
-             pole_marker.pose.orientation.w = 1.0;
-             
-             // Scale (thin pole with height = beacon.z)
-             pole_marker.scale.x = 0.1;
-             pole_marker.scale.y = 0.1;
-             pole_marker.scale.z = beacon.position.z();
-             
-             // Color - gray pole
-             pole_marker.color.r = 0.7;
-             pole_marker.color.g = 0.7;
-             pole_marker.color.b = 0.7;
-             pole_marker.color.a = 1.0;
-             
-             beacon_markers.markers.push_back(pole_marker);
-             
-             // Beacon label
+             // Satellite label
              visualization_msgs::Marker text_marker;
              text_marker.header.frame_id = fixed_frame_;
              text_marker.header.stamp = ros::Time::now();
-             text_marker.ns = "beacon_labels";
+             text_marker.ns = "satellite_labels";
              text_marker.id = id++;
              text_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
              text_marker.action = visualization_msgs::Marker::ADD;
              
-             // Position - above beacon
-             text_marker.pose.position.x = beacon.position.x();
-             text_marker.pose.position.y = beacon.position.y();
-             text_marker.pose.position.z = beacon.position.z() + 0.8;
+             // Position - above satellite
+             text_marker.pose.position.x = satellite.position.x();
+             text_marker.pose.position.y = satellite.position.y();
+             text_marker.pose.position.z = satellite.position.z() + 10.0;
              text_marker.pose.orientation.w = 1.0;
              
              // Scale
-             text_marker.scale.z = 0.5; // Text height
+             text_marker.scale.z = 5.0; // Text height
              
              // Color
              text_marker.color.r = 1.0;
@@ -2004,12 +2136,49 @@
              text_marker.color.a = 1.0;
              
              // Text
-             text_marker.text = beacon.id;
+             text_marker.text = satellite.id + "\nEl: " + 
+                               std::to_string(static_cast<int>(satellite.elevation)) + "°";
              
-             beacon_markers.markers.push_back(text_marker);
+             satellite_markers.markers.push_back(text_marker);
+             
+             // Add direction vector (orbital velocity)
+             visualization_msgs::Marker velocity_marker;
+             velocity_marker.header.frame_id = fixed_frame_;
+             velocity_marker.header.stamp = ros::Time::now();
+             velocity_marker.ns = "satellite_velocity";
+             velocity_marker.id = id++;
+             velocity_marker.type = visualization_msgs::Marker::ARROW;
+             velocity_marker.action = visualization_msgs::Marker::ADD;
+             
+             // Start and end points
+             geometry_msgs::Point start, end;
+             start.x = satellite.position.x();
+             start.y = satellite.position.y();
+             start.z = satellite.position.z();
+             
+             Eigen::Vector3d velocity_scaled = satellite.velocity * 100.0;  // Scale for visualization
+             end.x = satellite.position.x() + velocity_scaled.x();
+             end.y = satellite.position.y() + velocity_scaled.y();
+             end.z = satellite.position.z() + velocity_scaled.z();
+             
+             velocity_marker.points.push_back(start);
+             velocity_marker.points.push_back(end);
+             
+             // Arrow scale
+             velocity_marker.scale.x = 2.0;  // Shaft diameter
+             velocity_marker.scale.y = 4.0;  // Head diameter
+             velocity_marker.scale.z = 5.0;  // Head length
+             
+             // Color - blue
+             velocity_marker.color.r = 0.0;
+             velocity_marker.color.g = 0.0;
+             velocity_marker.color.b = 1.0;
+             velocity_marker.color.a = 0.7;
+             
+             satellite_markers.markers.push_back(velocity_marker);
          }
          
-         beacon_pub_.publish(beacon_markers);
+         satellite_pub_.publish(satellite_markers);
      }
      
      void publishUser() {
@@ -2028,9 +2197,9 @@
          marker.pose.orientation.w = 1.0;
          
          // Scale
-         marker.scale.x = 0.7;
-         marker.scale.y = 0.7;
-         marker.scale.z = 0.7;
+         marker.scale.x = 1.0;
+         marker.scale.y = 1.0;
+         marker.scale.z = 1.0;
          
          // Color - bright cyan for user
          marker.color.r = 0.0;
@@ -2052,11 +2221,11 @@
          // Position - above user
          text_marker.pose.position.x = user_position_.x();
          text_marker.pose.position.y = user_position_.y();
-         text_marker.pose.position.z = user_position_.z() + 1.0;
+         text_marker.pose.position.z = user_position_.z() + 2.0;
          text_marker.pose.orientation.w = 1.0;
          
          // Scale
-         text_marker.scale.z = 0.6; // Text height
+         text_marker.scale.z = 1.0; // Text height
          
          // Color
          text_marker.color.r = 0.0;
@@ -2065,9 +2234,79 @@
          text_marker.color.a = 1.0;
          
          // Text
-         text_marker.text = "USER";
+         text_marker.text = "GPS RECEIVER";
          
          user_pub_.publish(text_marker);
+         
+         // Add a small coordinate frame to indicate user orientation
+         visualization_msgs::Marker x_axis;
+         x_axis.header.frame_id = fixed_frame_;
+         x_axis.header.stamp = ros::Time::now();
+         x_axis.ns = "user_axes";
+         x_axis.id = 2;
+         x_axis.type = visualization_msgs::Marker::ARROW;
+         x_axis.action = visualization_msgs::Marker::ADD;
+         
+         geometry_msgs::Point origin, x_end;
+         origin.x = user_position_.x();
+         origin.y = user_position_.y();
+         origin.z = user_position_.z();
+         
+         x_end.x = user_position_.x() + 2.0;  // X-axis
+         x_end.y = user_position_.y();
+         x_end.z = user_position_.z();
+         
+         x_axis.points.push_back(origin);
+         x_axis.points.push_back(x_end);
+         
+         x_axis.scale.x = 0.2;  // Shaft diameter
+         x_axis.scale.y = 0.4;  // Head diameter
+         x_axis.scale.z = 0.6;  // Head length
+         
+         x_axis.color.r = 1.0;  // Red for X-axis
+         x_axis.color.g = 0.0;
+         x_axis.color.b = 0.0;
+         x_axis.color.a = 1.0;
+         
+         user_pub_.publish(x_axis);
+         
+         // Y-axis
+         visualization_msgs::Marker y_axis = x_axis;
+         y_axis.id = 3;
+         
+         geometry_msgs::Point y_end;
+         y_end.x = user_position_.x();
+         y_end.y = user_position_.y() + 2.0;  // Y-axis
+         y_end.z = user_position_.z();
+         
+         y_axis.points.clear();
+         y_axis.points.push_back(origin);
+         y_axis.points.push_back(y_end);
+         
+         y_axis.color.r = 0.0;
+         y_axis.color.g = 1.0;  // Green for Y-axis
+         y_axis.color.b = 0.0;
+         
+         user_pub_.publish(y_axis);
+         
+         // Z-axis
+         visualization_msgs::Marker z_axis = x_axis;
+         z_axis.id = 4;
+         
+         geometry_msgs::Point z_end;
+         z_end.x = user_position_.x();
+         z_end.y = user_position_.y();
+         z_end.z = user_position_.z() + 2.0;  // Z-axis
+         
+         z_axis.points.clear();
+         z_axis.points.push_back(origin);
+         z_axis.points.push_back(z_end);
+         
+         z_axis.color.r = 0.0;
+         z_axis.color.g = 0.0;
+         z_axis.color.b = 1.0;  // Blue for Z-axis
+         
+         user_pub_.publish(z_axis);
      }
      
      void publishTrajectory() {
@@ -2093,7 +2332,7 @@
          }
          
          // Line width
-         traj_marker.scale.x = 0.1;
+         traj_marker.scale.x = 0.2;
          
          // Color - light blue
          traj_marker.color.r = 0.3;
@@ -2119,9 +2358,9 @@
          current_point.pose.orientation.w = 1.0;
          
          // Scale
-         current_point.scale.x = 0.2;
-         current_point.scale.y = 0.2;
-         current_point.scale.z = 0.2;
+         current_point.scale.x = 0.4;
+         current_point.scale.y = 0.4;
+         current_point.scale.z = 0.4;
          
          // Color - bright green
          current_point.color.r = 0.0;
@@ -2132,755 +2371,217 @@
          trajectory_pub_.publish(current_point);
      }
      
-     void publishReflectionSurfaces() {
-         visualization_msgs::MarkerArray surface_markers;
+     void publishGPSSignals() {
+         visualization_msgs::MarkerArray signal_markers;
          int id = 0;
          
-         // Clear previous active surfaces if no paths
-         if (active_reflection_faces_.empty()) {
+         // Clear previous signals if there are none
+         if (satellite_signals_.empty()) {
              visualization_msgs::Marker clear_marker;
              clear_marker.action = visualization_msgs::Marker::DELETEALL;
              clear_marker.header.frame_id = fixed_frame_;
              clear_marker.header.stamp = ros::Time::now();
              
-             surface_markers.markers.push_back(clear_marker);
-             reflection_surface_pub_.publish(surface_markers);
+             signal_markers.markers.push_back(clear_marker);
+             signal_pub_.publish(signal_markers);
              return;
          }
          
-         // Remove duplicates from the active reflection faces list
-         std::set<std::pair<int, int>> unique_faces(
-             active_reflection_faces_.begin(), active_reflection_faces_.end());
+         // Colors for different signal types
+         std_msgs::ColorRGBA los_color; // Green
+         los_color.r = 0.0;
+         los_color.g = 1.0;
+         los_color.b = 0.0;
+         los_color.a = 1.0;
          
-         // Visualize each active reflection face
-         for (const auto& face_pair : unique_faces) {
-             int building_idx = face_pair.first;
-             int face_idx = face_pair.second;
-             
-             // Skip invalid indices
-             if (building_idx < 0 || building_idx >= buildings_.size()) {
-                 continue;
-             }
-             
-             const auto& building = buildings_[building_idx];
-             auto faces = building.getFaces();
-             
-             if (face_idx < 0 || face_idx >= faces.size()) {
-                 continue;
-             }
-             
-             const auto& face = faces[face_idx];
-             
-             // Create a thin box to represent the reflecting face
-             visualization_msgs::Marker surface_marker;
-             surface_marker.header.frame_id = fixed_frame_;
-             surface_marker.header.stamp = ros::Time::now();
-             surface_marker.ns = "reflection_surfaces";
-             surface_marker.id = id++;
-             surface_marker.type = visualization_msgs::Marker::CUBE;
-             surface_marker.action = visualization_msgs::Marker::ADD;
-             
-             // Position at the face center
-             surface_marker.pose.position.x = face.center.x();
-             surface_marker.pose.position.y = face.center.y();
-             surface_marker.pose.position.z = face.center.z();
-             
-             // Orientation to align with the face
-             Eigen::Vector3d z_axis(0, 0, 1);
-             Eigen::Vector3d rotation_axis = z_axis.cross(face.normal);
-             double rotation_angle = std::acos(z_axis.dot(face.normal));
-             
-             if (rotation_axis.norm() > RayTracing::EPSILON) {
-                 Eigen::Vector3d unit_axis = rotation_axis.normalized();
-                 tf::Quaternion q(unit_axis.x(), unit_axis.y(), unit_axis.z(), rotation_angle);
-                 surface_marker.pose.orientation.x = q.x();
-                 surface_marker.pose.orientation.y = q.y();
-                 surface_marker.pose.orientation.z = q.z();
-                 surface_marker.pose.orientation.w = q.w();
-             } else {
-                 // Handle case where normal is parallel to z-axis
-                 if (face.normal.z() < 0) {
-                     tf::Quaternion q;
-                     q.setRPY(M_PI, 0, 0);
-                     surface_marker.pose.orientation.x = q.x();
-                     surface_marker.pose.orientation.y = q.y();
-                     surface_marker.pose.orientation.z = q.z();
-                     surface_marker.pose.orientation.w = q.w();
-                 } else {
-                     surface_marker.pose.orientation.w = 1.0;
-                 }
-             }
-             
-             // Scale - slightly smaller than the actual face to be visible
-             surface_marker.scale.x = face.dimensions.x() * 0.95;
-             surface_marker.scale.y = face.dimensions.y() * 0.95;
-             surface_marker.scale.z = 0.05; // Very thin to appear as a surface
-             
-             // Color - bright red to highlight the reflection surface
-             surface_marker.color.r = 1.0;
-             surface_marker.color.g = 0.0;
-             surface_marker.color.b = 0.0;
-             surface_marker.color.a = 0.6;
-             
-             surface_markers.markers.push_back(surface_marker);
-             
-             // Add normal vector indicator
-             visualization_msgs::Marker normal_marker;
-             normal_marker.header.frame_id = fixed_frame_;
-             normal_marker.header.stamp = ros::Time::now();
-             normal_marker.ns = "reflection_normals";
-             normal_marker.id = id++;
-             normal_marker.type = visualization_msgs::Marker::ARROW;
-             normal_marker.action = visualization_msgs::Marker::ADD;
-             
-             // Use the face center as start
-             normal_marker.points.resize(2);
-             normal_marker.points[0].x = face.center.x();
-             normal_marker.points[0].y = face.center.y();
-             normal_marker.points[0].z = face.center.z();
-             
-             // Normal direction (1m length)
-             Eigen::Vector3d normal_end = face.center + face.normal;
-             normal_marker.points[1].x = normal_end.x();
-             normal_marker.points[1].y = normal_end.y();
-             normal_marker.points[1].z = normal_end.z();
-             
-             // Scale - arrow size
-             normal_marker.scale.x = 0.1;  // Shaft diameter
-             normal_marker.scale.y = 0.2;  // Head diameter
-             normal_marker.scale.z = 0.2;  // Head length
-             
-             // Color - yellow for normal vector
-             normal_marker.color.r = 1.0;
-             normal_marker.color.g = 1.0;
-             normal_marker.color.b = 0.0;
-             normal_marker.color.a = 1.0;
-             
-             surface_markers.markers.push_back(normal_marker);
-         }
+         std_msgs::ColorRGBA attenuated_color; // Yellow
+         attenuated_color.r = 1.0;
+         attenuated_color.g = 1.0;
+         attenuated_color.b = 0.0;
+         attenuated_color.a = 0.7;
          
-         reflection_surface_pub_.publish(surface_markers);
-     }
-     
-     void publishSignalPaths() {
-         visualization_msgs::MarkerArray path_markers;
-         int id = 0;
+         std_msgs::ColorRGBA multipath_color; // Red
+         multipath_color.r = 1.0;
+         multipath_color.g = 0.0;
+         multipath_color.b = 0.0;
+         multipath_color.a = 0.7;
          
-         // Clear previous paths if there are none
-         if (signal_paths_.empty()) {
-             visualization_msgs::Marker clear_marker;
-             clear_marker.action = visualization_msgs::Marker::DELETEALL;
-             clear_marker.header.frame_id = fixed_frame_;
-             clear_marker.header.stamp = ros::Time::now();
-             
-             path_markers.markers.push_back(clear_marker);
-             path_pub_.publish(path_markers);
-             return;
-         }
-         
-         // Color scheme for paths
-         std_msgs::ColorRGBA direct_color; // Green
-         direct_color.r = 0.0;
-         direct_color.g = 1.0;
-         direct_color.b = 0.0;
-         direct_color.a = 1.0;
-         
-         std_msgs::ColorRGBA single_refl_color; // Yellow
-         single_refl_color.r = 1.0;
-         single_refl_color.g = 1.0;
-         single_refl_color.b = 0.0;
-         single_refl_color.a = 1.0;
-         
-         std_msgs::ColorRGBA multi_refl_color; // Red
-         multi_refl_color.r = 1.0;
-         multi_refl_color.g = 0.0;
-         multi_refl_color.b = 0.0;
-         multi_refl_color.a = 1.0;
-         
-         // Visualize each signal path
-         for (const auto& path : signal_paths_) {
-             // Skip invalid paths
-             if (!path.valid || path.segments.empty() || path.penetrates_building) {
-                 continue;
-             }
-             
-             // Set color based on reflection count
+         // Visualize each satellite signal
+         for (const auto& signal : satellite_signals_) {
+             // Choose color based on signal type
              std_msgs::ColorRGBA path_color;
-             switch (path.reflection_count) {
-                 case 0:
-                     path_color = direct_color;
-                     break;
-                 case 1:
-                     path_color = single_refl_color;
-                     break;
-                 default:
-                     path_color = multi_refl_color;
-                     break;
+             if (signal.is_los) {
+                 path_color = los_color;
+             } else if (signal.is_multipath) {
+                 path_color = multipath_color;
+             } else {
+                 path_color = attenuated_color;
              }
              
-             // Visualize each segment of the path
-             for (size_t j = 0; j < path.segments.size(); ++j) {
-                 const auto& segment = path.segments[j];
+             // Visualize each segment
+             for (size_t i = 0; i < signal.segments.size(); ++i) {
+                 const auto& segment = signal.segments[i];
                  
-                 // Skip segments that penetrate buildings
-                 if (segment.penetrates_building) {
-                     continue;
-                 }
-                 
-                 // Create a line segment
+                 // Create line segment
                  visualization_msgs::Marker segment_marker;
                  segment_marker.header.frame_id = fixed_frame_;
                  segment_marker.header.stamp = ros::Time::now();
-                 segment_marker.ns = "path_segments";
+                 segment_marker.ns = "signal_segments";
                  segment_marker.id = id++;
                  segment_marker.type = visualization_msgs::Marker::LINE_STRIP;
                  segment_marker.action = visualization_msgs::Marker::ADD;
                  
-                 // Add both endpoints
-                 geometry_msgs::Point start_point, end_point;
-                 start_point.x = segment.start.x();
-                 start_point.y = segment.start.y();
-                 start_point.z = segment.start.z();
+                 // Add start and end points
+                 geometry_msgs::Point start, end;
+                 start.x = segment.start.x();
+                 start.y = segment.start.y();
+                 start.z = segment.start.z();
                  
-                 end_point.x = segment.end.x();
-                 end_point.y = segment.end.y();
-                 end_point.z = segment.end.z();
+                 end.x = segment.end.x();
+                 end.y = segment.end.y();
+                 end.z = segment.end.z();
                  
-                 segment_marker.points.push_back(start_point);
-                 segment_marker.points.push_back(end_point);
+                 segment_marker.points.push_back(start);
+                 segment_marker.points.push_back(end);
                  
-                 // Line width
-                 segment_marker.scale.x = path_width_;
+                 // Line width - thicker for direct segments
+                 segment_marker.scale.x = segment.direct ? signal_width_ * 1.5 : signal_width_;
                  
-                 // Color - use path color
+                 // Color
                  segment_marker.color = path_color;
                  
-                 // If this is a forced path, use a dashed line effect
-                 if (path.forced) {
-                     // Use a dashed style by making the line semi-transparent
-                     segment_marker.color.a = 0.8;
+                 // If this segment penetrates a building, use dashed line effect
+                 if (segment.penetrates_building) {
+                     segment_marker.color.a = 0.5;
                  }
                  
-                 path_markers.markers.push_back(segment_marker);
-                 
-                 // Add small arrow in the middle to indicate direction
-                 visualization_msgs::Marker arrow_marker;
-                 arrow_marker.header.frame_id = fixed_frame_;
-                 arrow_marker.header.stamp = ros::Time::now();
-                 arrow_marker.ns = "path_arrows";
-                 arrow_marker.id = id++;
-                 arrow_marker.type = visualization_msgs::Marker::ARROW;
-                 arrow_marker.action = visualization_msgs::Marker::ADD;
-                 
-                 // Position the arrow at the middle of the segment
-                 Eigen::Vector3d midpoint = (segment.start + segment.end) / 2.0;
-                 Eigen::Vector3d direction = (segment.end - segment.start).normalized();
-                 
-                 // Scale arrow size based on segment length
-                 double segment_length = (segment.end - segment.start).norm();
-                 double arrow_length = std::min(segment_length * 0.3, 1.0);
-                 
-                 Eigen::Vector3d arrow_start = midpoint - direction * arrow_length * 0.5;
-                 Eigen::Vector3d arrow_end = midpoint + direction * arrow_length * 0.5;
-                 
-                 geometry_msgs::Point arrow_start_pt, arrow_end_pt;
-                 arrow_start_pt.x = arrow_start.x();
-                 arrow_start_pt.y = arrow_start.y();
-                 arrow_start_pt.z = arrow_start.z();
-                 
-                 arrow_end_pt.x = arrow_end.x();
-                 arrow_end_pt.y = arrow_end.y();
-                 arrow_end_pt.z = arrow_end.z();
-                 
-                 arrow_marker.points.push_back(arrow_start_pt);
-                 arrow_marker.points.push_back(arrow_end_pt);
-                 
-                 // Arrow proportions
-                 arrow_marker.scale.x = path_width_ * 0.5;  // Shaft width
-                 arrow_marker.scale.y = path_width_ * 1.5;  // Head width
-                 arrow_marker.scale.z = path_width_ * 1.0;  // Head length
-                 
-                 // Color - same as segment
-                 arrow_marker.color = path_color;
-                 
-                 path_markers.markers.push_back(arrow_marker);
-                 
-                 // For reflection segments, add angle information
-                 if (segment.reflection_count > 0) {
-                     // Add text with reflection angle info
-                     visualization_msgs::Marker angle_marker;
-                     angle_marker.header.frame_id = fixed_frame_;
-                     angle_marker.header.stamp = ros::Time::now();
-                     angle_marker.ns = "reflection_angles";
-                     angle_marker.id = id++;
-                     angle_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-                     angle_marker.action = visualization_msgs::Marker::ADD;
-                     
-                     // Position - near reflection point
-                     angle_marker.pose.position.x = segment.start.x();
-                     angle_marker.pose.position.y = segment.start.y();
-                     angle_marker.pose.position.z = segment.start.z() + 0.5;
-                     angle_marker.pose.orientation.w = 1.0;
-                     
-                     // Scale
-                     angle_marker.scale.z = 0.4; // Text height
-                     
-                     // Color - white
-                     angle_marker.color.r = 1.0;
-                     angle_marker.color.g = 1.0;
-                     angle_marker.color.b = 1.0;
-                     angle_marker.color.a = 1.0;
-                     
-                     // Text - show incident angle
-                     std::stringstream ss;
-                     ss << std::fixed << std::setprecision(1) << segment.incident_angle << "°";
-                     angle_marker.text = ss.str();
-                     
-                     path_markers.markers.push_back(angle_marker);
-                 }
+                 signal_markers.markers.push_back(segment_marker);
              }
              
-             // Add text showing path details
-             visualization_msgs::Marker path_info_marker;
-             path_info_marker.header.frame_id = fixed_frame_;
-             path_info_marker.header.stamp = ros::Time::now();
-             path_info_marker.ns = "path_info";
-             path_info_marker.id = id++;
-             path_info_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-             path_info_marker.action = visualization_msgs::Marker::ADD;
+             // Add path info text
+             visualization_msgs::Marker info_marker;
+             info_marker.header.frame_id = fixed_frame_;
+             info_marker.header.stamp = ros::Time::now();
+             info_marker.ns = "signal_info";
+             info_marker.id = id++;
+             info_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+             info_marker.action = visualization_msgs::Marker::ADD;
              
-             // Position - near the beacon
-             const auto& first_segment = path.segments.front();
-             path_info_marker.pose.position.x = first_segment.start.x() + 0.5;
-             path_info_marker.pose.position.y = first_segment.start.y() + 0.5;
-             path_info_marker.pose.position.z = first_segment.start.z() + 0.5;
-             path_info_marker.pose.orientation.w = 1.0;
+             // Position - near the middle of the signal path
+             Eigen::Vector3d midpoint;
+             if (signal.segments.size() == 1) {
+                 // For direct or attenuated signals
+                 midpoint = (signal.segments[0].start + signal.segments[0].end) / 2.0;
+             } else if (signal.segments.size() > 1) {
+                 // For multipath signals, use the reflection point
+                 midpoint = signal.segments[0].end;
+             } else {
+                 continue;  // Skip if no segments
+             }
+             
+             info_marker.pose.position.x = midpoint.x();
+             info_marker.pose.position.y = midpoint.y();
+             info_marker.pose.position.z = midpoint.z() + 5.0;
+             info_marker.pose.orientation.w = 1.0;
              
              // Scale
-             path_info_marker.scale.z = 0.4; // Text height
+             info_marker.scale.z = 2.0; // Text height
              
-             // Color - same as path
-             path_info_marker.color = path_color;
+             // Color - same as signal
+             info_marker.color = path_color;
              
-             // Text - brief path info
+             // Text - signal type and strength
              std::stringstream ss;
-             ss << std::fixed << std::setprecision(1);
-             if (path.reflection_count == 0) {
-                 ss << "Direct: " << path.total_distance << "m";
+             ss << signal.satellite_id << " - ";
+             if (signal.is_los) {
+                 ss << "LOS";
+             } else if (signal.is_multipath) {
+                 ss << "Multipath";
              } else {
-                 ss << path.reflection_count << " refl: " << path.total_distance << "m";
+                 ss << "Attenuated";
              }
-             if (path.forced) {
-                 ss << " (forced)";
-             }
-             path_info_marker.text = ss.str();
+             ss << "\n" << std::fixed << std::setprecision(1) 
+                << signal.signal_strength << " dB-Hz";
              
-             path_markers.markers.push_back(path_info_marker);
+             info_marker.text = ss.str();
+             
+             signal_markers.markers.push_back(info_marker);
+             
+             // For multipath signals, mark the reflection point
+             if (signal.is_multipath && signal.segments.size() > 1) {
+                 visualization_msgs::Marker refl_marker;
+                 refl_marker.header.frame_id = fixed_frame_;
+                 refl_marker.header.stamp = ros::Time::now();
+                 refl_marker.ns = "reflection_points";
+                 refl_marker.id = id++;
+                 refl_marker.type = visualization_msgs::Marker::SPHERE;
+                 refl_marker.action = visualization_msgs::Marker::ADD;
+                 
+                 // Position at reflection point
+                 Eigen::Vector3d reflection_point = signal.segments[0].end;
+                 refl_marker.pose.position.x = reflection_point.x();
+                 refl_marker.pose.position.y = reflection_point.y();
+                 refl_marker.pose.position.z = reflection_point.z();
+                 refl_marker.pose.orientation.w = 1.0;
+                 
+                 // Size
+                 refl_marker.scale.x = 1.0;
+                 refl_marker.scale.y = 1.0;
+                 refl_marker.scale.z = 1.0;
+                 
+                 // Color - white
+                 refl_marker.color.r = 1.0;
+                 refl_marker.color.g = 1.0;
+                 refl_marker.color.b = 1.0;
+                 refl_marker.color.a = 1.0;
+                 
+                 signal_markers.markers.push_back(refl_marker);
+                 
+                 // Add "REFL" label
+                 visualization_msgs::Marker refl_label;
+                 refl_label.header.frame_id = fixed_frame_;
+                 refl_label.header.stamp = ros::Time::now();
+                 refl_label.ns = "reflection_labels";
+                 refl_label.id = id++;
+                 refl_label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+                 refl_label.action = visualization_msgs::Marker::ADD;
+                 
+                 refl_label.pose.position.x = reflection_point.x();
+                 refl_label.pose.position.y = reflection_point.y();
+                 refl_label.pose.position.z = reflection_point.z() + 2.0;
+                 refl_label.pose.orientation.w = 1.0;
+                 
+                 refl_label.scale.z = 1.0;
+                 
+                 refl_label.color.r = 1.0;
+                 refl_label.color.g = 1.0;
+                 refl_label.color.b = 1.0;
+                 refl_label.color.a = 1.0;
+                 
+                 refl_label.text = "REFLECTION";
+                 
+                 signal_markers.markers.push_back(refl_label);
+             }
          }
          
-         path_pub_.publish(path_markers);
+         signal_pub_.publish(signal_markers);
      }
      
-     void publishReflectionPoints() {
-         visualization_msgs::MarkerArray reflection_markers;
+     void publishMeasurements() {
+         visualization_msgs::MarkerArray measurement_markers;
          int id = 0;
          
-         // Clear if no signal paths
-         if (signal_paths_.empty()) {
+         // Clear previous measurements if there are none
+         if (satellite_signals_.empty()) {
              visualization_msgs::Marker clear_marker;
              clear_marker.action = visualization_msgs::Marker::DELETEALL;
              clear_marker.header.frame_id = fixed_frame_;
              clear_marker.header.stamp = ros::Time::now();
              
-             reflection_markers.markers.push_back(clear_marker);
-             reflection_pub_.publish(reflection_markers);
+             measurement_markers.markers.push_back(clear_marker);
+             measurement_pub_.publish(measurement_markers);
              return;
          }
          
-         // Track unique reflection points to avoid duplicates
-         std::map<std::tuple<double, double, double>, int> unique_points;
-         
-         // For each path with reflections
-         for (const auto& path : signal_paths_) {
-             if (path.reflection_count == 0 || path.penetrates_building) {
-                 continue; // Skip direct paths and invalid paths
-             }
-             
-             // Start from segment 1 (the first reflection point is at the end of segment 0)
-             for (size_t j = 1; j < path.segments.size(); ++j) {
-                 const auto& prev_segment = path.segments[j-1];
-                 
-                 // Skip if this segment penetrates a building
-                 if (prev_segment.penetrates_building) {
-                     continue;
-                 }
-                 
-                 // The reflection point is the end of the previous segment
-                 Eigen::Vector3d refl_point = prev_segment.end;
-                 
-                 // Create a tuple key from the point coordinates
-                 auto point_key = std::make_tuple(refl_point.x(), refl_point.y(), refl_point.z());
-                 
-                 // Count points at this location
-                 unique_points[point_key]++;
-             }
-         }
-         
-         // Visualize unique reflection points
-         for (const auto& pair : unique_points) {
-             auto point_key = pair.first;
-             int count = pair.second;
-             
-             // Get the coordinates
-             double x = std::get<0>(point_key);
-             double y = std::get<1>(point_key);
-             double z = std::get<2>(point_key);
-             
-             // 1. Sphere marker for the reflection point
-             visualization_msgs::Marker point_marker;
-             point_marker.header.frame_id = fixed_frame_;
-             point_marker.header.stamp = ros::Time::now();
-             point_marker.ns = "reflection_points";
-             point_marker.id = id++;
-             point_marker.type = visualization_msgs::Marker::SPHERE;
-             point_marker.action = visualization_msgs::Marker::ADD;
-             
-             point_marker.pose.position.x = x;
-             point_marker.pose.position.y = y;
-             point_marker.pose.position.z = z;
-             point_marker.pose.orientation.w = 1.0;
-             
-             // Size based on number of reflections
-             double size = 0.2 + 0.05 * std::min(5, count);
-             point_marker.scale.x = size;
-             point_marker.scale.y = size;
-             point_marker.scale.z = size;
-             
-             // Color - bright white
-             point_marker.color.r = 1.0;
-             point_marker.color.g = 1.0;
-             point_marker.color.b = 1.0;
-             point_marker.color.a = 1.0;
-             
-             reflection_markers.markers.push_back(point_marker);
-             
-             // 2. Number of reflections label if more than 1
-             if (count > 1) {
-                 visualization_msgs::Marker count_marker;
-                 count_marker.header.frame_id = fixed_frame_;
-                 count_marker.header.stamp = ros::Time::now();
-                 count_marker.ns = "reflection_counts";
-                 count_marker.id = id++;
-                 count_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-                 count_marker.action = visualization_msgs::Marker::ADD;
-                 
-                 count_marker.pose.position.x = x;
-                 count_marker.pose.position.y = y;
-                 count_marker.pose.position.z = z + size * 1.5;
-                 count_marker.pose.orientation.w = 1.0;
-                 
-                 count_marker.scale.z = 0.3; // Text height
-                 
-                 // Color - same as reflection point
-                 count_marker.color.r = 1.0;
-                 count_marker.color.g = 1.0;
-                 count_marker.color.b = 1.0;
-                 count_marker.color.a = 1.0;
-                 
-                 count_marker.text = std::to_string(count);
-                 
-                 reflection_markers.markers.push_back(count_marker);
-             }
-             
-             // 3. Add "REFL" label
-             visualization_msgs::Marker label_marker;
-             label_marker.header.frame_id = fixed_frame_;
-             label_marker.header.stamp = ros::Time::now();
-             label_marker.ns = "reflection_labels";
-             label_marker.id = id++;
-             label_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-             label_marker.action = visualization_msgs::Marker::ADD;
-             
-             label_marker.pose.position.x = x;
-             label_marker.pose.position.y = y;
-             label_marker.pose.position.z = z + size * 0.7;
-             label_marker.pose.orientation.w = 1.0;
-             
-             label_marker.scale.z = 0.25; // Text height
-             
-             // Color - yellow for high visibility
-             label_marker.color.r = 1.0;
-             label_marker.color.g = 1.0;
-             label_marker.color.b = 0.0;
-             label_marker.color.a = 1.0;
-             
-             label_marker.text = "REFL";
-             
-             reflection_markers.markers.push_back(label_marker);
-         }
-         
-         reflection_pub_.publish(reflection_markers);
-     }
-     
-     void publishDebugMarkers() {
-         // Publish markers for debug visualization
-         visualization_msgs::MarkerArray debug_markers;
-         int id = 0;
-         
-         // Clear previous markers if no debug info
-         if (debug_penetration_points_.empty()) {
-             visualization_msgs::Marker clear_marker;
-             clear_marker.action = visualization_msgs::Marker::DELETEALL;
-             clear_marker.header.frame_id = fixed_frame_;
-             clear_marker.header.stamp = ros::Time::now();
-             
-             debug_markers.markers.push_back(clear_marker);
-             debug_pub_.publish(debug_markers);
-             return;
-         }
-         
-         // Visualize penetration points for debugging
-         for (const auto& point_pair : debug_penetration_points_) {
-             const auto& point = point_pair.first;
-             const auto& color = point_pair.second;
-             
-             // Sphere marker for penetration point
-             visualization_msgs::Marker point_marker;
-             point_marker.header.frame_id = fixed_frame_;
-             point_marker.header.stamp = ros::Time::now();
-             point_marker.ns = "penetration_points";
-             point_marker.id = id++;
-             point_marker.type = visualization_msgs::Marker::SPHERE;
-             point_marker.action = visualization_msgs::Marker::ADD;
-             
-             point_marker.pose.position.x = point.x();
-             point_marker.pose.position.y = point.y();
-             point_marker.pose.position.z = point.z();
-             point_marker.pose.orientation.w = 1.0;
-             
-             // Size for visibility
-             point_marker.scale.x = 0.3;
-             point_marker.scale.y = 0.3;
-             point_marker.scale.z = 0.3;
-             
-             // Color - based on building color but with transparency
-             point_marker.color.r = color.x();
-             point_marker.color.g = color.y();
-             point_marker.color.b = color.z();
-             point_marker.color.a = 0.7;
-             
-             debug_markers.markers.push_back(point_marker);
-             
-             // Add a "PENETRATION" label
-             visualization_msgs::Marker label_marker;
-             label_marker.header.frame_id = fixed_frame_;
-             label_marker.header.stamp = ros::Time::now();
-             label_marker.ns = "penetration_labels";
-             label_marker.id = id++;
-             label_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-             label_marker.action = visualization_msgs::Marker::ADD;
-             
-             label_marker.pose.position.x = point.x();
-             label_marker.pose.position.y = point.y();
-             label_marker.pose.position.z = point.z() + 0.3;
-             label_marker.pose.orientation.w = 1.0;
-             
-             label_marker.scale.z = 0.2; // Text height
-             
-             // Color - red for warning
-             label_marker.color.r = 1.0;
-             label_marker.color.g = 0.0;
-             label_marker.color.b = 0.0;
-             label_marker.color.a = 1.0;
-             
-             label_marker.text = "PENETRATION";
-             
-             debug_markers.markers.push_back(label_marker);
-         }
-         
-         debug_pub_.publish(debug_markers);
-     }
-     
-     void publishTextInfo() {
-         visualization_msgs::MarkerArray text_markers;
-         int id = 0;
-         
-         // Title text
-         visualization_msgs::Marker title_marker;
-         title_marker.header.frame_id = fixed_frame_;
-         title_marker.header.stamp = ros::Time::now();
-         title_marker.ns = "text_info";
-         title_marker.id = id++;
-         title_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-         title_marker.action = visualization_msgs::Marker::ADD;
-         
-         title_marker.pose.position.x = 0.0;
-         title_marker.pose.position.y = 0.0;
-         title_marker.pose.position.z = 30.0;
-         title_marker.pose.orientation.w = 1.0;
-         
-         title_marker.scale.z = 1.0; // Text height
-         
-         title_marker.color.r = 1.0;
-         title_marker.color.g = 1.0;
-         title_marker.color.b = 1.0;
-         title_marker.color.a = 1.0;
-         
-         title_marker.text = "UWB Signal Reflection Physics - Moving User";
-         
-         text_markers.markers.push_back(title_marker);
-         
-         // Legend text
-         visualization_msgs::Marker legend_marker;
-         legend_marker.header.frame_id = fixed_frame_;
-         legend_marker.header.stamp = ros::Time::now();
-         legend_marker.ns = "legend";
-         legend_marker.id = id++;
-         legend_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-         legend_marker.action = visualization_msgs::Marker::ADD;
-         
-         legend_marker.pose.position.x = -road_length_ / 2.0 + 5.0;
-         legend_marker.pose.position.y = -road_width_ / 2.0 - 5.0;
-         legend_marker.pose.position.z = 5.0;
-         legend_marker.pose.orientation.w = 1.0;
-         
-         legend_marker.scale.z = 0.5; // Text height
-         
-         legend_marker.color.r = 1.0;
-         legend_marker.color.g = 1.0;
-         legend_marker.color.b = 1.0;
-         legend_marker.color.a = 1.0;
-         
-         legend_marker.text = 
-             "GREEN: Direct Path\n"
-             "YELLOW: Single Reflection\n"
-             "RED: Multi-Reflection\n\n"
-             "RED SURFACES: Reflecting Faces\n"
-             "WHITE SPHERES: Reflection Points\n"
-             "BLUE LINE: User Trajectory";
-         
-         text_markers.markers.push_back(legend_marker);
-         
-         // Count summary
-         visualization_msgs::Marker count_marker;
-         count_marker.header.frame_id = fixed_frame_;
-         count_marker.header.stamp = ros::Time::now();
-         count_marker.ns = "counts";
-         count_marker.id = id++;
-         count_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-         count_marker.action = visualization_msgs::Marker::ADD;
-         
-         count_marker.pose.position.x = road_length_ / 2.0 - 15.0;
-        count_marker.pose.position.y = -road_width_ / 2.0 - 5.0;
-        count_marker.pose.position.z = 5.0;
-        count_marker.pose.orientation.w = 1.0;
-        
-        count_marker.scale.z = 0.5; // Text height
-        
-        count_marker.color.r = 1.0;
-        count_marker.color.g = 1.0;
-        count_marker.color.b = 0.0;
-        count_marker.color.a = 1.0;
-        
-        // Count paths by type
-        int direct_paths = 0;
-        int single_reflection = 0;
-        int double_reflection = 0;
-        int forced_paths = 0;
-        
-        for (const auto& path : signal_paths_) {
-            if (path.penetrates_building) {
-                continue;  // Skip invalid paths
-            }
-            
-            if (path.forced) {
-                forced_paths++;
-            } else if (path.reflection_count == 0) {
-                direct_paths++;
-            } else if (path.reflection_count == 1) {
-                single_reflection++;
-            } else if (path.reflection_count == 2) {
-                double_reflection++;
-            }
-        }
-        
-        std::stringstream ss;
-        ss << "Paths: " << direct_paths << " direct\n"
-           << single_reflection << " single reflection\n"
-           << double_reflection << " double reflection\n";
-        
-        if (forced_paths > 0) {
-            ss << forced_paths << " forced paths\n";
-        }
-        
-        ss << "\nMoving with " << movement_type_ << " trajectory";
-        
-        count_marker.text = ss.str();
-        
-        text_markers.markers.push_back(count_marker);
-        
-        // User position info
-        visualization_msgs::Marker user_info;
-        user_info.header.frame_id = fixed_frame_;
-        user_info.header.stamp = ros::Time::now();
-        user_info.ns = "user_info";
-        user_info.id = id++;
-        user_info.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-        user_info.action = visualization_msgs::Marker::ADD;
-        
-        user_info.pose.position.x = road_length_ / 2.0 - 15.0;
-        user_info.pose.position.y = road_width_ / 2.0 + 5.0;
-        user_info.pose.position.z = 5.0;
-        user_info.pose.orientation.w = 1.0;
-        
-        user_info.scale.z = 0.5;
-        
-        user_info.color.r = 0.0;
-        user_info.color.g = 0.8;
-        user_info.color.b = 1.0;
-        user_info.color.a = 1.0;
-        
-        std::stringstream user_ss;
-        user_ss << "Current User Position:\n"
-                << "X: " << std::fixed << std::setprecision(2) << user_position_.x() << "\n"
-                << "Y: " << std::fixed << std::setprecision(2) << user_position_.y() << "\n"
-                << "Z: " << std::fixed << std::setprecision(2) << user_position_.z() << "\n"
-                << "Speed: " << std::fixed << std::setprecision(2) << movement_speed_ << " m/s";
-        
-        user_info.text = user_ss.str();
-        
-        text_markers.markers.push_back(user_info);
-        
-        text_pub_.publish(text_markers);
-    }
-    
-    void broadcastTFs() {
-        // Broadcast TF frames for beacons and user
-        ros::Time now = ros::Time::now();
-        
-        // User TF
-        tf::Transform user_tf;
-        user_tf.setOrigin(tf::Vector3(user_position_.x(), user_position_.y(), user_position_.z()));
-        user_tf.setRotation(tf::Quaternion(0, 0, 0, 1));
-        tf_broadcaster_.sendTransform(tf::StampedTransform(user_tf, now, fixed_frame_, "user"));
-        
-        // Beacon TFs
-        for (const auto& beacon : beacons_) {
-            tf::Transform beacon_tf;
-            beacon_tf.setOrigin(tf::Vector3(beacon.position.x(), beacon.position.y(), beacon.position.z()));
-            beacon_tf.setRotation(tf::Quaternion(0, 0, 0, 1));
-            tf_broadcaster_.sendTransform(tf::StampedTransform(beacon_tf, now, fixed_frame_, beacon.id));
-        }
-    }
-};
-
-int main(int argc, char** argv) {
-    ros::init(argc, argv, "RangingRC");
-    
-    ROS_INFO("Starting UWB Ray Tracer with moving user");
-    UWBRayTracer ray_tracer;
-    
-    ros::spin();
-    
-    return 0;
-}
+         // Create a panel to display pseudorange measurements
+         visualization
