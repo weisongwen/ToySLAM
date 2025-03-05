@@ -7,7 +7,7 @@
          doc="Use GPS orientation as initial guess for keyframes" />
     <arg name="use_gps_orientation_as_constraint" default="false" 
          doc="Use GPS orientation as a constraint in optimization" />
-    <arg name="use_gps_velocity" default="false" 
+    <arg name="use_gps_velocity" default="true" 
          doc="Use GPS velocity as measurement" />
 
     <!-- Topic names -->
@@ -46,13 +46,13 @@
     <arg name="enable_roll_pitch_constraint" default="true" />
     <arg name="enable_gravity_alignment_factor" default="true" />
     <arg name="enable_orientation_smoothness_factor" default="true" />
-    <arg name="enable_velocity_constraint" default="true" />
-    <arg name="enable_horizontal_velocity_incentive" default="true" />
+    <arg name="enable_velocity_constraint" default="false" />
+    <arg name="enable_horizontal_velocity_incentive" default="false" />
     <arg name="enable_imu_orientation_factor" default="false" />
 
     <!-- Velocity constraints -->
-    <arg name="max_velocity" default="25.0" /> <!-- m/s = 90 km/h -->
-    <arg name="min_horizontal_velocity" default="0.5" /> <!-- m/s -->
+    <arg name="max_velocity" default="55.0" /> <!-- m/s = 90 km/h -->
+    <arg name="min_horizontal_velocity" default="0.0" /> <!-- m/s -->
     
     <!-- Integration parameters -->
     <arg name="max_integration_dt" default="0.005" />

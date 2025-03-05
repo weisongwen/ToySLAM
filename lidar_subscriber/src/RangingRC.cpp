@@ -1267,132 +1267,182 @@
      }
      
      void createGPSSatellites() {
-         ROS_INFO("Creating GPS satellites with realistic orbital parameters...");
-         
-         // Clear any existing satellites
-         satellites_.clear();
-         
-         // PRN numbers for identification - using 12 satellites to ensure we get at least 8 visible
-         std::vector<int> prns = {1, 3, 7, 8, 11, 15, 19, 22, 24, 27, 30, 32};
-         
-         // Create satellites with orbital parameters optimized for high visibility
-         for (int i = 0; i < prns.size(); i++) {
-             GPSSatellite satellite;
-             satellite.id = "G" + std::to_string(prns[i]);
-             satellite.prn = prns[i];
-             
-             // Assign orbital parameters to distribute satellites for good geometry and visibility
-             satellite.semi_major_axis = GPSPhysics::GPS_ORBIT_RADIUS;
-             satellite.eccentricity = 0.01 + 0.005 * uniform_dist_(rng_);  // 0.01-0.015
-             
-             // Inclination around 55° with some variation (in radians)
-             satellite.inclination = GPSPhysics::deg2rad(55.0 + 2.0 * (uniform_dist_(rng_) - 0.5));
-             
-             // Distribute satellites across orbital planes for good visibility
-             // Use 30 degree spacing for better coverage
-             satellite.right_ascension = GPSPhysics::deg2rad(30.0 * i);
-             
-             // For optimal visibility, place more satellites at higher elevations
-             // Use phase differences to ensure better distribution
-             double phase_offset = 30.0 * i + 120.0 * uniform_dist_(rng_);
-             
-             // For the first 8 satellites, ensure they're highly visible by giving them
-             // better mean anomaly values that will result in higher elevations
-             if (i < 8) {
-                 // For these satellites, we'll place them strategically to ensure positive elevation
-                 // by adjusting their mean anomaly and argument of perigee
-                 satellite.argument_of_perigee = GPSPhysics::deg2rad(45.0 + 90.0 * uniform_dist_(rng_));
-                 satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset + 30.0 * i);
-             } else {
-                 // For additional satellites, use more random distribution
-                 satellite.argument_of_perigee = GPSPhysics::deg2rad(360.0 * uniform_dist_(rng_));
-                 satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset);
-             }
-             
-             // Mean motion is inversely related to orbital period (approximately 12 hours)
-             satellite.mean_motion = std::sqrt(GPSPhysics::GPS_EARTH_GM / 
-                                      std::pow(satellite.semi_major_axis, 3));
-             
-             // Initialize satellite position
-             satellite.updateState(gps_time_);
-             
-             // Calculate initial elevation and azimuth
-             double elevation, azimuth;
-             GPSPhysics::calculateElevationAzimuth(user_position_, satellite.position, elevation, azimuth);
-             satellite.elevation = elevation;
-             satellite.azimuth = azimuth;
-             
-             // Assign random initial clock bias (-10 to 10 meters)
-             satellite.clock_bias = 20.0 * (uniform_dist_(rng_) - 0.5);
-             
-             // Assign random clock drift (-0.01 to 0.01 m/s)
-             satellite.clock_drift = 0.02 * (uniform_dist_(rng_) - 0.5);
-             
-             // Add the satellite
-             satellites_.push_back(satellite);
-             
-             ROS_INFO("Created satellite %s at initial position (%.2f, %.2f, %.2f), elevation: %.1f°", 
-                      satellite.id.c_str(), satellite.position.x(), satellite.position.y(), 
-                      satellite.position.z(), satellite.elevation);
-         }
-         
-         // Check if we have enough visible satellites (above MIN_ELEVATION_ANGLE)
-         int visible_count = 0;
-         for (const auto& sat : satellites_) {
-             if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
-                 visible_count++;
-             }
-         }
-         
-         // If we don't have at least 8 visible satellites, adjust some orbital parameters
-         if (visible_count < 8) {
-             ROS_WARN("Only %d satellites visible, adjusting orbital parameters...", visible_count);
-             
-             // Adjust satellites with negative or low elevation
-             for (auto& sat : satellites_) {
-                 if (sat.elevation < GPSPhysics::MIN_ELEVATION_ANGLE) {
-                     // Adjust the satellite's position to have higher elevation
-                     // Move it above horizon by adjusting its argument of perigee and mean anomaly
-                     double current_elev = sat.elevation;
-                     
-                     // Try different orbital parameters until we get better elevation
-                     int attempts = 0;
-                     while (sat.elevation < GPSPhysics::MIN_ELEVATION_ANGLE + 5.0 && attempts < 10) {
-                         // Adjust orbital parameters to move satellite higher
-                         sat.argument_of_perigee = GPSPhysics::deg2rad(45.0 + 90.0 * uniform_dist_(rng_));
-                         sat.mean_anomaly = GPSPhysics::deg2rad(180.0 * uniform_dist_(rng_));
-                         
-                         // Update position with new parameters
-                         sat.updateState(gps_time_);
-                         
-                         // Recalculate elevation
-                         double new_elev, new_azim;
-                         GPSPhysics::calculateElevationAzimuth(user_position_, sat.position, new_elev, new_azim);
-                         sat.elevation = new_elev;
-                         sat.azimuth = new_azim;
-                         
-                         attempts++;
-                     }
-                     
-                     ROS_INFO("Adjusted satellite %s: elevation changed from %.1f° to %.1f°", 
+        ROS_INFO("Creating GPS satellites with realistic orbital parameters...");
+        
+        // Clear any existing satellites
+        satellites_.clear();
+        
+        // PRN numbers for identification - using 12 satellites to ensure we get at least 8 visible
+        std::vector<int> prns = {1, 3, 7, 8, 11, 15, 19, 22, 24, 27, 30, 32};
+        
+        // Create satellites with orbital parameters optimized for high visibility
+        for (int i = 0; i < prns.size(); i++) {
+            GPSSatellite satellite;
+            satellite.id = "G" + std::to_string(prns[i]);
+            satellite.prn = prns[i];
+            
+            // Assign orbital parameters to distribute satellites for good geometry and visibility
+            // Use a more realistic orbit radius (GPS orbits at ~20,200 km altitude)
+            double earth_radius_km = GPSPhysics::EARTH_RADIUS / 1000.0;     // ~6371 km
+            double gps_altitude_km = 20200.0;                               // 20,200 km altitude
+            satellite.semi_major_axis = (earth_radius_km + gps_altitude_km) * 1000.0; // in meters
+            
+            // Apply visualization scale for display (this doesn't affect physical calculations)
+            double display_radius = orbital_radius_;  // This is the visualization scale parameter
+            
+            // Eccentricity (GPS orbits are nearly circular)
+            satellite.eccentricity = 0.01 + 0.005 * uniform_dist_(rng_);  // 0.01-0.015
+            
+            // Inclination around 55° with some variation (in radians)
+            satellite.inclination = GPSPhysics::deg2rad(55.0 + 2.0 * (uniform_dist_(rng_) - 0.5));
+            
+            // Distribute satellites across orbital planes for good visibility
+            // Use 30 degree spacing for better coverage
+            satellite.right_ascension = GPSPhysics::deg2rad(30.0 * i);
+            
+            // For optimal visibility, place more satellites at higher elevations
+            // Use phase differences to ensure better distribution
+            double phase_offset = 30.0 * i + 120.0 * uniform_dist_(rng_);
+            
+            // For the first 8 satellites, ensure they're highly visible by giving them
+            // better mean anomaly values that will result in higher elevations
+            if (i < 8) {
+                // For these satellites, we'll place them strategically to ensure positive elevation
+                // by adjusting their mean anomaly and argument of perigee
+                satellite.argument_of_perigee = GPSPhysics::deg2rad(45.0 + 90.0 * uniform_dist_(rng_));
+                satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset + 30.0 * i);
+            } else {
+                // For additional satellites, use more random distribution
+                satellite.argument_of_perigee = GPSPhysics::deg2rad(360.0 * uniform_dist_(rng_));
+                satellite.mean_anomaly = GPSPhysics::deg2rad(phase_offset);
+            }
+            
+            // Mean motion is inversely related to orbital period (approximately 12 hours)
+            // Calculate using Kepler's 3rd law: T^2 ~ a^3
+            double GM = GPSPhysics::GPS_EARTH_GM;  // Earth's gravitational parameter
+            satellite.mean_motion = std::sqrt(GM / std::pow(satellite.semi_major_axis, 3));
+            
+            // Initialize satellite position using realistic orbital mechanics
+            satellite.updateState(gps_time_);
+            
+            // Store the actual physical position for range calculations
+            Eigen::Vector3d physical_position = satellite.position;
+            
+            // Scale the position for visualization only
+            double scale_factor = display_radius / satellite.semi_major_axis;
+            satellite.position = user_position_ + (satellite.position - Eigen::Vector3d(0,0,0)) * scale_factor;
+            
+            // Calculate initial elevation and azimuth
+            double elevation, azimuth;
+            GPSPhysics::calculateElevationAzimuth(user_position_, satellite.position, elevation, azimuth);
+            satellite.elevation = elevation;
+            satellite.azimuth = azimuth;
+            
+            // Assign random initial clock bias (-10 to 10 meters)
+            satellite.clock_bias = 20.0 * (uniform_dist_(rng_) - 0.5);
+            
+            // Assign random clock drift (-0.01 to 0.01 m/s)
+            satellite.clock_drift = 0.02 * (uniform_dist_(rng_) - 0.5);
+            
+            // Add the satellite
+            satellites_.push_back(satellite);
+            
+            ROS_INFO("Created satellite %s at initial position (%.2f, %.2f, %.2f), elevation: %.1f°", 
+                     satellite.id.c_str(), satellite.position.x(), satellite.position.y(), 
+                     satellite.position.z(), satellite.elevation);
+        }
+        
+        // Check if we have enough visible satellites (above MIN_ELEVATION_ANGLE)
+        int visible_count = 0;
+        for (const auto& sat : satellites_) {
+            if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                visible_count++;
+            }
+        }
+        
+        // If we don't have at least 8 visible satellites, adjust some orbital parameters
+        if (visible_count < 8) {
+            ROS_WARN("Only %d satellites visible, adjusting orbital parameters...", visible_count);
+            
+            // For each satellite with negative or low elevation, adjust its position
+            for (auto& sat : satellites_) {
+                if (sat.elevation < GPSPhysics::MIN_ELEVATION_ANGLE) {
+                    // Adjust the satellite's position to have higher elevation
+                    double current_elev = sat.elevation;
+                    
+                    // Move the satellite higher in the sky
+                    Eigen::Vector3d up_vector(0, 0, 1);
+                    Eigen::Vector3d to_sat = sat.position - user_position_;
+                    double distance = to_sat.norm();
+                    
+                    // Create a new position with higher elevation
+                    double elevation_adjustment = 30.0 + 30.0 * uniform_dist_(rng_); // 30-60 degrees up
+                    double adjusted_angle = GPSPhysics::deg2rad(elevation_adjustment);
+                    
+                    // Rotate the satellite position towards the zenith
+                    Eigen::Vector3d to_sat_normalized = to_sat.normalized();
+                    Eigen::Vector3d rotation_axis = to_sat_normalized.cross(up_vector).normalized();
+                    
+                    // If the cross product is nearly zero, use x-axis for rotation
+                    if (rotation_axis.norm() < 0.01) {
+                        rotation_axis = Eigen::Vector3d(1, 0, 0);
+                    }
+                    
+                    // Create rotation matrix (angle-axis rotation)
+                    Eigen::AngleAxisd rotation(adjusted_angle, rotation_axis);
+                    Eigen::Vector3d new_direction = rotation * to_sat_normalized;
+                    
+                    // Set new position
+                    sat.position = user_position_ + new_direction * distance;
+                    
+                    // Recalculate elevation and azimuth
+                    double new_elev, new_azim;
+                    GPSPhysics::calculateElevationAzimuth(user_position_, sat.position, new_elev, new_azim);
+                    sat.elevation = new_elev;
+                    sat.azimuth = new_azim;
+                    
+                    ROS_INFO("Adjusted satellite %s: elevation changed from %.1f° to %.1f°", 
                              sat.id.c_str(), current_elev, sat.elevation);
-                 }
-             }
-             
-             // Recount visible satellites
-             visible_count = 0;
-             for (const auto& sat : satellites_) {
-                 if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
-                     visible_count++;
-                 }
-             }
-             
-             ROS_INFO("After adjustment: %d satellites visible", visible_count);
-         }
-         
-         ROS_INFO("Created %zu GPS satellites with realistic orbits, %d visible", 
-                  satellites_.size(), visible_count);
-     }
+                }
+            }
+            
+            // Recount visible satellites
+            visible_count = 0;
+            for (const auto& sat : satellites_) {
+                if (sat.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                    visible_count++;
+                }
+            }
+            
+            ROS_INFO("After adjustment: %d satellites visible", visible_count);
+        }
+        
+        // Final check to ensure we have at least some satellites above horizon
+        if (visible_count < 1) {
+            // Emergency: place at least one satellite directly overhead
+            GPSSatellite emergency_sat;
+            emergency_sat.id = "G99";
+            emergency_sat.prn = 99;
+            
+            // Place high in the sky
+            emergency_sat.position = user_position_ + Eigen::Vector3d(0, 0, orbital_radius_);
+            emergency_sat.elevation = 90.0;
+            emergency_sat.azimuth = 0.0;
+            
+            // Reasonable orbital parameters
+            emergency_sat.semi_major_axis = GPSPhysics::EARTH_RADIUS + 20200000.0;
+            emergency_sat.eccentricity = 0.01;
+            emergency_sat.inclination = 0.0;
+            emergency_sat.mean_motion = std::sqrt(GPSPhysics::GPS_EARTH_GM / 
+                                         std::pow(emergency_sat.semi_major_axis, 3));
+            
+            satellites_.push_back(emergency_sat);
+            ROS_WARN("Added emergency satellite overhead for testing");
+        }
+        
+        ROS_INFO("Created %zu GPS satellites with realistic orbits, %d visible", 
+                 satellites_.size(), visible_count);
+    }
      
      void computeGPSSignals() {
          ROS_INFO("Computing GPS satellite signals and pseudorange measurements...");
@@ -2584,4 +2634,961 @@
          }
          
          // Create a panel to display pseudorange measurements
-         visualization
+        visualization_msgs::Marker panel;
+        panel.header.frame_id = fixed_frame_;
+        panel.header.stamp = ros::Time::now();
+        panel.ns = "measurement_panel";
+        panel.id = id++;
+        panel.type = visualization_msgs::Marker::CUBE;
+        panel.action = visualization_msgs::Marker::ADD;
+        
+        // Position panel near user but offset to the side
+        panel.pose.position.x = user_position_.x() - 15.0;
+        panel.pose.position.y = user_position_.y() + 10.0;
+        panel.pose.position.z = user_position_.z() + 10.0;
+        panel.pose.orientation.w = 1.0;
+        
+        // Size based on number of satellites
+        double panel_height = std::max(10.0, satellite_signals_.size() * 2.0 + 4.0);
+        panel.scale.x = 18.0;
+        panel.scale.y = 0.1;
+        panel.scale.z = panel_height;
+        
+        // Color - semi-transparent dark gray
+        panel.color.r = 0.2;
+        panel.color.g = 0.2;
+        panel.color.b = 0.2;
+        panel.color.a = 0.7;
+        
+        measurement_markers.markers.push_back(panel);
+        
+        // Add panel title
+        visualization_msgs::Marker title;
+        title.header.frame_id = fixed_frame_;
+        title.header.stamp = ros::Time::now();
+        title.ns = "measurement_title";
+        title.id = id++;
+        title.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        title.action = visualization_msgs::Marker::ADD;
+        
+        title.pose.position.x = panel.pose.position.x;
+        title.pose.position.y = panel.pose.position.y;
+        title.pose.position.z = panel.pose.position.z + panel_height/2.0 + 1.0;
+        title.pose.orientation.w = 1.0;
+        
+        title.scale.z = 1.0;
+        
+        title.color.r = 1.0;
+        title.color.g = 1.0;
+        title.color.b = 1.0;
+        title.color.a = 1.0;
+        
+        title.text = "PSEUDORANGE MEASUREMENTS";
+        
+        measurement_markers.markers.push_back(title);
+        
+        // Add header row
+        visualization_msgs::Marker header;
+        header.header.frame_id = fixed_frame_;
+        header.header.stamp = ros::Time::now();
+        header.ns = "measurement_header";
+        header.id = id++;
+        header.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        header.action = visualization_msgs::Marker::ADD;
+        
+        header.pose.position.x = panel.pose.position.x;
+        header.pose.position.y = panel.pose.position.y;
+        header.pose.position.z = panel.pose.position.z + panel_height/2.0 - 1.0;
+        header.pose.orientation.w = 1.0;
+        
+        header.scale.z = 0.7;
+        
+        header.color.r = 1.0;
+        header.color.g = 1.0;
+        header.color.b = 1.0;
+        header.color.a = 1.0;
+        
+        header.text = "SAT    PSEUDORANGE (m)    ERROR (m)    C/N0 (dB-Hz)    TYPE";
+        
+        measurement_markers.markers.push_back(header);
+        
+        // Add entries for each satellite
+        for (size_t i = 0; i < satellite_signals_.size(); i++) {
+            const auto& signal = satellite_signals_[i];
+            
+            visualization_msgs::Marker entry;
+            entry.header.frame_id = fixed_frame_;
+            entry.header.stamp = ros::Time::now();
+            entry.ns = "measurement_entries";
+            entry.id = id++;
+            entry.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            entry.action = visualization_msgs::Marker::ADD;
+            
+            // Position within panel
+            entry.pose.position.x = panel.pose.position.x;
+            entry.pose.position.y = panel.pose.position.y;
+            entry.pose.position.z = panel.pose.position.z + panel_height/2.0 - 2.5 - i * 1.8;
+            entry.pose.orientation.w = 1.0;
+            
+            entry.scale.z = 0.8;
+            
+            // Color based on signal type
+            if (signal.is_los) {
+                entry.color.r = 0.0;
+                entry.color.g = 1.0;
+                entry.color.b = 0.0;
+            } else if (signal.is_multipath) {
+                entry.color.r = 1.0;
+                entry.color.g = 0.0;
+                entry.color.b = 0.0;
+            } else {
+                entry.color.r = 1.0;
+                entry.color.g = 1.0;
+                entry.color.b = 0.0;
+            }
+            entry.color.a = 1.0;
+            
+            // Format text with measurement details
+            std::stringstream ss;
+            ss << std::fixed << std::setprecision(1);
+            ss << signal.satellite_id << "    " 
+               << std::setw(10) << std::setprecision(2) << signal.pseudorange << " m    "
+               << std::setw(5) << std::setprecision(2) << (signal.pseudorange - signal.geometric_range) << " m    "
+               << std::setw(5) << signal.signal_strength << " dB-Hz    ";
+            
+            if (signal.is_los) {
+                ss << "LOS";
+            } else if (signal.is_multipath) {
+                ss << "Multipath";
+            } else {
+                ss << "Attenuated";
+            }
+            
+            entry.text = ss.str();
+            
+            measurement_markers.markers.push_back(entry);
+        }
+        
+        measurement_pub_.publish(measurement_markers);
+    }
+    
+    void publishPseudoranges() {
+        visualization_msgs::MarkerArray pseudorange_markers;
+        int id = 0;
+        
+        // Clear previous errors if there are none
+        if (satellite_signals_.empty()) {
+            visualization_msgs::Marker clear_marker;
+            clear_marker.action = visualization_msgs::Marker::DELETEALL;
+            clear_marker.header.frame_id = fixed_frame_;
+            clear_marker.header.stamp = ros::Time::now();
+            
+            pseudorange_markers.markers.push_back(clear_marker);
+            pseudorange_pub_.publish(pseudorange_markers);
+            return;
+        }
+        
+        // Create a panel to display error breakdown
+        visualization_msgs::Marker panel;
+        panel.header.frame_id = fixed_frame_;
+        panel.header.stamp = ros::Time::now();
+        panel.ns = "error_panel";
+        panel.id = id++;
+        panel.type = visualization_msgs::Marker::CUBE;
+        panel.action = visualization_msgs::Marker::ADD;
+        
+        // Position panel near user but offset to the side
+        panel.pose.position.x = user_position_.x() + 15.0;
+        panel.pose.position.y = user_position_.y() + 10.0;
+        panel.pose.position.z = user_position_.z() + 10.0;
+        panel.pose.orientation.w = 1.0;
+        
+        // Size based on number of satellites plus header and footer
+        double panel_height = std::max(10.0, satellite_signals_.size() * 3.0 + 4.0);
+        panel.scale.x = 18.0;
+        panel.scale.y = 0.1;
+        panel.scale.z = panel_height;
+        
+        // Color - semi-transparent dark gray
+        panel.color.r = 0.2;
+        panel.color.g = 0.2;
+        panel.color.b = 0.2;
+        panel.color.a = 0.7;
+        
+        pseudorange_markers.markers.push_back(panel);
+        
+        // Add panel title
+        visualization_msgs::Marker title;
+        title.header.frame_id = fixed_frame_;
+        title.header.stamp = ros::Time::now();
+        title.ns = "error_title";
+        title.id = id++;
+        title.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        title.action = visualization_msgs::Marker::ADD;
+        
+        title.pose.position.x = panel.pose.position.x;
+        title.pose.position.y = panel.pose.position.y;
+        title.pose.position.z = panel.pose.position.z + panel_height/2.0 + 1.0;
+        title.pose.orientation.w = 1.0;
+        
+        title.scale.z = 1.0;
+        
+        title.color.r = 1.0;
+        title.color.g = 1.0;
+        title.color.b = 1.0;
+        title.color.a = 1.0;
+        
+        title.text = "PSEUDORANGE ERROR BREAKDOWN (METERS)";
+        
+        pseudorange_markers.markers.push_back(title);
+        
+        // Add header row
+        visualization_msgs::Marker header;
+        header.header.frame_id = fixed_frame_;
+        header.header.stamp = ros::Time::now();
+        header.ns = "error_header";
+        header.id = id++;
+        header.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        header.action = visualization_msgs::Marker::ADD;
+        
+        header.pose.position.x = panel.pose.position.x;
+        header.pose.position.y = panel.pose.position.y;
+        header.pose.position.z = panel.pose.position.z + panel_height/2.0 - 1.0;
+        header.pose.orientation.w = 1.0;
+        
+        header.scale.z = 0.7;
+        
+        header.color.r = 1.0;
+        header.color.g = 1.0;
+        header.color.b = 1.0;
+        header.color.a = 1.0;
+        
+        header.text = "SAT    CLOCK    IONO    TROPO    RECV    MPATH    NOISE    TOTAL";
+        
+        pseudorange_markers.markers.push_back(header);
+        
+        // Add entries for each satellite
+        for (size_t i = 0; i < satellite_signals_.size(); i++) {
+            const auto& signal = satellite_signals_[i];
+            
+            visualization_msgs::Marker entry;
+            entry.header.frame_id = fixed_frame_;
+            entry.header.stamp = ros::Time::now();
+            entry.ns = "error_entries";
+            entry.id = id++;
+            entry.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            entry.action = visualization_msgs::Marker::ADD;
+            
+            // Position within panel
+            entry.pose.position.x = panel.pose.position.x;
+            entry.pose.position.y = panel.pose.position.y;
+            entry.pose.position.z = panel.pose.position.z + panel_height/2.0 - 2.5 - i * 2.0;
+            entry.pose.orientation.w = 1.0;
+            
+            entry.scale.z = 0.7;
+            
+            // Color based on signal type
+            if (signal.is_los) {
+                entry.color.r = 0.0;
+                entry.color.g = 1.0;
+                entry.color.b = 0.0;
+            } else if (signal.is_multipath) {
+                entry.color.r = 1.0;
+                entry.color.g = 0.0;
+                entry.color.b = 0.0;
+            } else {
+                entry.color.r = 1.0;
+                entry.color.g = 1.0;
+                entry.color.b = 0.0;
+            }
+            entry.color.a = 1.0;
+            
+            // Format text with error breakdown
+            std::stringstream ss;
+            ss << std::fixed << std::setprecision(2);
+            ss << std::setw(4) << signal.satellite_id << "  " 
+               << std::setw(7) << signal.satellite_clock_error << "  "
+               << std::setw(6) << signal.ionospheric_delay << "  "
+               << std::setw(7) << signal.tropospheric_delay << "  "
+               << std::setw(6) << signal.receiver_clock_bias << "  "
+               << std::setw(7) << signal.multipath_error << "  "
+               << std::setw(7) << signal.receiver_noise << "  "
+               << std::setw(7) << signal.getTotalError();
+            
+            entry.text = ss.str();
+            
+            pseudorange_markers.markers.push_back(entry);
+            
+            // Add visual bar graph for error components
+            double bar_width = 0.4;
+            double bar_spacing = 0.5;
+            double max_bar_length = 8.0;  // Maximum bar length for scaling
+            double bar_z_pos = entry.pose.position.z - 0.6;  // Position below the text
+            
+            // Function to create a bar for each error component
+            auto createErrorBar = [&](double error, double x_offset, const std_msgs::ColorRGBA& color) {
+                visualization_msgs::Marker bar;
+                bar.header.frame_id = fixed_frame_;
+                bar.header.stamp = ros::Time::now();
+                bar.ns = "error_bars";
+                bar.id = id++;
+                bar.type = visualization_msgs::Marker::CUBE;
+                bar.action = visualization_msgs::Marker::ADD;
+                
+                // Scale error for visualization (absolute value)
+                double bar_length = std::min(max_bar_length, std::abs(error) * 3.0);
+                if (bar_length < 0.05) bar_length = 0.05;  // Minimum visible size
+                
+                // Position
+                bar.pose.position.x = panel.pose.position.x - 5.0 + x_offset;
+                bar.pose.position.y = panel.pose.position.y;
+                bar.pose.position.z = bar_z_pos;
+                
+                // Size
+                bar.scale.x = bar_length;
+                bar.scale.y = 0.3;
+                bar.scale.z = bar_width;
+                
+                // Color
+                bar.color = color;
+                
+                // Direction based on sign
+                if (error < 0) {
+                    bar.pose.position.x -= bar_length / 2.0;
+                } else {
+                    bar.pose.position.x += bar_length / 2.0;
+                }
+                
+                pseudorange_markers.markers.push_back(bar);
+            };
+            
+            // Define colors for different error sources
+            std_msgs::ColorRGBA clock_color, iono_color, tropo_color, recv_color, multipath_color, noise_color, total_color;
+            
+            clock_color.r = 0.0; clock_color.g = 0.7; clock_color.b = 1.0; clock_color.a = 0.7;  // Blue
+            iono_color.r = 1.0; iono_color.g = 0.5; iono_color.b = 0.0; iono_color.a = 0.7;      // Orange
+            tropo_color.r = 0.0; tropo_color.g = 0.5; tropo_color.b = 0.0; tropo_color.a = 0.7;  // Dark green
+            recv_color.r = 0.5; recv_color.g = 0.0; recv_color.b = 0.5; recv_color.a = 0.7;      // Purple
+            multipath_color.r = 1.0; multipath_color.g = 0.0; multipath_color.b = 0.0; multipath_color.a = 0.7; // Red
+            noise_color.r = 0.7; noise_color.g = 0.7; noise_color.b = 0.7; noise_color.a = 0.7;  // Gray
+            total_color.r = 1.0; total_color.g = 1.0; total_color.b = 1.0; total_color.a = 0.9;  // White
+            
+            // Create bars for each error component
+            createErrorBar(signal.satellite_clock_error, 0.0, clock_color);
+            createErrorBar(signal.ionospheric_delay, 1.5, iono_color);
+            createErrorBar(signal.tropospheric_delay, 3.0, tropo_color);
+            createErrorBar(signal.receiver_clock_bias, 4.5, recv_color);
+            createErrorBar(signal.multipath_error, 6.0, multipath_color);
+            createErrorBar(signal.receiver_noise, 7.5, noise_color);
+            createErrorBar(signal.getTotalError(), 9.0, total_color);
+        }
+        
+        // Add legend for the error bars
+        visualization_msgs::Marker legend;
+        legend.header.frame_id = fixed_frame_;
+        legend.header.stamp = ros::Time::now();
+        legend.ns = "error_legend";
+        legend.id = id++;
+        legend.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        legend.action = visualization_msgs::Marker::ADD;
+        
+        legend.pose.position.x = panel.pose.position.x;
+        legend.pose.position.y = panel.pose.position.y;
+        legend.pose.position.z = panel.pose.position.z - panel_height/2.0 + 1.5;
+        legend.pose.orientation.w = 1.0;
+        
+        legend.scale.z = 0.6;
+        
+        legend.color.r = 0.8;
+        legend.color.g = 0.8;
+        legend.color.b = 0.8;
+        legend.color.a = 1.0;
+        
+        legend.text = "Legend:\n"
+                      "Blue: Satellite Clock   Orange: Ionospheric   Green: Tropospheric\n"
+                      "Purple: Receiver Clock   Red: Multipath   Gray: Receiver Noise\n"
+                      "White: Total Error";
+        
+        pseudorange_markers.markers.push_back(legend);
+        
+        pseudorange_pub_.publish(pseudorange_markers);
+    }
+    
+    void publishSkyplot() {
+        visualization_msgs::MarkerArray skyplot_markers;
+        int id = 0;
+        
+        // Create skyplot background
+        visualization_msgs::Marker background;
+        background.header.frame_id = fixed_frame_;
+        background.header.stamp = ros::Time::now();
+        background.ns = "skyplot_background";
+        background.id = id++;
+        background.type = visualization_msgs::Marker::CYLINDER;
+        background.action = visualization_msgs::Marker::ADD;
+        
+        // Position skyplot near user
+        background.pose.position.x = user_position_.x() - 15.0;
+        background.pose.position.y = user_position_.y() - 10.0;
+        background.pose.position.z = user_position_.z() + 5.0;
+        background.pose.orientation.w = 1.0;
+        
+        // Size
+        double skyplot_radius = 5.0;
+        background.scale.x = 2 * skyplot_radius;
+        background.scale.y = 2 * skyplot_radius;
+        background.scale.z = 0.1;
+        
+        // Color - dark blue
+        background.color.r = 0.0;
+        background.color.g = 0.0;
+        background.color.b = 0.3;
+        background.color.a = 0.7;
+        
+        skyplot_markers.markers.push_back(background);
+        
+        // Add concentric circles for elevation markers
+        for (int i = 1; i <= 3; i++) {
+            visualization_msgs::Marker circle;
+            circle.header.frame_id = fixed_frame_;
+            circle.header.stamp = ros::Time::now();
+            circle.ns = "skyplot_circles";
+            circle.id = id++;
+            circle.type = visualization_msgs::Marker::CYLINDER;
+            circle.action = visualization_msgs::Marker::ADD;
+            
+            // Same position as background
+            circle.pose.position = background.pose.position;
+            circle.pose.orientation = background.pose.orientation;
+            
+            // Size - scaled based on elevation
+            double radius_scale = (4 - i) / 3.0;  // 3/3, 2/3, 1/3
+            circle.scale.x = 2 * skyplot_radius * radius_scale;
+            circle.scale.y = 2 * skyplot_radius * radius_scale;
+            circle.scale.z = 0.11;  // Slightly above background
+            
+            // Color - light blue rings
+            circle.color.r = 0.0;
+            circle.color.g = 0.5;
+            circle.color.b = 1.0;
+            circle.color.a = 0.3;
+            
+            skyplot_markers.markers.push_back(circle);
+            
+            // Add elevation label
+            visualization_msgs::Marker elev_text;
+            elev_text.header = circle.header;
+            elev_text.ns = "elevation_labels";
+            elev_text.id = id++;
+            elev_text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            elev_text.action = visualization_msgs::Marker::ADD;
+            
+            int elevation = 90 - (i * 30);  // 60°, 30°, 0°
+            
+            elev_text.pose.position = circle.pose.position;
+            elev_text.pose.position.y += circle.scale.y / 2.0;
+            elev_text.pose.position.z += 0.1;
+            elev_text.pose.orientation.w = 1.0;
+            
+            elev_text.scale.z = 0.8;
+            
+            elev_text.color.r = 1.0;
+            elev_text.color.g = 1.0;
+            elev_text.color.b = 1.0;
+            elev_text.color.a = 1.0;
+            
+            elev_text.text = std::to_string(elevation) + "°";
+            
+            skyplot_markers.markers.push_back(elev_text);
+        }
+        
+        // Add cardinal direction markers
+        std::vector<std::pair<std::string, double>> directions = {
+            {"N", 0.0}, {"E", 90.0}, {"S", 180.0}, {"W", 270.0}
+        };
+        
+        for (const auto& dir : directions) {
+            visualization_msgs::Marker dir_text;
+            dir_text.header.frame_id = fixed_frame_;
+            dir_text.header.stamp = ros::Time::now();
+            dir_text.ns = "direction_labels";
+            dir_text.id = id++;
+            dir_text.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            dir_text.action = visualization_msgs::Marker::ADD;
+            
+            double angle = GPSPhysics::deg2rad(dir.second);
+            dir_text.pose.position = background.pose.position;
+            dir_text.pose.position.x += (skyplot_radius + 0.5) * std::sin(angle);
+            dir_text.pose.position.y += (skyplot_radius + 0.5) * std::cos(angle);
+            dir_text.pose.position.z += 0.1;
+            dir_text.pose.orientation.w = 1.0;
+            
+            dir_text.scale.z = 0.8;
+            
+            dir_text.color.r = 1.0;
+            dir_text.color.g = 1.0;
+            dir_text.color.b = 1.0;
+            dir_text.color.a = 1.0;
+            
+            dir_text.text = dir.first;
+            
+            skyplot_markers.markers.push_back(dir_text);
+        }
+        
+        // Add satellites to skyplot
+        for (const auto& satellite : satellites_) {
+            // Skip satellites below horizon
+            if (satellite.elevation < 0) {
+                continue;
+            }
+            
+            // Calculate position on skyplot
+            double elevation_rad = GPSPhysics::deg2rad(90.0 - satellite.elevation);
+            double azimuth_rad = GPSPhysics::deg2rad(satellite.azimuth);
+            
+            // Convert to skyplot coordinates (azimuth 0=North, increases clockwise)
+            double x = skyplot_radius * std::sin(azimuth_rad) * elevation_rad / (M_PI/2);
+            double y = skyplot_radius * std::cos(azimuth_rad) * elevation_rad / (M_PI/2);
+            
+            // Create satellite marker
+            visualization_msgs::Marker sat_marker;
+            sat_marker.header.frame_id = fixed_frame_;
+            sat_marker.header.stamp = ros::Time::now();
+            sat_marker.ns = "skyplot_satellites";
+            sat_marker.id = id++;
+            sat_marker.type = visualization_msgs::Marker::SPHERE;
+            sat_marker.action = visualization_msgs::Marker::ADD;
+            
+            sat_marker.pose.position = background.pose.position;
+            sat_marker.pose.position.x += x;
+            sat_marker.pose.position.y += y;
+            sat_marker.pose.position.z += 0.2;  // Above the circles
+            sat_marker.pose.orientation.w = 1.0;
+            
+            // Size - larger for higher elevation
+            double size_factor = 0.5 + satellite.elevation / 180.0;
+            sat_marker.scale.x = size_factor;
+            sat_marker.scale.y = size_factor;
+            sat_marker.scale.z = size_factor;
+            
+            // Color based on signal availability
+            bool has_signal = false;
+            bool is_los = false;
+            bool is_multipath = false;
+            
+            for (const auto& signal : satellite_signals_) {
+                if (signal.satellite_id == satellite.id) {
+                    has_signal = true;
+                    is_los = signal.is_los;
+                    is_multipath = signal.is_multipath;
+                    break;
+                }
+            }
+            
+            if (has_signal) {
+                if (is_los) {
+                    // Green for LOS
+                    sat_marker.color.r = 0.0;
+                    sat_marker.color.g = 1.0;
+                    sat_marker.color.b = 0.0;
+                } else if (is_multipath) {
+                    // Red for multipath
+                    sat_marker.color.r = 1.0;
+                    sat_marker.color.g = 0.0;
+                    sat_marker.color.b = 0.0;
+                } else {
+                    // Yellow for attenuated
+                    sat_marker.color.r = 1.0;
+                    sat_marker.color.g = 1.0;
+                    sat_marker.color.b = 0.0;
+                }
+            } else if (satellite.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                // Gray for no signal but above horizon
+                sat_marker.color.r = 0.5;
+                sat_marker.color.g = 0.5;
+                sat_marker.color.b = 0.5;
+            } else {
+                // Dark gray for below minimum elevation
+                sat_marker.color.r = 0.3;
+                sat_marker.color.g = 0.3;
+                sat_marker.color.b = 0.3;
+            }
+            sat_marker.color.a = 1.0;
+            
+            skyplot_markers.markers.push_back(sat_marker);
+            
+            // Add satellite ID label
+            visualization_msgs::Marker sat_label;
+            sat_label.header = sat_marker.header;
+            sat_label.ns = "skyplot_labels";
+            sat_label.id = id++;
+            sat_label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            sat_label.action = visualization_msgs::Marker::ADD;
+            
+            sat_label.pose.position = sat_marker.pose.position;
+            sat_label.pose.position.z += 0.5;
+            sat_label.pose.orientation.w = 1.0;
+            
+            sat_label.scale.z = 0.6;
+            
+            sat_label.color.r = 1.0;
+            sat_label.color.g = 1.0;
+            sat_label.color.b = 1.0;
+            sat_label.color.a = 1.0;
+            
+            sat_label.text = satellite.id;
+            
+            skyplot_markers.markers.push_back(sat_label);
+        }
+        
+        // Add skyplot title
+        visualization_msgs::Marker title;
+        title.header.frame_id = fixed_frame_;
+        title.header.stamp = ros::Time::now();
+        title.ns = "skyplot_title";
+        title.id = id++;
+        title.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        title.action = visualization_msgs::Marker::ADD;
+        
+        title.pose.position = background.pose.position;
+        title.pose.position.z += skyplot_radius + 1.0;
+        title.pose.orientation.w = 1.0;
+        
+        title.scale.z = 1.0;
+        
+        title.color.r = 1.0;
+        title.color.g = 1.0;
+        title.color.b = 1.0;
+        title.color.a = 1.0;
+        
+        title.text = "SATELLITE SKYPLOT";
+        
+        skyplot_markers.markers.push_back(title);
+        
+        // Add legend for satellite colors
+        visualization_msgs::Marker legend;
+        legend.header.frame_id = fixed_frame_;
+        legend.header.stamp = ros::Time::now();
+        legend.ns = "skyplot_legend";
+        legend.id = id++;
+        legend.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        legend.action = visualization_msgs::Marker::ADD;
+        
+        legend.pose.position = background.pose.position;
+        legend.pose.position.z -= skyplot_radius + 1.0;
+        legend.pose.orientation.w = 1.0;
+        
+        legend.scale.z = 0.6;
+        
+        legend.color.r = 1.0;
+        legend.color.g = 1.0;
+        legend.color.b = 1.0;
+        legend.color.a = 1.0;
+        
+        legend.text = "Green = LOS  |  Yellow = Attenuated  |  Red = Multipath  |  Gray = No Signal";
+        
+        skyplot_markers.markers.push_back(legend);
+        
+        skyplot_pub_.publish(skyplot_markers);
+    }
+    
+    void publishTextInfo() {
+        visualization_msgs::MarkerArray text_markers;
+        int id = 0;
+        
+        // Title text
+        visualization_msgs::Marker title_marker;
+        title_marker.header.frame_id = fixed_frame_;
+        title_marker.header.stamp = ros::Time::now();
+        title_marker.ns = "text_info";
+        title_marker.id = id++;
+        title_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        title_marker.action = visualization_msgs::Marker::ADD;
+        
+        title_marker.pose.position.x = 0.0;
+        title_marker.pose.position.y = 0.0;
+        title_marker.pose.position.z = 30.0;
+        title_marker.pose.orientation.w = 1.0;
+        
+        title_marker.scale.z = 2.0; // Text height
+        
+        title_marker.color.r = 1.0;
+        title_marker.color.g = 1.0;
+        title_marker.color.b = 1.0;
+        title_marker.color.a = 1.0;
+        
+        title_marker.text = "GPS SATELLITE SIGNAL SIMULATOR";
+        
+        text_markers.markers.push_back(title_marker);
+        
+        // Legend text
+        visualization_msgs::Marker legend_marker;
+        legend_marker.header.frame_id = fixed_frame_;
+        legend_marker.header.stamp = ros::Time::now();
+        legend_marker.ns = "legend";
+        legend_marker.id = id++;
+        legend_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        legend_marker.action = visualization_msgs::Marker::ADD;
+        
+        legend_marker.pose.position.x = -road_length_ / 2.0 + 5.0;
+        legend_marker.pose.position.y = -road_width_ / 2.0 - 5.0;
+        legend_marker.pose.position.z = 5.0;
+        legend_marker.pose.orientation.w = 1.0;
+        
+        legend_marker.scale.z = 0.8; // Text height
+        
+        legend_marker.color.r = 1.0;
+        legend_marker.color.g = 1.0;
+        legend_marker.color.b = 1.0;
+        legend_marker.color.a = 1.0;
+        
+        legend_marker.text = 
+            "SIGNAL PATHS:\n"
+            "GREEN: Direct Line-of-Sight\n"
+            "YELLOW: Signal Attenuated by Buildings\n"
+            "RED: Multipath Reflection\n\n"
+            "ERROR SOURCES:\n"
+            "• Satellite clock bias & drift\n"
+            "• Ionospheric delay (Klobuchar model)\n"
+            "• Tropospheric delay (Saastamoinen)\n"
+            "• Receiver clock bias\n"
+            "• Multipath error\n"
+            "• Receiver noise\n"
+            "• Relativistic effects";
+        
+        text_markers.markers.push_back(legend_marker);
+        
+        // Signal statistics
+        visualization_msgs::Marker stats_marker;
+        stats_marker.header.frame_id = fixed_frame_;
+        stats_marker.header.stamp = ros::Time::now();
+        stats_marker.ns = "stats";
+        stats_marker.id = id++;
+        stats_marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        stats_marker.action = visualization_msgs::Marker::ADD;
+        
+        stats_marker.pose.position.x = road_length_ / 2.0 - 15.0;
+        stats_marker.pose.position.y = -road_width_ / 2.0 - 5.0;
+        stats_marker.pose.position.z = 5.0;
+        stats_marker.pose.orientation.w = 1.0;
+        
+        stats_marker.scale.z = 0.8; // Text height
+        
+        stats_marker.color.r = 1.0;
+        stats_marker.color.g = 1.0;
+        stats_marker.color.b = 0.0;
+        stats_marker.color.a = 1.0;
+        
+        // Count satellites by type
+        int los_count = 0;
+        int attenuated_count = 0;
+        int multipath_count = 0;
+        int blocked_count = 0;
+        
+        // Track satellites visible and those with signals
+        std::set<std::string> visible_satellites;
+        std::set<std::string> signal_satellites;
+        
+        for (const auto& satellite : satellites_) {
+            if (satellite.elevation >= GPSPhysics::MIN_ELEVATION_ANGLE) {
+                visible_satellites.insert(satellite.id);
+            }
+        }
+        
+        for (const auto& signal : satellite_signals_) {
+            signal_satellites.insert(signal.satellite_id);
+            
+            if (signal.is_los) los_count++;
+            else if (signal.is_multipath) multipath_count++;
+            else attenuated_count++;
+        }
+        
+        blocked_count = visible_satellites.size() - signal_satellites.size();
+        
+        // Calculate DOP if we have enough satellites
+        double gdop = calculateDOP();
+        
+        std::stringstream ss;
+        ss << "Satellites Above Horizon: " << visible_satellites.size() << "\n"
+           << "- Direct Line-of-Sight: " << los_count << "\n"
+           << "- Signal Attenuated: " << attenuated_count << "\n"
+           << "- Multipath: " << multipath_count << "\n"
+           << "- Completely Blocked: " << blocked_count << "\n\n"
+           << "GDOP: " << std::fixed << std::setprecision(1) << gdop << "\n"
+           << "Moving with " << movement_type_ << " trajectory";
+        
+        stats_marker.text = ss.str();
+        
+        text_markers.markers.push_back(stats_marker);
+        
+        // User position info
+        visualization_msgs::Marker user_info;
+        user_info.header.frame_id = fixed_frame_;
+        user_info.header.stamp = ros::Time::now();
+        user_info.ns = "user_info";
+        user_info.id = id++;
+        user_info.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        user_info.action = visualization_msgs::Marker::ADD;
+        
+        user_info.pose.position.x = road_length_ / 2.0 - 15.0;
+        user_info.pose.position.y = road_width_ / 2.0 + 5.0;
+        user_info.pose.position.z = 5.0;
+        user_info.pose.orientation.w = 1.0;
+        
+        user_info.scale.z = 0.8;
+        
+        user_info.color.r = 0.0;
+        user_info.color.g = 0.8;
+        user_info.color.b = 1.0;
+        user_info.color.a = 1.0;
+        
+        std::stringstream user_ss;
+        user_ss << "Receiver Position:\n"
+                << "Lat: " << std::fixed << std::setprecision(6) << user_lat_ << "°\n"
+                << "Lon: " << std::fixed << std::setprecision(6) << user_lon_ << "°\n"
+                << "Height: " << std::fixed << std::setprecision(2) << user_height_ << " m\n\n"
+                << "Clock Bias: " << std::fixed << std::setprecision(2) << receiver_clock_bias_ << " m\n"
+                << "Speed: " << std::fixed << std::setprecision(2) << movement_speed_ << " m/s\n"
+                << "Usable Satellites: " << signal_satellites.size() << "/" << visible_satellites.size();
+        
+        user_info.text = user_ss.str();
+        
+        text_markers.markers.push_back(user_info);
+        
+        // GPS time of week
+        visualization_msgs::Marker time_info;
+        time_info.header.frame_id = fixed_frame_;
+        time_info.header.stamp = ros::Time::now();
+        time_info.ns = "time_info";
+        time_info.id = id++;
+        time_info.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        time_info.action = visualization_msgs::Marker::ADD;
+        
+        // Position in corner
+        time_info.pose.position.x = -road_length_ / 2.0 + 5.0;
+        time_info.pose.position.y = road_width_ / 2.0 + 5.0;
+        time_info.pose.position.z = 5.0;
+        time_info.pose.orientation.w = 1.0;
+        
+        time_info.scale.z = 0.8;
+        
+        time_info.color.r = 1.0;
+        time_info.color.g = 1.0;
+        time_info.color.b = 1.0;
+        time_info.color.a = 1.0;
+        
+        // Format time as days, hours, minutes, seconds
+        int days = static_cast<int>(gps_time_) / 86400;
+        int hours = (static_cast<int>(gps_time_) % 86400) / 3600;
+        int minutes = (static_cast<int>(gps_time_) % 3600) / 60;
+        double seconds = std::fmod(gps_time_, 60.0);
+        
+        std::stringstream time_ss;
+        time_ss << "GPS Time of Week:\n"
+                << days << "d " << hours << "h " << minutes << "m " << std::fixed 
+                << std::setprecision(3) << seconds << "s";
+        
+        time_info.text = time_ss.str();
+        
+        text_markers.markers.push_back(time_info);
+        
+        text_pub_.publish(text_markers);
+    }
+    
+    double calculateDOP() {
+        // Calculate Dilution of Precision from satellite geometry
+        
+        // Need at least 4 satellites for a solution
+        if (satellite_signals_.size() < 4) {
+            return 99.9;  // Invalid DOP
+        }
+        
+        // Create geometry matrix
+        Eigen::MatrixXd G(satellite_signals_.size(), 4);
+        
+        // Fill geometry matrix with unit vectors from user to satellites
+        int row = 0;
+        for (const auto& signal : satellite_signals_) {
+            // Find the satellite
+            auto sat_it = std::find_if(satellites_.begin(), satellites_.end(),
+                                    [&signal](const GPSSatellite& sat) {
+                                        return sat.id == signal.satellite_id;
+                                    });
+            
+            if (sat_it != satellites_.end()) {
+                // Get unit vector from user to satellite
+                Eigen::Vector3d user_to_sat = (sat_it->position - user_position_).normalized();
+                
+                // Fill row of geometry matrix [x, y, z, 1]
+                G(row, 0) = user_to_sat.x();
+                G(row, 1) = user_to_sat.y();
+                G(row, 2) = user_to_sat.z();
+                G(row, 3) = 1.0;  // Clock term
+                
+                row++;
+            }
+        }
+        
+        // Calculate covariance matrix
+        Eigen::MatrixXd GTG = G.transpose() * G;
+        
+        // Check if matrix is invertible
+        double det = GTG.determinant();
+        if (std::abs(det) < 1e-10) {
+            return 50.0;  // Singular matrix - very poor geometry
+        }
+        
+        // Invert to get covariance matrix
+        Eigen::MatrixXd cov = GTG.inverse();
+        
+        // GDOP = sqrt(trace of covariance matrix)
+        double gdop = std::sqrt(cov.trace());
+        
+        // PDOP = sqrt(sum of position variances)
+        double pdop = std::sqrt(cov(0,0) + cov(1,1) + cov(2,2));
+        
+        // HDOP = sqrt(sum of horizontal position variances)
+        double hdop = std::sqrt(cov(0,0) + cov(1,1));
+        
+        // VDOP = sqrt(vertical position variance)
+        double vdop = std::sqrt(cov(2,2));
+        
+        // TDOP = sqrt(time/clock variance)
+        double tdop = std::sqrt(cov(3,3));
+        
+        // Return GDOP - could be extended to return all DOPs
+        return gdop;
+    }
+    
+    void broadcastTFs() {
+        // Broadcast TF frames for satellites and user
+        ros::Time now = ros::Time::now();
+        
+        // User TF
+        tf::Transform user_tf;
+        user_tf.setOrigin(tf::Vector3(user_position_.x(), user_position_.y(), user_position_.z()));
+        user_tf.setRotation(tf::Quaternion(0, 0, 0, 1));
+        tf_broadcaster_.sendTransform(tf::StampedTransform(user_tf, now, fixed_frame_, "gps_receiver"));
+        
+        // Satellite TFs
+        for (const auto& satellite : satellites_) {
+            tf::Transform satellite_tf;
+            satellite_tf.setOrigin(tf::Vector3(satellite.position.x(), 
+                                             satellite.position.y(), 
+                                             satellite.position.z()));
+            satellite_tf.setRotation(tf::Quaternion(0, 0, 0, 1));
+            tf_broadcaster_.sendTransform(tf::StampedTransform(satellite_tf, now, fixed_frame_, satellite.id));
+        }
+    }
+};
+
+int main(int argc, char** argv) {
+    ros::init(argc, argv, "RangingRC");
+    
+    ROS_INFO("Starting GPS Satellite Signal Simulator with rigorous range measurements");
+    GPSSimulator simulator;
+    
+    ros::spin();
+    
+    return 0;
+}

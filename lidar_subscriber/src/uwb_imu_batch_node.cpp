@@ -3815,8 +3815,8 @@ private:
                     Eigen::Vector3d gravity_sensor = current_orientation.inverse() * gravity_world_;
                     
                     // Remove gravity from accelerometers (gravity is already in sensor frame)
-                    Eigen::Vector3d acc_without_gravity1 = acc_step1 - gravity_sensor;
-                    Eigen::Vector3d acc_without_gravity2 = acc_step2 - gravity_sensor;
+                    Eigen::Vector3d acc_without_gravity1 = acc_step1 + gravity_sensor;
+                    Eigen::Vector3d acc_without_gravity2 = acc_step2 + gravity_sensor;
                     
                     // Rotate accelerations to integration frame
                     Eigen::Vector3d acc_int_frame1 = delta_q_half * acc_without_gravity1;
@@ -4847,8 +4847,8 @@ private:
                 Eigen::Vector3d gravity_sensor2 = result.orientation.inverse() * gravity_world_;
                 
                 // Remove gravity from accelerometer reading (averaged over rotation change)
-                Eigen::Vector3d acc_without_gravity1 = acc_step1 - gravity_sensor1;
-                Eigen::Vector3d acc_without_gravity2 = acc_step2 - gravity_sensor2;
+                Eigen::Vector3d acc_without_gravity1 = acc_step1 + gravity_sensor1;
+                Eigen::Vector3d acc_without_gravity2 = acc_step2 + gravity_sensor2;
                 
                 // Rotate to world frame using RK4 approach for acceleration
                 Eigen::Vector3d acc_world1 = orientation_before * acc_without_gravity1;
@@ -4919,7 +4919,7 @@ private:
             Eigen::Vector3d gravity_sensor = 0.5 * (gravity_sensor1 + gravity_sensor2);
             
             // Remove gravity from accelerometer reading
-            Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
+            Eigen::Vector3d acc_without_gravity = acc_corrected + gravity_sensor;
             
             // Rotate to world frame using average orientation
             Eigen::Quaterniond orientation_mid = orientation_before.slerp(0.5, result.orientation);
@@ -5046,10 +5046,10 @@ private:
                 
                 // IMPROVED: For high-speed scenarios - remove vertical damping
                 // Only apply slight damping if we have a large spurious vertical velocity
-                double v_vel_abs = std::abs(current_state_.velocity.z());
-                if (v_vel_abs > 5.0) {  // Only dampen extreme vertical velocities
-                    current_state_.velocity.z() *= 0.95;  // Mild damping only on extreme values
-                }
+                // double v_vel_abs = std::abs(current_state_.velocity.z());
+                // if (v_vel_abs > 5.0) {  // Only dampen extreme vertical velocities
+                //     current_state_.velocity.z() *= 0.95;  // Mild damping only on extreme values
+                // }
                 
                 // Adaptive max velocity based on IMU data for real-time propagation
                 double adaptive_max_vel = max_velocity_;
