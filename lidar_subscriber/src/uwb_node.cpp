@@ -45,6 +45,8 @@ private:
     Eigen::Vector3d current_velocity_;
     std::mt19937 gen_;
     std::vector<Eigen::Vector3d> estimated_trajectory_;
+    ros::Time last_update_time_;
+    size_t max_trajectory_size_ = 1000; // Limit trajectory memory usage
 
     struct RangeResidual {
         RangeResidual(const Eigen::Vector3d& anchor, double measurement)
@@ -68,14 +70,35 @@ private:
         double scale = 10;
         // Load anchor positions
         XmlRpc::XmlRpcValue anchor_list;
-        nh_.getParam("anchors", anchor_list);
-        for (int i = 0; i < anchor_list.size(); ++i) {
-            Eigen::Vector3d anchor(
-                anchor_list[i]["x"] ,
-                anchor_list[i]["y"],
-                anchor_list[i]["z"]
-            );
-            anchors_.push_back(anchor*10);
+        if (!nh_.getParam("anchors", anchor_list)) {
+            ROS_WARN("No anchor positions defined in parameter server, using defaults");
+            // Default anchor positions forming a cube
+            anchors_.push_back(Eigen::Vector3d(0, 0, 0) * scale);
+            anchors_.push_back(Eigen::Vector3d(5, 0, 0) * scale);
+            anchors_.push_back(Eigen::Vector3d(0, 5, 0) * scale);
+            anchors_.push_back(Eigen::Vector3d(5, 5, 0) * scale);
+            anchors_.push_back(Eigen::Vector3d(0, 0, 5) * scale);
+            anchors_.push_back(Eigen::Vector3d(5, 0, 5) * scale);
+            anchors_.push_back(Eigen::Vector3d(0, 5, 5) * scale);
+            anchors_.push_back(Eigen::Vector3d(5, 5, 5) * scale);
+        } else {
+            for (int i = 0; i < anchor_list.size(); ++i) {
+                try {
+                    Eigen::Vector3d anchor(
+                        anchor_list[i]["x"],
+                        anchor_list[i]["y"],
+                        anchor_list[i]["z"]
+                    );
+                    anchors_.push_back(anchor * scale);
+                } catch (const XmlRpc::XmlRpcException& e) {
+                    ROS_ERROR("Error parsing anchor %d: %s", i, e.getMessage().c_str());
+                }
+            }
+        }
+        
+        // Check if we have enough anchors for 3D positioning
+        if (anchors_.size() < 4) {
+            ROS_WARN("At least 4 anchors are needed for reliable 3D positioning");
         }
 
         // Load other parameters
@@ -119,10 +142,11 @@ private:
     }
 
     void initializeTimer() {
+        last_update_time_ = ros::Time::now();
         timer_ = nh_.createTimer(ros::Duration(0.1), &UWBPositionEstimator::estimationLoop, this);
     }
 
-    void estimationLoop(const ros::TimerEvent&) {
+    void estimationLoop(const ros::TimerEvent& event) {
         updateGroundTruthPosition();
         std::vector<double> measurements = simulateMeasurements();
         Eigen::Vector3d estimated_position = solvePosition(measurements);
@@ -131,8 +155,14 @@ private:
     }
 
     void updateGroundTruthPosition() {
+        // Use actual time difference for more accurate simulation
+        ros::Time current_time = ros::Time::now();
+        double dt = (current_time - last_update_time_).toSec();
+        last_update_time_ = current_time;
+        
+        // Use accumulating time for simulation
         static double t = 0.0;
-        t += 0.1;
+        t += dt;
         
         if (motion_type_ == "circular") {
             current_gt_position_ = Eigen::Vector3d(
@@ -169,8 +199,32 @@ private:
     }
 
     Eigen::Vector3d solvePosition(const std::vector<double>& measurements) {
+        // Verify we have enough measurements
+        if (measurements.size() < 4) {
+            ROS_WARN("Too few measurements (%zu) for reliable 3D positioning", measurements.size());
+            // Return last position or default if no history
+            return estimated_trajectory_.empty() ? Eigen::Vector3d(0, 0, 0) : estimated_trajectory_.back();
+        }
+        
         ceres::Problem problem;
-        Eigen::Vector3d position = current_gt_position_ + Eigen::Vector3d::Random() * 0.5; // Perturbed initial guess
+        
+        // More realistic initial guess:
+        // If we have previous estimates, use the last one
+        // Otherwise use centroid of anchors as starting point
+        Eigen::Vector3d position;
+        if (!estimated_trajectory_.empty()) {
+            position = estimated_trajectory_.back();
+        } else {
+            // Calculate centroid of anchors as starting point
+            Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+            for (const auto& anchor : anchors_) {
+                centroid += anchor;
+            }
+            if (!anchors_.empty()) {
+                centroid /= anchors_.size();
+            }
+            position = centroid;
+        }
 
         for (size_t i = 0; i < anchors_.size(); ++i) {
             ceres::CostFunction* cost_function =
@@ -194,9 +248,21 @@ private:
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
 
-        ROS_DEBUG_COND(summary.termination_type != ceres::CONVERGENCE,
-                      "Optimization failed to converge: %s", 
-                      summary.FullReport().c_str());
+        // Better error handling
+        if (summary.termination_type != ceres::CONVERGENCE) {
+            ROS_WARN("Optimization failed to converge: %s", summary.BriefReport().c_str());
+            // For debug builds, log full report
+            ROS_DEBUG("%s", summary.FullReport().c_str());
+            
+            // If this is a serious failure, return the previous position instead
+            if (summary.termination_type == ceres::FAILURE || 
+                summary.final_cost > 10.0 * measurements.size()) {
+                if (!estimated_trajectory_.empty()) {
+                    ROS_WARN("Using previous position estimate due to optimization failure");
+                    return estimated_trajectory_.back();
+                }
+            }
+        }
 
         return position;
     }
@@ -227,6 +293,11 @@ private:
 
     void updateTrajectory(const Eigen::Vector3d& position) {
         estimated_trajectory_.push_back(position);
+        
+        // Limit trajectory size to prevent memory issues
+        if (estimated_trajectory_.size() > max_trajectory_size_) {
+            estimated_trajectory_.erase(estimated_trajectory_.begin());
+        }
         
         visualization_msgs::Marker trajectory;
         trajectory.header.frame_id = "world";
