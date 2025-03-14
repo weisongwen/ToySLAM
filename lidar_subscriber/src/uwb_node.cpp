@@ -6,6 +6,7 @@
 #include <random>
 #include <cmath>
 #include <vector>
+#include <xmlrpcpp/XmlRpcException.h>
 
 // roslaunch ToySLAM fusion.launch 
 

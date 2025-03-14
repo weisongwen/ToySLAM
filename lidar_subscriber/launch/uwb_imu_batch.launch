@@ -7,7 +7,7 @@
          doc="Use GPS orientation as initial guess for keyframes" />
     <arg name="use_gps_orientation_as_constraint" default="false" 
          doc="Use GPS orientation as a constraint in optimization" />
-    <arg name="use_gps_velocity" default="true" 
+    <arg name="use_gps_velocity" default="false" 
          doc="Use GPS velocity as measurement" />
 
     <!-- Topic names -->

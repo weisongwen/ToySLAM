@@ -147,7 +147,7 @@ private:
 // IMPROVED: Adaptive velocity magnitude constraint for high-speed scenarios
 class VelocityMagnitudeConstraint {
 public:
-    VelocityMagnitudeConstraint(double max_velocity = 25.0, double weight = 300.0)
+    VelocityMagnitudeConstraint(double max_velocity = 55.0, double weight = 300.0)
         : max_velocity_(max_velocity), weight_(weight) {}
     
     template <typename T>
@@ -1233,14 +1233,15 @@ public:
         Eigen::Quaternion<T> corrected_delta_q = delta_q * deltaQ(corrected_delta_q_vec);
         
         // Gravity vector in world frame
+        // Gravity vector in world frame (in ENU, gravity is [0, 0, -9.81])
         Eigen::Matrix<T, 3, 1> g = gravity_.cast<T>();
-        
+
         // Compute residuals
         Eigen::Map<Eigen::Matrix<T, 15, 1>> residual(residuals);
-        
-        // Position residual
+
+        // Position residual - in ENU frame, g is already negative in Z-direction
         residual.template segment<3>(0) = q_i.inverse() * ((p_j - p_i - v_i * sum_dt) - 
-                                                       T(0.5) * g * sum_dt * sum_dt) - corrected_delta_p;
+                                                    T(0.5) * g * sum_dt * sum_dt) - corrected_delta_p;
         
         // Orientation residual - IMPROVED with safer handling
         Eigen::Quaternion<T> q_i_inverse_times_q_j = q_i.conjugate() * q_j;
@@ -1376,8 +1377,8 @@ public:
         // CRITICAL: Realistic bias parameters
         private_nh.param<double>("imu_acc_bias_noise", imu_acc_bias_noise_, 0.0001);  // m/s²/sqrt(s)
         private_nh.param<double>("imu_gyro_bias_noise", imu_gyro_bias_noise_, 0.00001); // rad/s/sqrt(s)
-        private_nh.param<double>("acc_bias_max", acc_bias_max_, 0.1);   // Maximum allowed acc bias (m/s²)
-        private_nh.param<double>("gyro_bias_max", gyro_bias_max_, 0.01); // Maximum allowed gyro bias (rad/s)
+        private_nh.param<double>("acc_bias_max", acc_bias_max_, 1.1);   // Maximum allowed acc bias (m/s²) 0.1 
+        private_nh.param<double>("gyro_bias_max", gyro_bias_max_, 1.01); // Maximum allowed gyro bias (rad/s) 0.01
         
         // CRITICAL: Initial biases (small realistic values)
         private_nh.param<double>("initial_acc_bias_x", initial_acc_bias_x_, 0.05);
@@ -1405,7 +1406,7 @@ public:
         
         // NEW: Add feature configuration parameters
         private_nh.param<bool>("enable_roll_pitch_constraint", enable_roll_pitch_constraint_, true);
-        private_nh.param<bool>("enable_gravity_alignment_factor", enable_gravity_alignment_factor_, true);
+        private_nh.param<bool>("enable_gravity_alignment_factor", enable_gravity_alignment_factor_, true); 
         private_nh.param<bool>("enable_orientation_smoothness_factor", enable_orientation_smoothness_factor_, true);
         private_nh.param<bool>("enable_velocity_constraint", enable_velocity_constraint_, true);
         private_nh.param<bool>("enable_horizontal_velocity_incentive", enable_horizontal_velocity_incentive_, true);
@@ -2240,6 +2241,35 @@ private:
         return unix_time;
     }
 
+    // Add to the UwbImuFusion class private section:
+    void testGpsVelocityCalculation() {
+        if (gps_measurements_.empty()) {
+            ROS_WARN("No GPS data available for velocity test");
+            return;
+        }
+        
+        ROS_INFO("=== GPS VELOCITY TEST ===");
+        for (const auto& gps : gps_measurements_) {
+            double vel_norm = gps.velocity.norm();
+            ROS_INFO("GPS timestamp: %.3f, velocity: [%.2f, %.2f, %.2f] m/s, magnitude: %.2f m/s (%.1f km/h)",
+                    gps.timestamp, gps.velocity.x(), gps.velocity.y(), gps.velocity.z(),
+                    vel_norm, vel_norm * 3.6);
+        }
+        
+        // Calculate average velocity
+        if (gps_measurements_.size() >= 2) {
+            double total_vel = 0.0;
+            for (const auto& gps : gps_measurements_) {
+                total_vel += gps.velocity.norm();
+            }
+            double avg_vel = total_vel / gps_measurements_.size();
+            
+            ROS_INFO("Average GPS velocity: %.2f m/s (%.1f km/h) from %zu measurements",
+                    avg_vel, avg_vel * 3.6, gps_measurements_.size());
+        }
+        ROS_INFO("=========================");
+    }
+
     // GPS callback function
     void gpsCallback(const novatel_msgs::INSPVAX::ConstPtr& msg) {
         try {
@@ -2273,7 +2303,14 @@ private:
             Eigen::Vector3d enu_position = convertGpsToEnu(msg->latitude, msg->longitude, msg->altitude);
             
             // Get velocity (convert from NED to ENU)
+            // ENU: X=East, Y=North, Z=Up
             Eigen::Vector3d enu_velocity(msg->east_velocity, msg->north_velocity, -msg->up_velocity);
+
+            // Debug velocity conversion
+            ROS_DEBUG("GPS velocity converted: NED [%.2f, %.2f, %.2f] -> ENU [%.2f, %.2f, %.2f], magnitude: %.2f m/s (%.1f km/h)",
+                    msg->north_velocity, msg->east_velocity, msg->up_velocity,
+                    enu_velocity.x(), enu_velocity.y(), enu_velocity.z(),
+                    enu_velocity.norm(), enu_velocity.norm() * 3.6);
             
             // Get orientation with safety checks
             double roll_rad = msg->roll * M_PI / 180.0;
@@ -2390,6 +2427,11 @@ private:
                 } else {
                     ROS_WARN("Skipping GPS keyframe at %.3f - no surrounding IMU data", unix_timestamp);
                 }
+            }
+
+            // Call this function at the end of gpsCallback after adding a few measurements:
+            if (gps_measurements_.size() == 5) {
+                testGpsVelocityCalculation();
             }
         } catch (const std::exception& e) {
             ROS_ERROR("Exception in gpsCallback: %s", e.what());
@@ -2543,9 +2585,16 @@ private:
                 propagated_state.orientation = gps.orientation;
             }
             
-            // Set velocity only if configured to use GPS velocity
+            /// Set velocity only if configured to use GPS velocity
             if (use_gps_velocity_) {
+                // Convert from North-East-Down to East-North-Up if needed
                 propagated_state.velocity = gps.velocity;
+                
+                // Log velocity update
+                double vel_norm = propagated_state.velocity.norm();
+                ROS_INFO("Setting velocity from GPS: [%.2f, %.2f, %.2f] m/s, magnitude: %.2f m/s (%.1f km/h)",
+                        propagated_state.velocity.x(), propagated_state.velocity.y(), propagated_state.velocity.z(),
+                        vel_norm, vel_norm * 3.6);
             }
             
             propagated_state.timestamp = gps.timestamp;
@@ -2765,12 +2814,19 @@ private:
     }
     
     // IMPROVED: Better velocity clamping that preserves direction for high-speed scenarios
-    void clampVelocity(Eigen::Vector3d& velocity, double max_velocity = 25.0) {
+    void clampVelocity(Eigen::Vector3d velocity, double max_velocity = 55.0) {
         double velocity_norm = velocity.norm();
         
         if (velocity_norm > max_velocity) {
             // Scale velocity proportionally to keep direction but limit magnitude
             velocity *= (max_velocity / velocity_norm);
+            ROS_DEBUG("Velocity clamped from %.2f to %.2f m/s (%.1f km/h)", 
+                     velocity_norm, max_velocity, max_velocity * 3.6);
+        }
+        
+        // If horizontal velocity incentive is disabled, don't enforce minimum
+        if (!enable_horizontal_velocity_incentive_) {
+            return;
         }
         
         // Only enforce a minimum horizontal velocity if it's very small and we're not moving vertically
@@ -3817,6 +3873,11 @@ private:
                     // Remove gravity from accelerometers (gravity is already in sensor frame)
                     Eigen::Vector3d acc_without_gravity1 = acc_step1 + gravity_sensor;
                     Eigen::Vector3d acc_without_gravity2 = acc_step2 + gravity_sensor;
+
+                    // ROS_INFO("IMU pre-integration gravity compensation: acc1=[%.2f, %.2f, %.2f], gravity_sensor=[%.2f, %.2f, %.2f], acc_no_g1=[%.2f, %.2f, %.2f]",
+                    //     acc_step1.x(), acc_step1.y(), acc_step1.z(),
+                    //     gravity_sensor.x(), gravity_sensor.y(), gravity_sensor.z(),
+                    //     acc_without_gravity1.x(), acc_without_gravity1.y(), acc_without_gravity1.z());
                     
                     // Rotate accelerations to integration frame
                     Eigen::Vector3d acc_int_frame1 = delta_q_half * acc_without_gravity1;
@@ -4609,6 +4670,40 @@ private:
                 }
                 clampVelocity(current_state_.velocity, adaptive_max_velocity);
             }
+
+            // Log detailed velocity information
+            if (!state_window_.empty()) {
+                double vel_norm = current_state_.velocity.norm();
+                ROS_INFO("After optimization: velocity [%.2f, %.2f, %.2f] m/s, magnitude: %.2f m/s (%.1f km/h)",
+                        current_state_.velocity.x(), current_state_.velocity.y(), current_state_.velocity.z(),
+                        vel_norm, vel_norm * 3.6);
+                
+                // If we have GPS data, compare with GPS velocity
+                if (use_gps_instead_of_uwb_ && !gps_measurements_.empty()) {
+                    // Find closest GPS measurement to current time
+                    double min_time_diff = std::numeric_limits<double>::max();
+                    GpsMeasurement closest_gps;
+                    bool found_gps = false;
+                    
+                    for (const auto& gps : gps_measurements_) {
+                        double time_diff = std::abs(gps.timestamp - current_state_.timestamp);
+                        if (time_diff < min_time_diff) {
+                            min_time_diff = time_diff;
+                            closest_gps = gps;
+                            found_gps = true;
+                        }
+                    }
+                    
+                    if (found_gps && min_time_diff < 1.0) {  // Within 1 second
+                        double gps_vel_norm = closest_gps.velocity.norm();
+                        double vel_diff = (current_state_.velocity - closest_gps.velocity).norm();
+                        
+                        ROS_INFO("GPS velocity comparison: GPS [%.2f, %.2f, %.2f] m/s (%.1f km/h), diff: %.2f m/s (%.1f km/h)",
+                                closest_gps.velocity.x(), closest_gps.velocity.y(), closest_gps.velocity.z(),
+                                gps_vel_norm * 3.6, vel_diff, vel_diff * 3.6);
+                    }
+                }
+            }
             
             // Increment optimization count
             optimization_count_++;
@@ -5031,8 +5126,13 @@ private:
                 Eigen::Vector3d gravity_sensor2 = current_state_.orientation.inverse() * gravity_world_;
                 Eigen::Vector3d gravity_sensor = 0.5 * (gravity_sensor1 + gravity_sensor2);
                 
-                // Remove gravity from accelerometer reading
-                Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
+                // Remove gravity from accelerometer reading (accelerometer measures gravity + acceleration)
+                // In ENU frame with Z-up, gravity is [0, 0, -9.81], so we add the gravity_sensor vector
+                Eigen::Vector3d acc_without_gravity = acc_corrected + gravity_sensor;
+                ROS_DEBUG("IMU gravity compensation: raw=[%.2f, %.2f, %.2f], gravity_sensor=[%.2f, %.2f, %.2f], corrected=[%.2f, %.2f, %.2f]",
+                        acc_corrected.x(), acc_corrected.y(), acc_corrected.z(),
+                        gravity_sensor.x(), gravity_sensor.y(), gravity_sensor.z(),
+                        acc_without_gravity.x(), acc_without_gravity.y(), acc_without_gravity.z());
                 
                 // Rotate to world frame using midpoint rotation
                 Eigen::Quaterniond orientation_mid = orientation_before.slerp(0.5, current_state_.orientation);
