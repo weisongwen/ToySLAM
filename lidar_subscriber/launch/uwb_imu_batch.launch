@@ -5,7 +5,7 @@
     <!-- GPS data usage configuration -->
     <arg name="use_gps_orientation_as_initial" default="true" 
          doc="Use GPS orientation as initial guess for keyframes" />
-    <arg name="use_gps_orientation_as_constraint" default="false" 
+    <arg name="use_gps_orientation_as_constraint" default="true" 
          doc="Use GPS orientation as a constraint in optimization" />
     <arg name="use_gps_velocity" default="false" 
          doc="Use GPS velocity as measurement" />
@@ -44,7 +44,7 @@
     <arg name="enable_bias_estimation" default="true" />
     <arg name="enable_marginalization" default="true" />
     <arg name="enable_roll_pitch_constraint" default="true" />
-    <arg name="enable_gravity_alignment_factor" default="true" />
+    <arg name="enable_gravity_alignment_factor" default="false" />
     <arg name="enable_orientation_smoothness_factor" default="true" />
     <arg name="enable_velocity_constraint" default="false" />
     <arg name="enable_horizontal_velocity_incentive" default="false" />

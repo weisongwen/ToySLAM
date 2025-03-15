@@ -2800,7 +2800,7 @@ private:
     }
     
     // CRITICAL: Ensure biases stay within reasonable limits
-    void clampBiases(Eigen::Vector3d& acc_bias, Eigen::Vector3d& gyro_bias) {
+    void clampBiases(Eigen::Vector3d acc_bias, Eigen::Vector3d& gyro_bias) {
         double acc_bias_norm = acc_bias.norm();
         double gyro_bias_norm = gyro_bias.norm();
         
@@ -3718,6 +3718,8 @@ private:
                     
                     // Transform gravity to sensor frame
                     Eigen::Vector3d gravity_sensor = start_orientation.inverse() * gravity_world_;
+
+                    std::cout<<"gravity_sensor-> -------------" << gravity_sensor<<"\n";
                     
                     // Create synthetic measurements evenly spaced
                     for (int i = 0; i < num_synthetic; i++) {
@@ -5015,6 +5017,15 @@ private:
             
             // Remove gravity from accelerometer reading
             Eigen::Vector3d acc_without_gravity = acc_corrected + gravity_sensor;
+
+            // Add improved debug logging
+            static int debug_counter = 0;
+            if (debug_counter++ % 100 == 0) {  // Only log every 100th message
+                ROS_DEBUG("IMU gravity handling: raw=[%.2f, %.2f, %.2f], gravity=[%.2f, %.2f, %.2f], corrected=[%.2f, %.2f, %.2f]",
+                        acc_corrected.x(), acc_corrected.y(), acc_corrected.z(),
+                        gravity_sensor.x(), gravity_sensor.y(), gravity_sensor.z(),
+                        acc_without_gravity.x(), acc_without_gravity.y(), acc_without_gravity.z());
+            }
             
             // Rotate to world frame using average orientation
             Eigen::Quaterniond orientation_mid = orientation_before.slerp(0.5, result.orientation);
@@ -5128,7 +5139,7 @@ private:
                 
                 // Remove gravity from accelerometer reading (accelerometer measures gravity + acceleration)
                 // In ENU frame with Z-up, gravity is [0, 0, -9.81], so we add the gravity_sensor vector
-                Eigen::Vector3d acc_without_gravity = acc_corrected + gravity_sensor;
+                Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
                 ROS_DEBUG("IMU gravity compensation: raw=[%.2f, %.2f, %.2f], gravity_sensor=[%.2f, %.2f, %.2f], corrected=[%.2f, %.2f, %.2f]",
                         acc_corrected.x(), acc_corrected.y(), acc_corrected.z(),
                         gravity_sensor.x(), gravity_sensor.y(), gravity_sensor.z(),
