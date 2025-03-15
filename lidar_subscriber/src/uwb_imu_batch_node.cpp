@@ -4617,6 +4617,8 @@ private:
             ceres::Solver::Options options;
             options.max_num_iterations = max_iterations_;
             options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+            // options.linear_solver_type = ceres::SPARSE_SCHUR;
+
             options.minimizer_progress_to_stdout = false;
             options.num_threads = 4;
             
