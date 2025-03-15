@@ -1190,16 +1190,16 @@ public:
         // IMPROVED: Add nonlinear correction if bias change is too large
         // This is a simplified model for the case study - in production,
         // you would recompute the entire preintegration
-        if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) {
-            // Apply nonlinear scaling to limit extreme corrections
-            T dba_scale = ceres::fmin(T(bias_correction_threshold_) / dba_norm, T(1.0));
-            T dbg_scale = ceres::fmin(T(bias_correction_threshold_) / dbg_norm, T(1.0));
+        // if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) {
+        //     // Apply nonlinear scaling to limit extreme corrections
+        //     T dba_scale = ceres::fmin(T(bias_correction_threshold_) / dba_norm, T(1.0));
+        //     T dbg_scale = ceres::fmin(T(bias_correction_threshold_) / dbg_norm, T(1.0));
             
-            dba *= dba_scale;
-            dbg *= dbg_scale;
+        //     dba *= dba_scale;
+        //     dbg *= dbg_scale;
 
-            std::cout <<"if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) \n";
-        }
+        //     std::cout <<"if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) \n";
+        // }
         
         // Limit bias correction magnitude for numerical stability
         // const T max_bias_correction = T(0.1);

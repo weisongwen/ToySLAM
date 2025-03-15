@@ -1,80 +1,160 @@
 <launch>
-    <!-- Mode selection -->
-    <arg name="use_gps" default="true" />
+    <!-- ============================== SENSOR FUSION MODE ============================== -->
+    <!-- Determines whether to use GPS or UWB for position measurements -->
+    <!-- Set to true for GPS+IMU fusion, false for UWB+IMU fusion -->
+    <arg name="use_gps" default="true" 
+         doc="Use GPS for position/velocity (true) or UWB for position only (false)" />
     
-    <!-- GPS data usage configuration -->
+    <!-- ============================== GPS DATA USAGE CONFIGURATION ============================== -->
+    <!-- Controls how GPS orientation and velocity data are used in the fusion process -->
+    
+    <!-- When true, GPS orientation is used to initialize each new keyframe's orientation -->
+    <!-- This provides a good starting point for orientation before IMU integration takes over -->
     <arg name="use_gps_orientation_as_initial" default="true" 
-         doc="Use GPS orientation as initial guess for keyframes" />
+         doc="Use GPS orientation as initial value for each keyframe" />
+    
+    <!-- When true, GPS orientation is used as a constraint during optimization -->
+    <!-- Currently disabled as we prefer orientation to evolve from IMU integration -->
     <arg name="use_gps_orientation_as_constraint" default="false" 
-         doc="Use GPS orientation as a constraint in optimization" />
+         doc="Use GPS orientation as an optimization constraint (pulls estimated orientation toward GPS measurement)" />
+    
+    <!-- CRITICAL: When true, GPS velocity is used to initialize velocity at each keyframe -->
+    <!-- This is essential for stable velocity estimation -->
     <arg name="use_gps_velocity" default="true" 
-         doc="Use GPS velocity as measurement (if the enable_velocity_constraint is disabled, the gps velocity only work as initial guess)" />
+         doc="Use GPS velocity to initialize each keyframe. If enable_velocity_constraint is false, GPS velocity is only used for initialization, not as a constraint." />
 
-    <!-- Topic names -->
-    <arg name="imu_topic" default="/imu/data" />
-    <arg name="gps_topic" default="/novatel_data/inspvax" />
-    <arg name="uwb_topic" default="/sensor_simulator/UWBPoistionPS" />
+    <!-- ============================== TOPIC NAMES ============================== -->
+    <!-- ROS topics where sensor data is published -->
+    <arg name="imu_topic" default="/imu/data" 
+         doc="Topic for IMU measurements (orientation, angular velocity, linear acceleration)" />
+    <arg name="gps_topic" default="/novatel_data/inspvax" 
+         doc="Topic for GPS/INS measurements (position, velocity, orientation)" />
+    <arg name="uwb_topic" default="/sensor_simulator/UWBPoistionPS" 
+         doc="Topic for UWB position measurements (position only)" />
     
-    <!-- Frame IDs -->
-    <arg name="world_frame_id" default="map" />
-    <arg name="body_frame_id" default="base_link" />
+    <!-- ============================== COORDINATE FRAMES ============================== -->
+    <!-- Reference frames for the fusion system -->
+    <arg name="world_frame_id" default="map" 
+         doc="World reference frame for position estimation" />
+    <arg name="body_frame_id" default="base_link" 
+         doc="Body frame of the vehicle" />
     
-    <!-- Noise parameters -->
-    <arg name="imu_acc_noise" default="0.03" />    <!-- m/s² -->
-    <arg name="imu_gyro_noise" default="0.002" />  <!-- rad/s -->
-    <arg name="gps_position_noise" default="0.5" /> <!-- m -->
-    <arg name="gps_velocity_noise" default="0.1" /> <!-- m/s -->
-    <arg name="gps_orientation_noise" default="0.1" /> <!-- rad -->
-    <arg name="uwb_position_noise" default="0.1" /> <!-- m -->
+    <!-- ============================== SENSOR NOISE PARAMETERS ============================== -->
+    <!-- These values model the uncertainty in sensor measurements -->
     
-    <!-- Initial bias values -->
-    <arg name="initial_acc_bias_x" default="0.05" />
-    <arg name="initial_acc_bias_y" default="-0.05" />
-    <arg name="initial_acc_bias_z" default="0.05" />
-    <arg name="initial_gyro_bias_x" default="0.001" />
-    <arg name="initial_gyro_bias_y" default="-0.001" />
-    <arg name="initial_gyro_bias_z" default="0.001" />
+    <!-- IMU noise parameters - affect integration accuracy and bias estimation -->
+    <arg name="imu_acc_noise" default="0.03" 
+         doc="Accelerometer white noise (m/s²). Higher values trust accelerometer less." />
+    <arg name="imu_gyro_noise" default="0.002" 
+         doc="Gyroscope white noise (rad/s). Higher values trust gyroscope less." />
     
-    <!-- Optimization parameters -->
-    <arg name="optimization_window_size" default="20" />
-    <arg name="optimization_frequency" default="10.0" />
-    <arg name="max_iterations" default="10" />
+    <!-- GPS noise parameters - affect how tightly estimates adhere to GPS -->
+    <arg name="gps_position_noise" default="0.5" 
+         doc="GPS position measurement noise (m). Higher values allow more IMU influence." />
+    <arg name="gps_velocity_noise" default="0.1" 
+         doc="GPS velocity measurement noise (m/s). Higher values allow more IMU influence." />
+    <arg name="gps_orientation_noise" default="0.1" 
+         doc="GPS orientation measurement noise (rad). Higher values trust GPS orientation less." />
     
-    <!-- Enable/disable features -->
-    <arg name="enable_bias_estimation" default="true" />
-    <arg name="enable_marginalization" default="true" />
-    <arg name="enable_roll_pitch_constraint" default="true" />
-    <arg name="enable_gravity_alignment_factor" default="false" />
-    <arg name="enable_orientation_smoothness_factor" default="true" />
-    <arg name="enable_velocity_constraint" default="false" />
-    <arg name="enable_horizontal_velocity_incentive" default="false" />
-    <arg name="enable_imu_orientation_factor" default="false" />
+    <!-- UWB noise parameters -->
+    <arg name="uwb_position_noise" default="0.1" 
+         doc="UWB position measurement noise (m). Only used in UWB mode." />
+    
+    <!-- ============================== INITIAL BIAS VALUES ============================== -->
+    <!-- Initial values for IMU biases - helps convergence and provides better initial integration -->
+    <arg name="initial_acc_bias_x" default="0.05" 
+         doc="Initial accelerometer bias X component (m/s²)" />
+    <arg name="initial_acc_bias_y" default="-0.05" 
+         doc="Initial accelerometer bias Y component (m/s²)" />
+    <arg name="initial_acc_bias_z" default="0.05" 
+         doc="Initial accelerometer bias Z component (m/s²)" />
+    <arg name="initial_gyro_bias_x" default="0.001" 
+         doc="Initial gyroscope bias X component (rad/s)" />
+    <arg name="initial_gyro_bias_y" default="-0.001" 
+         doc="Initial gyroscope bias Y component (rad/s)" />
+    <arg name="initial_gyro_bias_z" default="0.001" 
+         doc="Initial gyroscope bias Z component (rad/s)" />
+    
+    <!-- ============================== OPTIMIZATION PARAMETERS ============================== -->
+    <!-- Controls how optimization is performed -->
+    <arg name="optimization_window_size" default="20" 
+         doc="Number of keyframes to maintain in sliding window optimization. Larger windows provide better accuracy but slower performance." />
+    <arg name="optimization_frequency" default="10.0" 
+         doc="How often to run the optimizer (Hz). Higher values give more frequent updates but increase CPU usage." />
+    <arg name="max_iterations" default="10" 
+         doc="Maximum iterations for Ceres solver. Higher values may improve accuracy but increase computation time." />
+    
+    <!-- ============================== FEATURE CONFIGURATION ============================== -->
+    <!-- Enable/disable various estimation features -->
+    
+    <!-- CORE FEATURES -->
+    <arg name="enable_bias_estimation" default="true" 
+         doc="Estimate and correct for IMU biases. Almost always should be enabled." />
+    <arg name="enable_marginalization" default="true" 
+         doc="Use marginalization to maintain information from older keyframes. Improves stability." />
+    
+    <!-- ORIENTATION FEATURES -->
+    <arg name="enable_roll_pitch_constraint" default="true" 
+         doc="Constrain roll and pitch to be near zero (assumes ground vehicle on flat terrain)." />
+    <arg name="enable_gravity_alignment_factor" default="false" 
+         doc="Use accelerometer to align with gravity. Usually disabled for vehicles with significant acceleration." />
+    <arg name="enable_orientation_smoothness_factor" default="true" 
+         doc="Enforce smooth changes in orientation between keyframes." />
+    <arg name="enable_imu_orientation_factor" default="false" 
+         doc="Use IMU's orientation measurement as a constraint (typically disabled as we prefer integration)." />
+    
+    <!-- VELOCITY FEATURES -->
+    <arg name="enable_velocity_constraint" default="false" 
+         doc="Apply GPS velocity as constraint during optimization. When false, GPS velocity only affects initialization." />
+    <arg name="enable_horizontal_velocity_incentive" default="false" 
+         doc="Encourage vehicle to maintain minimum horizontal velocity. Set to false if low/zero speeds are expected." />
 
-    <!-- Velocity constraints -->
-    <arg name="max_velocity" default="55.0" /> <!-- m/s = 90 km/h -->
-    <arg name="min_horizontal_velocity" default="0.0" /> <!-- m/s -->
+    <!-- ============================== VELOCITY CONSTRAINTS ============================== -->
+    <!-- Limits on velocity estimation -->
+    <arg name="max_velocity" default="55.0" 
+         doc="Maximum allowed velocity (m/s = 198 km/h). Acts as upper limit for estimates." />
+    <arg name="min_horizontal_velocity" default="0.0" 
+         doc="Minimum horizontal velocity to maintain (m/s). Set to 0 if vehicle can stop." />
     
-    <!-- Integration parameters -->
-    <arg name="max_integration_dt" default="0.005" />
-    <arg name="bias_correction_threshold" default="10000000.05" />
+    <!-- ============================== INTEGRATION PARAMETERS ============================== -->
+    <!-- Controls IMU integration behavior -->
+    <arg name="max_integration_dt" default="0.005" 
+         doc="Maximum time step for IMU integration (s). Smaller steps improve accuracy but increase computation." />
     
-    <!-- Factor weights -->
-    <arg name="roll_pitch_weight" default="300.0" />
-    <arg name="imu_orientation_weight" default="50.0" />
-    <arg name="bias_constraint_weight" default="1000.0" />
-    <arg name="velocity_constraint_weight" default="150.0" />
-    <arg name="horizontal_velocity_weight" default="10.0" />
-    <arg name="orientation_smoothness_weight" default="100.0" />
-    <arg name="gravity_alignment_weight" default="150.0" />
+    <!-- CRITICAL: Allows unlimited bias correction to stabilize velocity estimates 0.05-->
+    <arg name="bias_correction_threshold" default="0.05" 
+         doc="Threshold for bias correction in IMU preintegration. Very high value effectively removes limits on bias correction." />
     
-    <!-- Add visualization parameter -->
-    <arg name="rviz" default="true" />
+    <!-- ============================== FACTOR WEIGHTS ============================== -->
+    <!-- Weights for different constraints in the optimization -->
+    <arg name="roll_pitch_weight" default="300.0" 
+         doc="Weight for roll/pitch constraints. Higher values enforce more level orientation." />
+    <arg name="imu_orientation_weight" default="50.0" 
+         doc="Weight for IMU orientation factor. Only used if enable_imu_orientation_factor is true." />
+    <arg name="bias_constraint_weight" default="1000.0" 
+         doc="Weight for bias magnitude constraints. Higher values limit biases to smaller values." />
+    <arg name="velocity_constraint_weight" default="150.0" 
+         doc="Weight for velocity magnitude constraint. Only used if enable_velocity_constraint is true." />
+    <arg name="horizontal_velocity_weight" default="10.0" 
+         doc="Weight for horizontal velocity incentive. Only used if enable_horizontal_velocity_incentive is true." />
+    <arg name="orientation_smoothness_weight" default="100.0" 
+         doc="Weight for orientation smoothness. Higher values enforce smoother orientation changes." />
+    <arg name="gravity_alignment_weight" default="150.0" 
+         doc="Weight for gravity alignment. Only used if enable_gravity_alignment_factor is true." />
+    
+    <!-- ============================== VISUALIZATION ============================== -->
+    <!-- Controls visualization tools -->
+    <arg name="rviz" default="true" 
+         doc="Launch RViz for visualization" />
 
-    <!-- Launch RViz with a configuration for trajectory visualization -->
+    <!-- ============================== NODE CONFIGURATION ============================== -->
+    <!-- Launch RViz for visualization -->
     <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(find ToySLAM)/rviz/gps_trajectory.rviz" />
 
-    <!-- UWB/GPS-IMU Fusion Node with correct package and node name -->
+    <!-- GPS/IMU Fusion Node -->
     <node name="uwb_imu_batch_node" pkg="ToySLAM" type="uwb_imu_batch_node" output="screen">
+        <!-- Pass all parameters to the node -->
+        
         <!-- Topic configuration -->
         <param name="imu_topic" value="$(arg imu_topic)" />
         <param name="gps_topic" value="$(arg gps_topic)" />
