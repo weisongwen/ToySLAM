@@ -486,7 +486,7 @@ public:
         // Compute position residuals - weighted by noise standard deviation
         residuals[0] = (position[0] - T(measured_position_[0])) / T(noise_std_);
         residuals[1] = (position[1] - T(measured_position_[1])) / T(noise_std_);
-        residuals[2] = (position[2] - T(measured_position_[2])) / T(noise_std_);
+        residuals[2] = (position[2] - T(measured_position_[2])) / T(noise_std_ * 0.0001);
         
         return true;
     }
@@ -1200,7 +1200,8 @@ public:
         }
         
         // Limit bias correction magnitude for numerical stability
-        const T max_bias_correction = T(0.1);
+        // const T max_bias_correction = T(0.1);
+        const T max_bias_correction = T(1.0);
         for (int i = 0; i < 3; ++i) {
             dba(i) = ceres::fmin(ceres::fmax(dba(i), -max_bias_correction), max_bias_correction);
             dbg(i) = ceres::fmin(ceres::fmax(dbg(i), -max_bias_correction), max_bias_correction);
@@ -1224,7 +1225,8 @@ public:
         Eigen::Matrix<T, 3, 1> corrected_delta_q_vec = delta_bias_correction.template segment<3>(6);
         
         // Limit orientation correction magnitude
-        const T max_angle_correction = T(0.1);  // radians
+        // const T max_angle_correction = T(0.1);  // radians
+        const T max_angle_correction = T(1.0);  // radians
         T correction_norm = corrected_delta_q_vec.norm();
         if (correction_norm > max_angle_correction) {
             corrected_delta_q_vec *= (max_angle_correction / correction_norm);
@@ -1279,8 +1281,12 @@ public:
         residual.template segment<3>(6) = q_i.inverse() * (v_j - v_i - g * sum_dt) - corrected_delta_v;
         
         // CRITICAL: Bias change residuals - adjusted for high-speed scenario
-        residual.template segment<3>(9) = (ba_j - ba_i) / T(0.002);   // Accelerometer bias change
-        residual.template segment<3>(12) = (bg_j - bg_i) / T(0.0002); // Gyroscope bias change
+        // residual.template segment<3>(9) = (ba_j - ba_i) / T(0.002);   // Accelerometer bias change
+        // residual.template segment<3>(12) = (bg_j - bg_i) / T(0.0002); // Gyroscope bias change
+
+        // CRITICAL: Bias change residuals - adjusted for high-speed scenario
+        residual.template segment<3>(9) = (ba_j - ba_i) / T(1.0);   // Accelerometer bias change
+        residual.template segment<3>(12) = (bg_j - bg_i) / T(1.0); // Gyroscope bias change
         
         // Weight residuals by the information matrix
         Eigen::Matrix<T, 9, 9> sqrt_information = preint_.covariance.cast<T>().inverse().llt().matrixL().transpose();
@@ -4416,14 +4422,14 @@ private:
                             ceres::CostFunction* gps_pos_factor = GpsPositionFactor::Create(
                                 gps.position, gps_position_noise_);
                             
-                            problem.AddResidualBlock(gps_pos_factor, new ceres::HuberLoss(0.1), variables[i].pose);
+                            problem.AddResidualBlock(gps_pos_factor, NULL, variables[i].pose);
                             
                             // Add velocity factor if configured to use GPS velocity
                             if (use_gps_velocity_ && enable_velocity_constraint_) {
                                 ceres::CostFunction* gps_vel_factor = GpsVelocityFactor::Create(
                                     gps.velocity, gps_velocity_noise_);
                                 
-                                problem.AddResidualBlock(gps_vel_factor, new ceres::HuberLoss(0.1), variables[i].velocity);
+                                problem.AddResidualBlock(gps_vel_factor, NULL, variables[i].velocity);
                             }
                             
                             // Add orientation factor if configured to use GPS orientation as constraint
@@ -4431,7 +4437,7 @@ private:
                                 ceres::CostFunction* orientation_factor = GpsOrientationFactor::Create(
                                     gps.orientation, gps_orientation_noise_);
                                 
-                                problem.AddResidualBlock(orientation_factor, new ceres::HuberLoss(0.2), variables[i].pose);
+                                problem.AddResidualBlock(orientation_factor, NULL, variables[i].pose);
                             }
                             
                             break;
@@ -5139,7 +5145,7 @@ private:
                 
                 // Remove gravity from accelerometer reading (accelerometer measures gravity + acceleration)
                 // In ENU frame with Z-up, gravity is [0, 0, -9.81], so we add the gravity_sensor vector
-                Eigen::Vector3d acc_without_gravity = acc_corrected - gravity_sensor;
+                Eigen::Vector3d acc_without_gravity = acc_corrected + gravity_sensor;
                 ROS_DEBUG("IMU gravity compensation: raw=[%.2f, %.2f, %.2f], gravity_sensor=[%.2f, %.2f, %.2f], corrected=[%.2f, %.2f, %.2f]",
                         acc_corrected.x(), acc_corrected.y(), acc_corrected.z(),
                         gravity_sensor.x(), gravity_sensor.y(), gravity_sensor.z(),
