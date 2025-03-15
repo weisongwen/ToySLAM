@@ -1197,6 +1197,8 @@ public:
             
             dba *= dba_scale;
             dbg *= dbg_scale;
+
+            std::cout <<"if (dba_norm > T(bias_correction_threshold_) || dbg_norm > T(bias_correction_threshold_)) \n";
         }
         
         // Limit bias correction magnitude for numerical stability
@@ -1279,6 +1281,8 @@ public:
         
         // Velocity residual
         residual.template segment<3>(6) = q_i.inverse() * (v_j - v_i - g * sum_dt) - corrected_delta_v;
+
+        // std::cout<<"velocity residuals->  "<<residual.template segment<3>(6)<<"\n";
         
         // CRITICAL: Bias change residuals - adjusted for high-speed scenario
         // residual.template segment<3>(9) = (ba_j - ba_i) / T(0.002);   // Accelerometer bias change
@@ -4430,6 +4434,7 @@ private:
                                     gps.velocity, gps_velocity_noise_);
                                 
                                 problem.AddResidualBlock(gps_vel_factor, NULL, variables[i].velocity);
+                                std::cout<<"Add velocity factor if configured to use GPS velocity---------------------------\n";
                             }
                             
                             // Add orientation factor if configured to use GPS orientation as constraint
@@ -4588,7 +4593,7 @@ private:
                         preint, gravity_world_, bias_correction_threshold_);
                     
                     // IMPROVED: Use HuberLoss for IMU factor
-                    problem.AddResidualBlock(imu_factor, new ceres::HuberLoss(1.0),
+                    problem.AddResidualBlock(imu_factor, NULL,
                                            variables[i].pose, variables[i].velocity, variables[i].bias,
                                            variables[i+1].pose, variables[i+1].velocity, variables[i+1].bias);
                 }

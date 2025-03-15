@@ -284,6 +284,8 @@
         // Velocity residual (simplified)
         residual.template segment<3>(3) = v_j - (v_i + g * delta_t + 
             q_i * beta_corrected);
+        std::cout<<"Velocity residual (simplified)-----------------------------------> "<<residual.template segment<3>(3)<<std::endl;
+        
 
         // Rotation residual (corrected)
         Eigen::Quaternion<T> q_error = (q_i * gamma_corrected).conjugate() * q_j;
@@ -291,7 +293,7 @@
 
         // Scale residuals
         const T pos_scale = T(1.0);
-        const T vel_scale = T(0.1);
+        const T vel_scale = T(1.0);
         const T rot_scale = T(1.0);
         
         residual.template segment<3>(0) *= pos_scale;

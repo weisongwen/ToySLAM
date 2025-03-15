@@ -5,10 +5,10 @@
     <!-- GPS data usage configuration -->
     <arg name="use_gps_orientation_as_initial" default="true" 
          doc="Use GPS orientation as initial guess for keyframes" />
-    <arg name="use_gps_orientation_as_constraint" default="true" 
+    <arg name="use_gps_orientation_as_constraint" default="false" 
          doc="Use GPS orientation as a constraint in optimization" />
     <arg name="use_gps_velocity" default="true" 
-         doc="Use GPS velocity as measurement" />
+         doc="Use GPS velocity as measurement (if the enable_velocity_constraint is disabled, the gps velocity only work as initial guess)" />
 
     <!-- Topic names -->
     <arg name="imu_topic" default="/imu/data" />
@@ -56,7 +56,7 @@
     
     <!-- Integration parameters -->
     <arg name="max_integration_dt" default="0.005" />
-    <arg name="bias_correction_threshold" default="0.05" />
+    <arg name="bias_correction_threshold" default="10000000.05" />
     
     <!-- Factor weights -->
     <arg name="roll_pitch_weight" default="300.0" />
