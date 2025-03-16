@@ -2311,6 +2311,29 @@ private:
             
             // Convert GPS to ENU with safety checks
             Eigen::Vector3d enu_position = convertGpsToEnu(msg->latitude, msg->longitude, msg->altitude);
+
+            // TESTING: Add artificial noise to GPS position if in test mode
+            if (false) {
+                double gps_noise_magnitude_ = 2.0;
+                // Only add noise to every nth message to create visible outliers
+                static int msg_counter = 0;
+                if (++msg_counter % 20 == 0) {  // Every 5th message gets noise
+                    // Generate random noise
+                    double noise_x = ((double)rand() / RAND_MAX * 2.0 - 1.0) * gps_noise_magnitude_;
+                    double noise_y = ((double)rand() / RAND_MAX * 2.0 - 1.0) * gps_noise_magnitude_;
+                    double noise_z = ((double)rand() / RAND_MAX * 2.0 - 1.0) * gps_noise_magnitude_ * 0.5;
+                    
+                    // Add the noise
+                    Eigen::Vector3d original_position = enu_position;
+                    enu_position.x() += noise_x;
+                    enu_position.y() += noise_y;
+                    enu_position.z() += noise_z;
+                    
+                    // Log the injected noise
+                    ROS_INFO("Injected GPS noise: [%.2f, %.2f, %.2f] meters at t=%.3f", 
+                            noise_x, noise_y, noise_z, unix_timestamp);
+                }
+            }
             
             // Get velocity (convert from NED to ENU)
             // ENU: X=East, Y=North, Z=Up

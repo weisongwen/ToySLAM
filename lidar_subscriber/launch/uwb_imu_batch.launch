@@ -77,7 +77,7 @@
     
     <!-- ============================== OPTIMIZATION PARAMETERS ============================== -->
     <!-- Controls how optimization is performed -->
-    <arg name="optimization_window_size" default="20" 
+    <arg name="optimization_window_size" default="10" 
          doc="Number of keyframes to maintain in sliding window optimization. Larger windows provide better accuracy but slower performance." />
     <arg name="optimization_frequency" default="10.0" 
          doc="How often to run the optimizer (Hz). Higher values give more frequent updates but increase CPU usage." />
