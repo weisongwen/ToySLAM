@@ -64,6 +64,9 @@
   <build_export_depend>roscpp</build_export_depend>
   <build_export_depend>sensor_msgs</build_export_depend>
   <build_export_depend>nav_msgs</build_export_depend>
+  <build_export_depend>gnss_comm</build_export_depend>
+
+
 
   
   <exec_depend>pcl_conversions</exec_depend>
@@ -76,6 +79,7 @@
   <exec_depend>ndt_omp</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>gnss_comm</exec_depend>
 
   
 

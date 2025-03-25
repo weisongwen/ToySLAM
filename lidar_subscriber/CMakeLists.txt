@@ -31,6 +31,8 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   sensor_msgs
   novatel_msgs
+
+  gnss_comm
 )
 
 find_package(absl REQUIRED)
@@ -182,4 +184,13 @@ target_link_libraries(loam_mapping_node
   ${CERES_LIBRARIES}
   # pclomp
   OpenMP::OpenMP_CXX
+)
+
+add_executable(gnssSpp src/gnssSpp.cpp)
+target_link_libraries(gnssSpp ${catkin_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+  # pclomp
+  OpenMP::OpenMP_CXX
+  absl::strings
 )
