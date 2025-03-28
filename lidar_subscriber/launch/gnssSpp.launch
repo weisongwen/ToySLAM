@@ -1,0 +1,107 @@
+<launch>
+    <!-- ============================== GNSS SPP MODE ============================== -->
+    <!-- Configuration for GNSS Single Point Positioning node -->
+    <arg name="use_initialization_mode" default="true" 
+         doc="Use more permissive settings during initialization to get first fix" />
+         
+    <!-- ============================== FRAME CONFIGURATION ============================== -->
+    <arg name="frame_id" default="gnss" 
+         doc="Frame ID for GNSS measurements" />
+    
+    <!-- ============================== INITIAL POSITION ============================== -->
+    <!-- Initial position estimate (if known) -->
+    <arg name="initial_latitude" default="22.3193" 
+         doc="Initial latitude (deg) - Hong Kong" />
+    <arg name="initial_longitude" default="114.1694" 
+         doc="Initial longitude (deg) - Hong Kong" />
+    <arg name="initial_altitude" default="100.0" 
+         doc="Initial altitude (m)" />
+    
+    <!-- ============================== MEASUREMENT SETTINGS ============================== -->
+    <!-- Filtering settings for GNSS measurements -->
+    <arg name="min_cn0" default="5.0" 
+         doc="Minimum carrier-to-noise ratio (dB-Hz) - signals below this strength are ignored" />
+    <arg name="min_satellites" default="4" 
+         doc="Minimum number of satellites required for position solution" />
+    <arg name="cut_off_degree" default="0.0"
+         doc="Elevation cutoff angle (degrees) for position calculation" />
+    
+    <!-- ============================== FILTER CONTROLS ============================== -->
+    <!-- Debug options to bypass filters -->
+    <arg name="disable_cn0_filter" default="false" 
+         doc="Disable CN0 filtering (for debugging)" />
+    <arg name="disable_elevation_filter" default="true" 
+         doc="Disable elevation mask filtering (for debugging)" />
+    <arg name="force_use_ephemeris" default="true"
+         doc="Force using ephemeris regardless of age" />
+    <arg name="use_abs_elevation_during_init" default="true"
+         doc="Use absolute value of elevation during initialization" />
+    
+    <!-- ============================== SOLUTION SETTINGS ============================== -->
+    <arg name="use_doppler" default="true" 
+         doc="Use Doppler measurements for velocity estimation" />
+    <arg name="apply_iono_correction" default="true" 
+         doc="Apply ionospheric correction using Klobuchar model" />
+    
+    <!-- ============================== DEBUG SETTINGS ============================== -->
+    <arg name="output_debug_info" default="true" 
+         doc="Output detailed debugging information" />
+    <arg name="debug_output_path" default="" 
+         doc="Path to write debug output file (if enabled)" />
+    
+    <!-- ============================== TOPIC CONFIGURATION ============================== -->
+    <!-- Topics for GNSS data -->
+    <arg name="ephem_topic" default="/ublox_driver/ephem" 
+         doc="Topic for GPS ephemeris data" />
+    <arg name="glo_ephem_topic" default="/ublox_driver/glo_ephem" 
+         doc="Topic for GLONASS ephemeris data" />
+    <arg name="iono_params_topic" default="/ublox_driver/iono_params" 
+         doc="Topic for ionospheric parameters" />
+    <arg name="range_meas_topic" default="/ublox_driver/range_meas" 
+         doc="Topic for GNSS range measurements" />
+    
+    <!-- ============================== VISUALIZATION ============================== -->
+    <arg name="rviz" default="true" 
+         doc="Launch RViz for visualization" />
+         
+    <!-- Launch RViz for visualization -->
+    <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(find ToySLAM)/rviz/gnssSpp.rviz" />
+    
+    <!-- ============================== GNSS SPP NODE ============================== -->
+    <node name="gnssSpp" pkg="ToySLAM" type="gnssSpp" output="screen" >
+        <!-- Frame configuration -->
+        <param name="frame_id" value="$(arg frame_id)" />
+        
+        <!-- Initial position -->
+        <param name="initial_latitude" value="$(arg initial_latitude)" />
+        <param name="initial_longitude" value="$(arg initial_longitude)" />
+        <param name="initial_altitude" value="$(arg initial_altitude)" />
+        
+        <!-- Measurement settings -->
+        <param name="min_cn0" value="$(arg min_cn0)" />
+        <param name="min_satellites" value="$(arg min_satellites)" />
+        <param name="cut_off_degree" value="$(arg cut_off_degree)" />
+        
+        <!-- Filter controls -->
+        <!-- Filter controls -->
+        <param name="disable_cn0_filter" value="$(arg disable_cn0_filter)" />
+        <param name="disable_elevation_filter" value="$(arg disable_elevation_filter)" />
+        <param name="use_initialization_mode" value="$(arg use_initialization_mode)" />
+        <param name="force_use_ephemeris" value="$(arg force_use_ephemeris)" />
+        <param name="use_abs_elevation_during_init" value="$(arg use_abs_elevation_during_init)" />
+        
+        <!-- Solution settings -->
+        <param name="use_doppler" value="$(arg use_doppler)" />
+        <param name="apply_iono_correction" value="$(arg apply_iono_correction)" />
+        
+        <!-- Debug settings -->
+        <param name="output_debug_info" value="$(arg output_debug_info)" />
+        <param name="debug_output_path" value="$(arg debug_output_path)" />
+        
+        <!-- Remap topics -->
+        <remap from="/ublox_driver/ephem" to="$(arg ephem_topic)" />
+        <remap from="/ublox_driver/glo_ephem" to="$(arg glo_ephem_topic)" />
+        <remap from="/ublox_driver/iono_params" to="$(arg iono_params_topic)" />
+        <remap from="/ublox_driver/range_meas" to="$(arg range_meas_topic)" />
+    </node>
+</launch>
