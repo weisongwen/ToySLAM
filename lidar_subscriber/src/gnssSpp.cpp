@@ -434,220 +434,6 @@
      const SatelliteInfo sat_info_;
  };
  
- // RTKLIB-style Doppler residual for velocity estimation - GPS only
-struct GpsDopplerResidual {
-    GpsDopplerResidual(const SatelliteInfo& sat_info)
-        : sat_info_(sat_info) {}
-    
-    template <typename T>
-    bool operator()(const T* const velocity_state, T* residual) const {
-        // Extract receiver velocity and clock drift
-        T vx = velocity_state[0];
-        T vy = velocity_state[1];
-        T vz = velocity_state[2];
-        T clock_drift = velocity_state[3];  // clock drift in m/s
-        
-        // Satellite position, velocity, and LOS (line-of-sight unit vector)
-        T sat_pos[3] = {T(sat_info_.sat_pos_x), T(sat_info_.sat_pos_y), T(sat_info_.sat_pos_z)};
-        T sat_vel[3] = {T(sat_info_.sat_vel_x), T(sat_info_.sat_vel_y), T(sat_info_.sat_vel_z)};
-        T rcv_pos[3] = {T(sat_info_.rx_pos_x), T(sat_info_.rx_pos_y), T(sat_info_.rx_pos_z)};
-        
-        // Compute geometric range
-        T e[3]; // Line-of-sight vector from receiver to satellite
-        e[0] = sat_pos[0] - rcv_pos[0];
-        e[1] = sat_pos[1] - rcv_pos[1];
-        e[2] = sat_pos[2] - rcv_pos[2];
-        
-        // Compute range (distance)
-        T r = ceres::sqrt(e[0]*e[0] + e[1]*e[1] + e[2]*e[2]);
-        
-        // Normalize LOS vector
-        if (r > T(0.0)) {
-            e[0] /= r;
-            e[1] /= r;
-            e[2] /= r;
-        } else {
-            // Protect against division by zero
-            residual[0] = T(0.0);
-            return true;
-        }
-        
-        // Compute relative velocity along line-of-sight using RTKLIB formula
-        // But don't use boolean operations that are incompatible with Ceres Jets
-        T rate = T(0.0);
-        
-        // Manually account for velocity vector
-        // Instead of vx * (i==0), just handle each component directly
-        rate += (sat_vel[0] - vx) * e[0]; // X component
-        rate += (sat_vel[1] - vy) * e[1]; // Y component
-        rate += (sat_vel[2] - vz) * e[2]; // Z component
-        
-        // Sagnac effect correction
-        T wx = T(EARTH_ROTATION_RATE) * rcv_pos[1]; // Earth rotation effect
-        T wy = -T(EARTH_ROTATION_RATE) * rcv_pos[0];
-        
-        rate += wx * e[1] - wy * e[0];
-        
-        // Convert range rate to Doppler frequency (Hz)
-        // In RTKLIB, range_rate = -rate
-        // Doppler = -range_rate * f / c = rate * f / c
-        T freq = T(GPS_L1_FREQ); // Use L1 frequency
-        T expected_doppler = rate * freq / T(SPEED_OF_LIGHT);
-        
-        // Add clock drift effect (scaled to frequency)
-        expected_doppler += clock_drift * freq / T(SPEED_OF_LIGHT);
-        
-        // Measured Doppler
-        T measured_doppler = T(sat_info_.doppler);
-        
-        // Calculate residual with proper weighting
-        T weight = T(1.0);
-        if (sat_info_.cn0 > T(0.0)) {
-            // Higher CN0 = better measurement
-            // Use explicit comparison instead of ceres::min/max
-            T cn0_ratio = T(sat_info_.cn0) / T(50.0);
-            T min_weight = T(0.1);
-            T max_weight = T(1.0);
-            
-            // weight = min(max_weight, max(min_weight, cn0_ratio));
-            weight = cn0_ratio < min_weight ? min_weight : 
-                    (cn0_ratio > max_weight ? max_weight : cn0_ratio);
-        }
-        
-        // If standard deviation is available, use it for weighting
-        T std_dev = T(sat_info_.dopp_std);
-        if (std_dev <= T(0.0)) std_dev = T(1.0); // Default std if not available
-        
-        residual[0] = (expected_doppler - measured_doppler) * weight / std_dev;
-        
-        return true;
-    }
-    
-    static ceres::CostFunction* Create(const SatelliteInfo& sat_info) {
-        return new ceres::AutoDiffCostFunction<GpsDopplerResidual, 1, 4>(
-            new GpsDopplerResidual(sat_info));
-    }
-    
-private:
-    const SatelliteInfo sat_info_;
-};
-
-// RTKLIB-style Doppler residual for velocity estimation - Multi-system
-struct MultiSystemDopplerResidual {
-    MultiSystemDopplerResidual(const SatelliteInfo& sat_info)
-        : sat_info_(sat_info) {}
-    
-    template <typename T>
-    bool operator()(const T* const velocity_state, T* residual) const {
-        // Extract receiver velocity
-        T vx = velocity_state[0];
-        T vy = velocity_state[1];
-        T vz = velocity_state[2];
-        
-        // Select appropriate clock drift based on system
-        T clock_drift;
-        if (sat_info_.system == GPS) {
-            clock_drift = velocity_state[3];  // GPS clock drift
-        } else if (sat_info_.system == GLONASS) {
-            clock_drift = velocity_state[4];  // GLONASS clock drift
-        } else {
-            // Default to GPS for other systems
-            clock_drift = velocity_state[3];
-        }
-        
-        // Satellite position, velocity, and LOS (line-of-sight unit vector)
-        T sat_pos[3] = {T(sat_info_.sat_pos_x), T(sat_info_.sat_pos_y), T(sat_info_.sat_pos_z)};
-        T sat_vel[3] = {T(sat_info_.sat_vel_x), T(sat_info_.sat_vel_y), T(sat_info_.sat_vel_z)};
-        T rcv_pos[3] = {T(sat_info_.rx_pos_x), T(sat_info_.rx_pos_y), T(sat_info_.rx_pos_z)};
-        
-        // Compute geometric range
-        T e[3]; // Line-of-sight vector from receiver to satellite
-        e[0] = sat_pos[0] - rcv_pos[0];
-        e[1] = sat_pos[1] - rcv_pos[1];
-        e[2] = sat_pos[2] - rcv_pos[2];
-        
-        // Compute range (distance)
-        T r = ceres::sqrt(e[0]*e[0] + e[1]*e[1] + e[2]*e[2]);
-        
-        // Normalize LOS vector
-        if (r > T(0.0)) {
-            e[0] /= r;
-            e[1] /= r;
-            e[2] /= r;
-        } else {
-            // Protect against division by zero
-            residual[0] = T(0.0);
-            return true;
-        }
-        
-        // Compute relative velocity along line-of-sight using RTKLIB formula
-        T rate = T(0.0);
-        
-        // Manually account for velocity vector components without using boolean operations
-        rate += (sat_vel[0] - vx) * e[0]; // X component
-        rate += (sat_vel[1] - vy) * e[1]; // Y component
-        rate += (sat_vel[2] - vz) * e[2]; // Z component
-        
-        // Sagnac effect correction
-        T wx = T(EARTH_ROTATION_RATE) * rcv_pos[1]; // Earth rotation effect
-        T wy = -T(EARTH_ROTATION_RATE) * rcv_pos[0];
-        
-        rate += wx * e[1] - wy * e[0];
-        
-        // Determine frequency based on satellite system
-        T freq;
-        if (sat_info_.system == GPS) {
-            freq = T(GPS_L1_FREQ);
-        } else if (sat_info_.system == GLONASS) {
-            // GLONASS uses FDMA, compute frequency based on slot
-            int k = sat_info_.freq_num;
-            freq = T(GLONASS_L1_BASE_FREQ + k * GLONASS_L1_DELTA_FREQ);
-        } else {
-            // Default to GPS L1 frequency for other systems
-            freq = T(GPS_L1_FREQ);
-        }
-        
-        // Convert range rate to Doppler frequency (Hz)
-        T expected_doppler = rate * freq / T(SPEED_OF_LIGHT);
-        
-        // Add clock drift effect (scaled to frequency)
-        expected_doppler += clock_drift * freq / T(SPEED_OF_LIGHT);
-        
-        // Measured Doppler
-        T measured_doppler = T(sat_info_.doppler);
-        
-        // Calculate residual with proper weighting
-        T weight = T(1.0);
-        if (sat_info_.cn0 > T(0.0)) {
-            // Higher CN0 = better measurement
-            // Use explicit comparison instead of ceres::min/max
-            T cn0_ratio = T(sat_info_.cn0) / T(50.0);
-            T min_weight = T(0.1);
-            T max_weight = T(1.0);
-            
-            // weight = min(max_weight, max(min_weight, cn0_ratio));
-            weight = cn0_ratio < min_weight ? min_weight : 
-                    (cn0_ratio > max_weight ? max_weight : cn0_ratio);
-        }
-        
-        // If standard deviation is available, use it for weighting
-        T std_dev = T(sat_info_.dopp_std);
-        if (std_dev <= T(0.0)) std_dev = T(1.0); // Default std if not available
-        
-        residual[0] = (expected_doppler - measured_doppler) * weight / std_dev;
-        
-        return true;
-    }
-    
-    static ceres::CostFunction* Create(const SatelliteInfo& sat_info) {
-        return new ceres::AutoDiffCostFunction<MultiSystemDopplerResidual, 1, 5>(
-            new MultiSystemDopplerResidual(sat_info));
-    }
-    
-private:
-    const SatelliteInfo sat_info_;
-};
- 
  // Time difference between two gtime_t structs
  static double time_diff(const gtime_t& t1, const gtime_t& t2) {
      return difftime(t1.time, t2.time) + t1.sec - t2.sec;
@@ -1527,6 +1313,9 @@ private:
              ROS_WARN("Using system time as fallback: GPS TOW = %.3f", gps_tow);
          }
          
+         // Store current time for use in other functions
+         current_time_ = gps_tow;
+         
          ROS_INFO("Processing %zu GNSS observations at GPS TOW %.3f", msg->meas.size(), gps_tow);
          
          // Print ephemeris status periodically
@@ -1852,181 +1641,31 @@ private:
              }
          }
          
-         // Print detailed elevation angle analysis
-         ROS_INFO("=== Satellite Elevation Analysis ===");
-         for (size_t i = 0; i < satellites.size(); i++) {
-             const auto& sat = satellites[i];
-             std::string sys_name;
-             switch(sat.system) {
-                 case GPS: sys_name = "GPS"; break;
-                 case GLONASS: sys_name = "GLONASS"; break;
-                 case GALILEO: sys_name = "GALILEO"; break;
-                 case BEIDOU: sys_name = "BEIDOU"; break;
-                 default: sys_name = "UNKNOWN"; break;
-             }
-             
-             ROS_INFO("  Satellite %3d (%8s): Elev = %6.2f°, Azim = %6.2f°, CN0 = %5.1f dB-Hz", 
-                     sat.sat_id, 
-                     sys_name.c_str(), 
-                     sat.elevation * 180.0/M_PI,  // Convert to degrees
-                     sat.azimuth * 180.0/M_PI,    // Convert to degrees
-                     sat.cn0);
-         }
-         ROS_INFO("================================");
- 
-         // Also add histogram of elevation angles for quick analysis
-         int elev_bins[9] = {0}; // 0-10, 10-20, ..., 80-90 degrees
-         int neg_elev_bins[9] = {0}; // -10-0, -20--10, ..., -90--80 degrees
-         for (const auto& sat : satellites) {
-             double elev_deg = sat.elevation * 180.0/M_PI;
-             if (elev_deg >= 0) {
-                 int bin = std::min(8, static_cast<int>(elev_deg / 10.0));
-                 elev_bins[bin]++;
-             } else {
-                 int bin = std::min(8, static_cast<int>(-elev_deg / 10.0));
-                 neg_elev_bins[bin]++;
-             }
-         }
- 
-         ROS_INFO("Elevation angle distribution:");
-         ROS_INFO("  0-10°: %d satellites", elev_bins[0]);
-         ROS_INFO(" 10-20°: %d satellites", elev_bins[1]);
-         ROS_INFO(" 20-30°: %d satellites", elev_bins[2]);
-         ROS_INFO(" 30-40°: %d satellites", elev_bins[3]);
-         ROS_INFO(" 40-50°: %d satellites", elev_bins[4]);
-         ROS_INFO(" 50-60°: %d satellites", elev_bins[5]);
-         ROS_INFO(" 60-70°: %d satellites", elev_bins[6]);
-         ROS_INFO(" 70-80°: %d satellites", elev_bins[7]);
-         ROS_INFO(" 80-90°: %d satellites", elev_bins[8]);
-         
-         // Report negative elevation satellites if there are any
-         if (count_negative_elevation > 0) {
-             ROS_INFO("Negative elevation angle distribution:");
-             ROS_INFO("   0-(-10)°: %d satellites", neg_elev_bins[0]);
-             ROS_INFO(" -10-(-20)°: %d satellites", neg_elev_bins[1]);
-             ROS_INFO(" -20-(-30)°: %d satellites", neg_elev_bins[2]);
-             ROS_INFO(" -30-(-40)°: %d satellites", neg_elev_bins[3]);
-             ROS_INFO(" -40-(-50)°: %d satellites", neg_elev_bins[4]);
-             ROS_INFO(" -50-(-60)°: %d satellites", neg_elev_bins[5]);
-             ROS_INFO(" -60-(-70)°: %d satellites", neg_elev_bins[6]);
-             ROS_INFO(" -70-(-80)°: %d satellites", neg_elev_bins[7]);
-             ROS_INFO(" -80-(-90)°: %d satellites", neg_elev_bins[8]);
-             
-             // Warn about incorrect initial position
-             if (!initialized_ && count_negative_elevation > 5) {
-                 ROS_WARN("Many satellites have negative elevations (%.2f%% of satellites). "
-                        "This suggests incorrect initial position. Will use ALL satellites for initialization.",
-                       (100.0 * count_negative_elevation) / satellites.size());
-             }
-         }
-         
-         // Debug satellite geometry periodically
-         static bool already_debugged = false;
-         if (!already_debugged && output_debug_info_ && !satellites.empty()) {
-             debugSatelliteGeometry(satellites);
-             already_debugged = true;  // Only print once
-         }
-         
-         // Count satellites above elevation mask - only for information
-         int valid_satellites_above_mask = 0;
-         for (const auto& sat : satellites) {
-             if (sat.elevation * 180.0 / M_PI >= cut_off_degree_) {
-                 valid_satellites_above_mask++;
-             } else {
-                 count_below_elevation++;
-             }
-         }
-         
-         // Count GPS satellites for GPS-only mode
-         int gps_count = 0;
-         for (const auto& sat : satellites) {
-             if (sat.system == GPS) {
-                 gps_count++;
-             }
-         }
-         
-         // Print diagnostic information
-         ROS_INFO("Satellite filtering results:");
-         ROS_INFO("  Total observations: %zu", msg->meas.size());
-         ROS_INFO("  Empty pseudorange: %d", count_empty_psr);
-         ROS_INFO("  Invalid pseudorange: %d", count_invalid_psr);
-         ROS_INFO("  Low CN0: %d", count_low_cn0);
-         ROS_INFO("  No ephemeris: %d", count_no_ephemeris);
-         ROS_INFO("  GLONASS satellites skipped: %d", count_glonass_skipped);
-         ROS_INFO("  Ephemeris computation error: %d", count_ephemeris_error);
-         ROS_INFO("  Below elevation mask: %d", count_below_elevation);
-         ROS_INFO("  Negative elevation: %d", count_negative_elevation);
-         ROS_INFO("  All valid satellites: %zu", satellites.size());
-         ROS_INFO("  Valid GPS satellites: %d", gps_count);
-         ROS_INFO("  Valid satellites above %.1f° elevation: %d", cut_off_degree_, valid_satellites_above_mask);
-         
          // Make sure we have enough satellites (regardless of elevation)
          if (satellites.size() < min_satellites_) {
              ROS_WARN("Not enough valid satellites: %zu (need %d)", satellites.size(), min_satellites_);
              return;
          }
          
-         if (gps_only_mode_ && gps_count < min_satellites_) {
-             ROS_WARN("Not enough GPS satellites in GPS-only mode: %d (need %d)", gps_count, min_satellites_);
-             return;
-         }
+         // Verify and possibly recalculate satellite velocities
+         validateSatelliteVelocities(satellites);
          
-         // Print all satellite positions and pseudoranges before WLS solution
-         ROS_INFO("Satellite details before adding to WLS solver:");
-         for (const auto& sat : satellites) {
-             double sat_range = sqrt(sat.sat_pos_x*sat.sat_pos_x + 
-                                  sat.sat_pos_y*sat.sat_pos_y + 
-                                  sat.sat_pos_z*sat.sat_pos_z);
-                                    
-             ROS_INFO("  Sat %d (%s): Pos=[%.1f, %.1f, %.1f], Range=%.1f km, PR=%.1f m, ClkBias=%.9f s (%.3f m)", 
-                 sat.sat_id,
-                 (sat.system == GPS ? "GPS" : (sat.system == GLONASS ? "GLO" : "Other")),
-                 sat.sat_pos_x, sat.sat_pos_y, sat.sat_pos_z,
-                 sat_range/1000.0,
-                 sat.pseudorange,
-                 sat.sat_clock_bias,
-                 sat.sat_clock_bias * SPEED_OF_LIGHT);
-                 
-             // Check for unusual values
-             if (sat_range < 10000.0 || sat_range > 50000000.0) {
-                 ROS_WARN("  Satellite %d has unusual range from Earth center: %.1f km", 
-                         sat.sat_id, sat_range/1000.0);
-             }
-             
-             double clock_corr = sat.sat_clock_bias * SPEED_OF_LIGHT;
-             if (fabs(clock_corr) > 100000.0) {
-                 ROS_WARN("  Satellite %d has unusual clock bias: %.9f s (%.1f m)", 
-                        sat.sat_id, sat.sat_clock_bias, clock_corr);
-             }
-             
-             if (sat.pseudorange < 10000.0 || sat.pseudorange > 100000000.0) {
-                 ROS_WARN("  Satellite %d has unusual pseudorange: %.1f m", sat.sat_id, sat.pseudorange);
-             }
-         }
+         // During initialization or if disable_elevation_filter is set, use ALL satellites
+         bool use_all_sats = !initialized_ || disable_elevation_filter_;
          
          // Run WLS solver - special initialization 
          GnssSolution solution;
          solution.timestamp = gps_tow;
          
-         // During initialization or if disable_elevation_filter is set, use ALL satellites
-         bool use_all_sats = !initialized_ || disable_elevation_filter_;
-         
-         // Create proper debug message
-         if (!initialized_) {
-             ROS_INFO("Initialization mode: Using all %zu satellites regardless of elevation", satellites.size());
-         } else if (disable_elevation_filter_) {
-             ROS_INFO("Elevation filter disabled: Using all %zu satellites", satellites.size());
-         }
-         
          // Use GPS-only mode for more stability
-         bool success;
+         bool position_success;
          if (gps_only_mode_) {
-             success = solveGpsOnlyWLS(satellites, solution, use_all_sats);
+             position_success = solveGpsOnlyWLS(satellites, solution, use_all_sats);
          } else {
-             success = solveMultiSystemWLS(satellites, solution, use_all_sats);
+             position_success = solveMultiSystemWLS(satellites, solution, use_all_sats);
          }
          
-         if (success) {
+         if (position_success) {
              // If we just initialized, log and save the position
              if (!initialized_) {
                  ROS_INFO("Initial position found: Lat=%.7f°, Lon=%.7f°, Alt=%.2fm, Sats=%d", 
@@ -2131,6 +1770,7 @@ private:
      int current_gps_week_;     // Current GPS week
      double current_leap_seconds_; // Current GPS-UTC leap seconds
      double max_velocity_;      // Maximum expected velocity in m/s
+     double current_time_;      // Store current time for reuse in other functions
      
      // Raw data logging
      bool log_raw_data_;
@@ -2164,338 +1804,771 @@ private:
      std::mutex glo_ephem_mutex_;
      std::mutex iono_params_mutex_;
      
-     void calculateElevationAzimuth(
-         double rx, double ry, double rz,
-         double sx, double sy, double sz,
-         double& elevation, double& azimuth) {
+     /**
+      * @brief Validate satellite velocities and calculate them if missing
+      * @param satellites Vector of satellite information
+      */
+     void validateSatelliteVelocities(std::vector<SatelliteInfo>& satellites) {
+         int count_updated = 0;
+         int count_skipped = 0;
          
-         // Print input values for debugging elevation issues
-         ROS_DEBUG("Elevation calculation inputs:");
-         ROS_DEBUG("  Receiver: [%.2f, %.2f, %.2f]", rx, ry, rz);
-         ROS_DEBUG("  Satellite: [%.2f, %.2f, %.2f]", sx, sy, sz);
-         
-         // Compute vector from receiver to satellite
-         double dx = sx - rx;
-         double dy = sy - ry;
-         double dz = sz - rz;
-         
-         // Length of the vector (range)
-         double range = sqrt(dx*dx + dy*dy + dz*dz);
-         
-         // Check for valid range
-         if (range < 1e-6) {
-             ROS_WARN("Invalid range in elevation calculation");
-             elevation = 0.0;
-             azimuth = 0.0;
-             return;
-         }
-         
-         // Convert receiver ECEF to LLA
-         double lat, lon, alt;
-         CoordinateConverter::ecefToLla(rx, ry, rz, lat, lon, alt);
-         
-         // Debug LLA conversion
-         ROS_DEBUG("  Receiver LLA: [%.6f°, %.6f°, %.2fm]", 
-                    lat * 180.0/M_PI, lon * 180.0/M_PI, alt);
-         
-         // Compute ENU vector from receiver to satellite
-         // Rotation matrix from ECEF to ENU
-         double sin_lat = sin(lat);
-         double cos_lat = cos(lat);
-         double sin_lon = sin(lon);
-         double cos_lon = cos(lon);
-         
-         // Rotate ECEF vector to ENU
-         double e = -sin_lon * dx + cos_lon * dy;
-         double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
-         double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
-         
-         // Debug ENU vector
-         ROS_DEBUG("  ENU vector: [%.2f, %.2f, %.2f]", e, n, u);
-         
-         // Compute elevation and azimuth
-         double horizontal_distance = sqrt(e*e + n*n);
-         
-         elevation = atan2(u, horizontal_distance);
-         azimuth = atan2(e, n);
-         
-         // Normalize azimuth to [0, 2π)
-         if (azimuth < 0) {
-             azimuth += 2 * M_PI;
-         }
-         
-         // Debug final values
-         ROS_DEBUG("  Computed: elev = %.2f° (%.6f rad), azim = %.2f° (%.6f rad)", 
-                    elevation * 180.0/M_PI, elevation, 
-                    azimuth * 180.0/M_PI, azimuth);
-     }
-     
-     void calculateMeasurementWeight(SatelliteInfo& sat_info) {
-         // GVINS approach - weight based on sin²(elevation)
-         // Use absolute elevation angle for weighting to handle negative elevations during initialization
-         double elevation_deg = sat_info.elevation * 180.0 / M_PI;
-         double abs_elevation = fabs(sat_info.elevation);
-         double sin_el = sin(abs_elevation);
-         double elevation_weight = std::max(0.01, sin_el * sin_el);
-         
-         // Calculate weight based on CN0 (carrier-to-noise density ratio)
-         double cn0_weight = 1.0;
-         if (sat_info.cn0 > 0) {
-             // Use a more gradual scaling with CN0
-             cn0_weight = std::min(1.0, std::max(0.2, (sat_info.cn0 - min_cn0_) / 30.0));
-         }
-         
-         // URA-based weight
-         double ura_weight = 1.0;
-         if (sat_info.ura > 0) {
-             // Adjust based on URA - lower URA means higher weight
-             ura_weight = 1.0 / sat_info.ura;
-         }
-         
-         // Combined weight (product of elevation and CN0 weights)
-         sat_info.weight = elevation_weight * cn0_weight * ura_weight;
-         
-         // Set pseudorange standard deviation based on weight (for whitening)
-         sat_info.psr_std = pseudorange_noise_ / sqrt(sat_info.weight);
-         
-         ROS_DEBUG("Satellite %d: elevation=%.1f°, CN0=%.1f dB-Hz, URA=%.1f, weight=%.3f", 
-                    sat_info.sat_id, elevation_deg, sat_info.cn0, sat_info.ura, sat_info.weight);
-     }
-     
-     // Solve for position using GPS satellites only
-     bool solveGpsOnlyWLS(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution, bool use_all_satellites = false) {
-         ROS_INFO("Starting GPS-only WLS solver with %zu total satellites", satellites.size());
-         
-         // Extract GPS satellites
-         std::vector<uint32_t> gps_idx;
-         for (uint32_t i = 0; i < satellites.size(); ++i) {
-             if (satellites[i].system == GPS && 
-                 (use_all_satellites || satellites[i].elevation * 180.0/M_PI >= cut_off_degree_)) {
-                 gps_idx.push_back(i);
+         for (auto& sat : satellites) {
+             bool valid_velocity = true;
+             
+             // Check if velocity components are valid
+             if (!std::isfinite(sat.sat_vel_x) || !std::isfinite(sat.sat_vel_y) || !std::isfinite(sat.sat_vel_z)) {
+                 valid_velocity = false;
+             }
+             
+             // Validate velocity magnitude (GPS/GLONASS satellites move around 3-4 km/s)
+             double vel_magnitude = sqrt(
+                 sat.sat_vel_x * sat.sat_vel_x +
+                 sat.sat_vel_y * sat.sat_vel_y +
+                 sat.sat_vel_z * sat.sat_vel_z);
+                 
+             if (vel_magnitude < 1000.0 || vel_magnitude > 6000.0) {
+                 valid_velocity = false;
+             }
+             
+             // If velocity is invalid, calculate it
+             if (!valid_velocity) {
+                 if (sat.system == GPS) {
+                     // Find ephemeris for this satellite
+                     auto eph_it = gps_ephemeris_.find(sat.sat_id);
+                     if (eph_it != gps_ephemeris_.end()) {
+                         // Calculate satellite transmission time based on pseudorange
+                         double transmission_time = sat.raw_time_tow - sat.pseudorange / SPEED_OF_LIGHT;
+                         
+                         double dummy_clock_bias, dummy_clock_drift;
+                         bool success = GpsEphemerisCalculator::computeSatPosVel(
+                             eph_it->second, 
+                             transmission_time, 
+                             sat.sat_pos_x, sat.sat_pos_y, sat.sat_pos_z,
+                             sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z,
+                             dummy_clock_bias, dummy_clock_drift,
+                             true);  // Force use of ephemeris
+                         
+                         if (success) {
+                             count_updated++;
+                             vel_magnitude = sqrt(
+                                 sat.sat_vel_x * sat.sat_vel_x +
+                                 sat.sat_vel_y * sat.sat_vel_y +
+                                 sat.sat_vel_z * sat.sat_vel_z);
+                                 
+                             ROS_INFO("Updated velocity for GPS PRN %d: [%.2f, %.2f, %.2f] m/s (%.2f km/s)",
+                                     sat.sat_id, sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z, vel_magnitude/1000.0);
+                         } else {
+                             count_skipped++;
+                             ROS_WARN("Failed to calculate velocity for GPS PRN %d", sat.sat_id);
+                         }
+                     } else {
+                         count_skipped++;
+                         ROS_WARN("No ephemeris found for GPS PRN %d", sat.sat_id);
+                     }
+                 } else if (sat.system == GLONASS) {
+                     // Find ephemeris for this satellite
+                     auto eph_it = glo_ephemeris_.find(sat.sat_id);
+                     if (eph_it != glo_ephemeris_.end()) {
+                         // GLONASS time (UTC + 3 hours, but without leap seconds)
+                         // GPS TOW -> GLONASS time
+                         double glonass_time = fmod(sat.raw_time_tow - current_leap_seconds_, 86400.0);
+                         
+                         // Time of transmission
+                         double transmission_time = glonass_time - sat.pseudorange / SPEED_OF_LIGHT;
+                         
+                         double dummy_clock_bias, dummy_clock_drift;
+                         bool success = GlonassEphemerisCalculator::computeSatPosVel(
+                             eph_it->second,
+                             transmission_time,
+                             sat.sat_pos_x, sat.sat_pos_y, sat.sat_pos_z,
+                             sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z,
+                             dummy_clock_bias, dummy_clock_drift,
+                             true);  // Force use of ephemeris
+                             
+                         if (success) {
+                             count_updated++;
+                             vel_magnitude = sqrt(
+                                 sat.sat_vel_x * sat.sat_vel_x +
+                                 sat.sat_vel_y * sat.sat_vel_y +
+                                 sat.sat_vel_z * sat.sat_vel_z);
+                                 
+                             ROS_INFO("Updated velocity for GLONASS slot %d: [%.2f, %.2f, %.2f] m/s (%.2f km/s)",
+                                     sat.sat_id, sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z, vel_magnitude/1000.0);
+                         } else {
+                             count_skipped++;
+                             ROS_WARN("Failed to calculate velocity for GLONASS slot %d", sat.sat_id);
+                         }
+                     } else {
+                         count_skipped++;
+                         ROS_WARN("No ephemeris found for GLONASS slot %d", sat.sat_id);
+                     }
+                 }
              }
          }
          
-         if (gps_idx.size() < 4) {
-             ROS_WARN("Too few GPS satellites for positioning: %zu (need at least 4)", gps_idx.size());
+         if (count_updated > 0) {
+             ROS_INFO("Updated velocities for %d satellites", count_updated);
+         }
+         if (count_skipped > 0) {
+             ROS_WARN("Failed to update velocities for %d satellites", count_skipped);
+         }
+     }
+     
+     /**
+      * @brief Solve for velocity using GPS satellites only with direct weighted least squares
+      * @param satellites Vector of all satellite information
+      * @param solution Output GNSS solution structure to store velocity results
+      * @return true if velocity calculation was successful
+      */
+     bool solveGpsOnlyVelocityWLS_RTKLIB(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution) {
+         // Log all available Doppler measurements
+         ROS_INFO("All GPS Doppler measurements:");
+         for (uint32_t i = 0; i < satellites.size(); ++i) {
+             const auto& sat = satellites[i];
+             if (sat.system == GPS && sat.doppler != 0.0) {
+                 ROS_INFO("  Sat %d: Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°", 
+                         sat.sat_id, sat.doppler, sat.cn0, sat.elevation * 180.0/M_PI);
+             }
+         }
+         
+         // Select valid satellites for velocity calculation
+         std::vector<SatelliteInfo> valid_sats;
+         
+         for (const auto& sat : satellites) {
+             // Skip non-GPS satellites in GPS-only mode
+             if (sat.system != GPS) continue;
+             
+             // Check if Doppler measurement exists and is valid
+             if (sat.doppler == 0.0 || !std::isfinite(sat.doppler)) continue;
+             
+             // Check elevation angle
+             if (sat.elevation * 180.0/M_PI < cut_off_degree_) continue;
+             
+             // Skip satellites with very large clock bias
+             if (std::abs(sat.sat_clock_bias * SPEED_OF_LIGHT) > 100000.0) {
+                 ROS_WARN("Skipping satellite %d with large clock bias (%.2f m) for velocity", 
+                          sat.sat_id, sat.sat_clock_bias * SPEED_OF_LIGHT);
+                 continue;
+             }
+             
+             valid_sats.push_back(sat);
+         }
+         
+         // Check if we have enough satellites
+         if (valid_sats.size() < 4) {
+             ROS_WARN("Too few GPS satellites with valid Doppler: %zu (need at least 4)", valid_sats.size());
              return false;
          }
          
-         ROS_INFO("Using %zu GPS satellites for position fix", gps_idx.size());
-         
-         // 4-parameter state for GPS-only: [x, y, z, clock_bias]
-         double state[4] = {0.0, 0.0, 0.0, 0.0};
-         
-         // Use the Earth surface as a starting point if not initialized
-         if (!initialized_) {
-             // Start at a point on Earth's surface using proper WGS84 model
-             double lat_rad = initial_latitude_ * M_PI / 180.0;
-             double lon_rad = initial_longitude_ * M_PI / 180.0;
-             double N = WGS84_a / sqrt(1.0 - WGS84_e_sq * sin(lat_rad) * sin(lat_rad));
-             double x0 = (N + initial_altitude_) * cos(lat_rad) * cos(lon_rad);
-             double y0 = (N + initial_altitude_) * cos(lat_rad) * sin(lon_rad);
-             double z0 = (N * (1.0 - WGS84_e_sq) + initial_altitude_) * sin(lat_rad);
-             
-             state[0] = x0;
-             state[1] = y0;
-             state[2] = z0;
-             state[3] = 0.0;  // Initial clock bias
-             
-             ROS_INFO("Starting with Earth surface position: [%.1f, %.1f, %.1f]", x0, y0, z0);
-         } else {
-             // Use current solution
-             state[0] = current_solution_.x;
-             state[1] = current_solution_.y;
-             state[2] = current_solution_.z;
-             state[3] = current_solution_.clock_bias;
-             
-             ROS_INFO("Using current position as initial state: [%.1f, %.1f, %.1f], clock=%.1f",
-                     state[0], state[1], state[2], state[3]);
+         // Print selected Doppler values for velocity calculation
+         ROS_INFO("GPS satellites selected for velocity calculation:");
+         for (const auto& sat : valid_sats) {
+             ROS_INFO("  Satellite %d: Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°",
+                      sat.sat_id, sat.doppler, sat.cn0, sat.elevation * 180.0/M_PI);
          }
          
-         // Use multiple iterations for better convergence
-         bool valid_solution = false;
-         double prev_state[4];
-         double prev_cost = 1e10;
+         // The velocity estimation problem can be solved directly with linear least squares
+         // We set up the system: H * v = z, where:
+         // - H is the observation matrix
+         // - v is the unknown vector [vx, vy, vz, c*dtr_dot]
+         // - z is the Doppler measurements adjusted for satellite motion
          
-         for (int iter = 0; iter < 3 && !valid_solution; iter++) {
-             // Save current state for validation
-             for (int i = 0; i < 4; i++) {
-                 prev_state[i] = state[i];
+         int n = valid_sats.size();
+         Eigen::MatrixXd H(n, 4);  // Observation matrix
+         Eigen::VectorXd z(n);     // Measurement vector
+         Eigen::VectorXd w(n);     // Weight vector
+         
+         // For each satellite, compute line-of-sight vector and set up equations
+         for (int i = 0; i < n; i++) {
+             const auto& sat = valid_sats[i];
+             
+             // Compute line-of-sight unit vector from receiver to satellite
+             double rx_pos[3] = {solution.x, solution.y, solution.z};
+             double sat_pos[3] = {sat.sat_pos_x, sat.sat_pos_y, sat.sat_pos_z};
+             double los[3];  // Line-of-sight vector
+             
+             // Geometric range vector components
+             los[0] = sat_pos[0] - rx_pos[0];
+             los[1] = sat_pos[1] - rx_pos[1];
+             los[2] = sat_pos[2] - rx_pos[2];
+             
+             // Compute range (geometric distance)
+             double range = sqrt(los[0]*los[0] + los[1]*los[1] + los[2]*los[2]);
+             
+             // Normalize to unit vector
+             los[0] /= range;
+             los[1] /= range;
+             los[2] /= range;
+             
+             // Satellite velocity components
+             double sat_vel[3] = {sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z};
+             
+             // Earth rotation effect (Sagnac effect)
+             // Earth rotates around z-axis at EARTH_ROTATION_RATE
+             double earth_corr[3] = {
+                 EARTH_ROTATION_RATE * sat_pos[1],      // (0, 0, omega_e) × (sat_x, sat_y, sat_z)
+                 -EARTH_ROTATION_RATE * sat_pos[0],
+                 0.0
+             };
+             
+             // Compute the range rate due to satellite motion
+             double sat_motion = 
+                 sat_vel[0] * los[0] + 
+                 sat_vel[1] * los[1] + 
+                 sat_vel[2] * los[2];
+             
+             // Correction for Earth rotation
+             sat_motion += 
+                 earth_corr[0] * los[0] + 
+                 earth_corr[1] * los[1] + 
+                 earth_corr[2] * los[2];
+             
+             // Frequency for GPS L1
+             double freq = GPS_L1_FREQ;
+             
+             // Fill matrix H with line-of-sight vector components
+             // These form the coefficients for the receiver velocity
+             H(i, 0) = -los[0];  // Negative because we solve for receiver velocity
+             H(i, 1) = -los[1];
+             H(i, 2) = -los[2];
+             H(i, 3) = 1.0;      // Coefficient for clock drift
+             
+             // Convert measured Doppler to range rate and adjust for satellite motion
+             // Doppler sign convention: positive = satellite moving away from receiver
+             double measured_doppler = sat.doppler;
+             
+             // Convert Doppler to range rate: range_rate = -Doppler * c / freq
+             double measured_range_rate = -measured_doppler * SPEED_OF_LIGHT / freq;
+             
+             // Adjust measurement for satellite motion
+             z(i) = measured_range_rate - sat_motion;
+             
+             // Set weight based on elevation and signal strength
+             double weight = 1.0;
+             if (sat.elevation > 0) {
+                 double sin_el = sin(sat.elevation);
+                 weight = sin_el * sin_el;  // sin²(elevation)
+                 
+                 // Apply CN0-based weighting if available
+                 if (sat.cn0 > 0) {
+                     double cn0_factor = sat.cn0 / 40.0;  // Normalized to typical good value
+                     cn0_factor = std::min(std::max(cn0_factor, 0.5), 2.0);  // Limit range
+                     weight *= cn0_factor;
+                 }
              }
              
-             // Set up the Ceres problem
-             ceres::Problem problem;
+             // Minimum weight to prevent numerical issues
+             weight = std::max(weight, 0.01);
+             w(i) = weight;
+         }
+         
+        //  // Apply weights to the system
+        //  Eigen::MatrixXd W = w.asDiagonal();
+        //  Eigen::MatrixXd Hw = W.sqrt() * H;
+        //  Eigen::VectorXd zw = W.sqrt() * z;
+
+         // Apply weights to the system
+        Eigen::MatrixXd W = w.asDiagonal();
+        Eigen::MatrixXd Hw = H;
+        Eigen::VectorXd zw = z;
+
+        // Apply square root weights manually
+        for (int i = 0; i < n; i++) {
+            double sqrt_weight = sqrt(w(i));
+            for (int j = 0; j < Hw.cols(); j++) {
+                Hw(i, j) *= sqrt_weight;
+            }
+            zw(i) *= sqrt_weight;
+        }
+         
+         // Solve the weighted least squares problem
+         Eigen::VectorXd v = Hw.colPivHouseholderQr().solve(zw);
+         
+         // Extract velocity components and clock drift
+         double vx = v(0);
+         double vy = v(1);
+         double vz = v(2);
+         double clock_drift = v(3);
+         
+         // Compute velocity magnitude
+         double velocity_magnitude = sqrt(vx*vx + vy*vy + vz*vz);
+         
+         // Print raw solution
+         ROS_INFO("Raw GPS velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), clock drift=%.2f m/s",
+                  vx, vy, vz, velocity_magnitude * 3.6, clock_drift);
+         
+         // Check residuals to diagnose issues
+         Eigen::VectorXd residuals = H * v - z;
+         double rms_residual = sqrt(residuals.squaredNorm() / n);
+         
+         ROS_INFO("Velocity estimation residual RMS: %.2f m/s", rms_residual);
+         
+         // Check for large residuals
+         for (int i = 0; i < n; i++) {
+             if (std::abs(residuals(i)) > 2.5 * rms_residual) {
+                 ROS_WARN("Large residual for satellite %d: %.2f m/s (%.2f Hz)",
+                         valid_sats[i].sat_id, residuals(i), 
+                         -residuals(i) * GPS_L1_FREQ / SPEED_OF_LIGHT);
+             }
+         }
+         
+         // Check for unrealistic clock drift (larger than 1 ppm of c)
+         const double MAX_REASONABLE_DRIFT = 300.0;  // 300 m/s is ~1 ppm of c
+         
+         if (std::abs(clock_drift) > MAX_REASONABLE_DRIFT) {
+             ROS_WARN("Unrealistic clock drift: %.2f m/s. Limiting to ±%.2f m/s",
+                      clock_drift, MAX_REASONABLE_DRIFT);
              
-             // Vector to store loss functions to manage their memory
-             std::vector<ceres::LossFunction*> loss_functions;
+             clock_drift = (clock_drift > 0) ? 
+                 MAX_REASONABLE_DRIFT : -MAX_REASONABLE_DRIFT;
+         }
+         
+         // Check for unrealistic velocity
+         if (velocity_magnitude > max_velocity_) {
+             ROS_WARN("Velocity magnitude %.2f m/s exceeds expected maximum of %.1f m/s. Possible causes:", 
+                      velocity_magnitude, max_velocity_);
              
-             // Add residual blocks for each GPS satellite
-             for (const auto& idx : gps_idx) {
-                 const auto& sat = satellites[idx];
+             // Analyze possible causes
+             if (rms_residual > 10.0) {
+                 ROS_WARN("High residuals (%.2f m/s) suggest measurement inconsistencies", rms_residual);
+             }
+             
+             if (velocity_magnitude > 5 * max_velocity_) {
+                 ROS_ERROR("Extremely high velocity detected (%.2f km/h)! Likely issues:", 
+                          velocity_magnitude * 3.6);
+                 ROS_ERROR("1. Incorrect satellite velocities");
+                 ROS_ERROR("2. Wrong Doppler sign convention");
+                 ROS_ERROR("3. Missing Earth rotation correction");
                  
-                 ceres::CostFunction* cost_function = GpsPseudorangeResidual::Create(sat);
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(5.0);
-                loss_functions.push_back(loss_function);
-                
-                problem.AddResidualBlock(
-                    cost_function,
-                    loss_function,
-                    state);
+                 // Scale down velocity to reasonable maximum
+                 double scale = max_velocity_ / velocity_magnitude;
+                 vx *= scale;
+                 vy *= scale;
+                 vz *= scale;
+                 velocity_magnitude = max_velocity_;
+                 
+                 ROS_WARN("Velocity capped to %.1f m/s (%.1f km/h)", 
+                          max_velocity_, max_velocity_ * 3.6);
+             }
+         }
+         
+         // Store results
+         solution.vx = vx;
+         solution.vy = vy;
+         solution.vz = vz;
+         solution.clock_drift = clock_drift;
+         
+         ROS_INFO("Final GPS velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), clock drift=%.2f m/s",
+                  vx, vy, vz, velocity_magnitude * 3.6, clock_drift);
+         
+         return true;
+     }
+ 
+     /**
+      * @brief Solve for velocity using multi-system satellites with direct weighted least squares
+      * @param satellites Vector of all satellite information
+      * @param solution Output GNSS solution structure to store velocity results
+      * @return true if velocity calculation was successful
+      */
+     bool solveMultiSystemVelocityWLS_RTKLIB(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution) {
+         // Log all available Doppler measurements
+         ROS_INFO("All available Doppler measurements:");
+         for (uint32_t i = 0; i < satellites.size(); ++i) {
+             const auto& sat = satellites[i];
+             if (sat.doppler != 0.0) {
+                 std::string sys_name = (sat.system == GPS) ? "GPS" : 
+                                      ((sat.system == GLONASS) ? "GLONASS" : "Other");
+                                      
+                 ROS_INFO("  Sat %d (%s): Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°", 
+                         sat.sat_id, sys_name.c_str(), sat.doppler, sat.cn0,
+                         sat.elevation * 180.0/M_PI);
+             }
+         }
+         
+         // Select valid satellites for velocity calculation
+         std::vector<SatelliteInfo> valid_sats;
+         int gps_count = 0, glonass_count = 0;
+         
+         for (const auto& sat : satellites) {
+             // Check if Doppler measurement exists and is valid
+             if (sat.doppler == 0.0 || !std::isfinite(sat.doppler)) continue;
+             
+             // Check elevation angle
+             if (sat.elevation * 180.0/M_PI < cut_off_degree_) continue;
+             
+             // Skip satellites with very large clock bias
+             if (std::abs(sat.sat_clock_bias * SPEED_OF_LIGHT) > 100000.0) {
+                 ROS_WARN("Skipping satellite %d with large clock bias (%.2f m) for velocity", 
+                          sat.sat_id, sat.sat_clock_bias * SPEED_OF_LIGHT);
+                 continue;
+             }
+             
+             // Count satellites by system
+             if (sat.system == GPS) {
+                 gps_count++;
+             } else if (sat.system == GLONASS) {
+                 glonass_count++;
+             }
+             
+             valid_sats.push_back(sat);
+         }
+         
+         ROS_INFO("Selected %d GPS and %d GLONASS satellites for velocity calculation",
+                  gps_count, glonass_count);
+         
+         // Need at least 5 satellites for multi-system (one for system time offset)
+         if (valid_sats.size() < 5 || gps_count < 1 || glonass_count < 1) {
+             ROS_WARN("Insufficient satellites for multi-system velocity: %zu GPS, %d GLONASS (need 5 total with at least 1 from each)",
+                      valid_sats.size(), gps_count, glonass_count);
+                      
+             // Try GPS-only as fallback
+             if (gps_count >= 4) {
+                 ROS_INFO("Trying GPS-only velocity as fallback");
+                 return solveGpsOnlyVelocityWLS_RTKLIB(satellites, solution);
+             }
+             
+             return false;
+         }
+         
+         // The velocity estimation problem can be solved directly with linear least squares
+         // We set up the system: H * v = z, where:
+         // - H is the observation matrix
+         // - v is the unknown vector [vx, vy, vz, gps_clock_drift, glonass_clock_drift]
+         // - z is the Doppler measurements adjusted for satellite motion
+         
+         int n = valid_sats.size();
+         Eigen::MatrixXd H(n, 5);  // Observation matrix
+         Eigen::VectorXd z(n);     // Measurement vector
+         Eigen::VectorXd w(n);     // Weight vector
+         
+         // For each satellite, compute line-of-sight vector and set up equations
+         for (int i = 0; i < n; i++) {
+             const auto& sat = valid_sats[i];
+             
+             // Compute line-of-sight unit vector from receiver to satellite
+             double rx_pos[3] = {solution.x, solution.y, solution.z};
+             double sat_pos[3] = {sat.sat_pos_x, sat.sat_pos_y, sat.sat_pos_z};
+             double los[3];  // Line-of-sight vector
+             
+             // Geometric range vector components
+             los[0] = sat_pos[0] - rx_pos[0];
+             los[1] = sat_pos[1] - rx_pos[1];
+             los[2] = sat_pos[2] - rx_pos[2];
+             
+             // Compute range (geometric distance)
+             double range = sqrt(los[0]*los[0] + los[1]*los[1] + los[2]*los[2]);
+             
+             // Normalize to unit vector
+             los[0] /= range;
+             los[1] /= range;
+             los[2] /= range;
+             
+             // Satellite velocity components
+             double sat_vel[3] = {sat.sat_vel_x, sat.sat_vel_y, sat.sat_vel_z};
+             
+             // Earth rotation effect (Sagnac effect)
+             // Earth rotates around z-axis at EARTH_ROTATION_RATE
+             double earth_corr[3] = {
+                 EARTH_ROTATION_RATE * sat_pos[1],      // (0, 0, omega_e) × (sat_x, sat_y, sat_z)
+                 -EARTH_ROTATION_RATE * sat_pos[0],
+                 0.0
+             };
+             
+             // Compute the range rate due to satellite motion
+             double sat_motion = 
+                 sat_vel[0] * los[0] + 
+                 sat_vel[1] * los[1] + 
+                 sat_vel[2] * los[2];
+             
+             // Correction for Earth rotation
+             sat_motion += 
+                 earth_corr[0] * los[0] + 
+                 earth_corr[1] * los[1] + 
+                 earth_corr[2] * los[2];
+             
+             // Determine frequency based on satellite system
+             double freq;
+             if (sat.system == GPS) {
+                 freq = GPS_L1_FREQ;
+             } else if (sat.system == GLONASS) {
+                 // GLONASS uses FDMA, compute frequency based on slot
+                 int k = sat.freq_num;
+                 freq = GLONASS_L1_BASE_FREQ + k * GLONASS_L1_DELTA_FREQ;
+             } else {
+                 // Default to GPS L1 frequency for other systems
+                 freq = GPS_L1_FREQ;
+             }
+             
+             // Fill matrix H with line-of-sight vector components
+             // These form the coefficients for the receiver velocity
+             H(i, 0) = -los[0];  // Negative because we solve for receiver velocity
+             H(i, 1) = -los[1];
+             H(i, 2) = -los[2];
+             
+             // Set clock drift column based on system
+             if (sat.system == GPS) {
+                 H(i, 3) = 1.0;  // GPS clock drift
+                 H(i, 4) = 0.0;  // No GLONASS contribution
+             } else if (sat.system == GLONASS) {
+                 H(i, 3) = 0.0;  // No GPS contribution 
+                 H(i, 4) = 1.0;  // GLONASS clock drift
+             } else {
+                 // Default to GPS for other systems
+                 H(i, 3) = 1.0;
+                 H(i, 4) = 0.0;
+             }
+             
+             // Convert measured Doppler to range rate and adjust for satellite motion
+             // Doppler sign convention: positive = satellite moving away from receiver
+             double measured_doppler = sat.doppler;
+             
+             // Convert Doppler to range rate: range_rate = -Doppler * c / freq
+             double measured_range_rate = -measured_doppler * SPEED_OF_LIGHT / freq;
+             
+             // Adjust measurement for satellite motion
+             z(i) = measured_range_rate - sat_motion;
+             
+             // Set weight based on elevation and signal strength
+             double weight = 1.0;
+             if (sat.elevation > 0) {
+                 double sin_el = sin(sat.elevation);
+                 weight = sin_el * sin_el;  // sin²(elevation)
+                 
+                 // Apply CN0-based weighting if available
+                 if (sat.cn0 > 0) {
+                     double cn0_factor = sat.cn0 / 40.0;  // Normalized to typical good value
+                     cn0_factor = std::min(std::max(cn0_factor, 0.5), 2.0);  // Limit range
+                     weight *= cn0_factor;
+                 }
+             }
+             
+             // Minimum weight to prevent numerical issues
+             weight = std::max(weight, 0.01);
+             w(i) = weight;
+         }
+         
+         // Apply weights to the system
+        Eigen::MatrixXd W = w.asDiagonal();
+        Eigen::MatrixXd Hw = H;
+        Eigen::VectorXd zw = z;
+
+        // Apply square root weights manually
+        for (int i = 0; i < n; i++) {
+            double sqrt_weight = sqrt(w(i));
+            for (int j = 0; j < Hw.cols(); j++) {
+                Hw(i, j) *= sqrt_weight;
             }
-            
-            // Configure the solver - standard options for stability
-            ceres::Solver::Options options;
-            options.linear_solver_type = ceres::DENSE_QR;
-            options.minimizer_progress_to_stdout = false;
-            options.max_num_iterations = 10;  // Fewer iterations per outer loop
-            options.function_tolerance = 1e-6;
-            
-            // Run the solver
-            ceres::Solver::Summary summary;
-            ceres::Solve(options, &problem, &summary);
-            
-            if (!summary.IsSolutionUsable()) {
-                ROS_WARN("GPS-only solver failed at iteration %d: %s", iter, summary.BriefReport().c_str());
-                continue;
+            zw(i) *= sqrt_weight;
+        }
+         
+         // Solve the weighted least squares problem
+         Eigen::VectorXd v = Hw.colPivHouseholderQr().solve(zw);
+         
+         // Extract velocity components and clock drifts
+         double vx = v(0);
+         double vy = v(1);
+         double vz = v(2);
+         double gps_clock_drift = v(3);
+         double glonass_clock_drift = v(4);
+         
+         // Compute velocity magnitude
+        double velocity_magnitude = sqrt(vx*vx + vy*vy + vz*vz);
+        
+        // Print raw solution
+        ROS_INFO("Raw multi-system velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h)",
+                 vx, vy, vz, velocity_magnitude * 3.6);
+        ROS_INFO("Clock drifts: GPS=%.2f m/s, GLONASS=%.2f m/s", 
+                 gps_clock_drift, glonass_clock_drift);
+        
+        // Check residuals to diagnose issues
+        Eigen::VectorXd residuals = H * v - z;
+        double rms_residual = sqrt(residuals.squaredNorm() / n);
+        
+        ROS_INFO("Multi-system velocity residual RMS: %.2f m/s", rms_residual);
+        
+        // Check for large residuals
+        for (int i = 0; i < n; i++) {
+            if (std::abs(residuals(i)) > 2.5 * rms_residual) {
+                std::string sys_name = (valid_sats[i].system == GPS) ? "GPS" : 
+                                      ((valid_sats[i].system == GLONASS) ? "GLONASS" : "Other");
+                                      
+                ROS_WARN("Large residual for satellite %d (%s): %.2f m/s",
+                        valid_sats[i].sat_id, sys_name.c_str(), residuals(i));
             }
-            
-            // Log intermediate solution
-            ROS_INFO("Iteration %d solution: [%.2f, %.2f, %.2f], clock=%.2f, cost=%.6f", 
-                   iter, state[0], state[1], state[2], state[3], summary.final_cost);
-            
-            // Calculate magnitude of position
-            double position_magnitude = sqrt(state[0]*state[0] + state[1]*state[1] + state[2]*state[2]);
-            
-            // Check if solution degraded
-            if (iter > 0 && summary.final_cost > prev_cost * 1.5) {
-                ROS_WARN("Solution degraded in iteration %d, reverting to previous", iter);
-                // Revert to previous state
-                for (int i = 0; i < 4; i++) {
-                    state[i] = prev_state[i];
-                }
-                break;
-            }
-            
-            // Check if solution is near Earth's surface
-            if (position_magnitude > 6000000.0 && position_magnitude < 7000000.0) {
-                // Convert to lat/lon/alt for further validation
-                double lat, lon, alt;
-                CoordinateConverter::ecefToLla(state[0], state[1], state[2], lat, lon, alt);
-                
-                // Validate altitude
-                if (alt > -10000.0 && alt < 10000.0) {
-                    valid_solution = true;
-                } else {
-                    ROS_WARN("Solution altitude (%.1f m) is outside reasonable range", alt);
-                    
-                    // Try opposite side of Earth if this is first iteration
-                    if (iter == 0) {
-                        state[0] = -state[0];
-                        state[1] = -state[1];
-                        state[2] = -state[2];
-                        ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
-                               state[0], state[1], state[2]);
-                    }
-                }
-            } else {
-                ROS_WARN("Position magnitude (%.1f m) is not near Earth radius", position_magnitude);
-                
-                // Try opposite side of Earth if this is first iteration
-                if (iter == 0) {
-                    state[0] = -state[0];
-                    state[1] = -state[1];
-                    state[2] = -state[2];
-                    ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
-                          state[0], state[1], state[2]);
-                }
-            }
-            
-            // Store current cost for next iteration
-            prev_cost = summary.final_cost;
         }
         
-        if (!valid_solution) {
-            ROS_WARN("Could not find a valid GPS-only solution after multiple attempts");
-            return false;
+        // Check for unrealistic clock drift (larger than 1 ppm of c)
+        double max_reasonable_drift = SPEED_OF_LIGHT * 1e-6;  // ~300 m/s
+        
+        // GPS clock drift
+        if (std::abs(gps_clock_drift) > max_reasonable_drift) {
+            ROS_WARN("Unrealistic GPS clock drift: %.2f m/s. Limiting to %.2f m/s", 
+                     gps_clock_drift, max_reasonable_drift);
+            gps_clock_drift = (gps_clock_drift > 0) ? 
+                max_reasonable_drift : -max_reasonable_drift;
         }
         
-        // Print output state for debugging
-        ROS_INFO("GPS-only solution state: [%.2f, %.2f, %.2f], clock=%.2f", 
-                state[0], state[1], state[2], state[3]);
+        // GLONASS clock drift
+        if (std::abs(glonass_clock_drift) > max_reasonable_drift) {
+            ROS_WARN("Unrealistic GLONASS clock drift: %.2f m/s. Limiting to %.2f m/s", 
+                     glonass_clock_drift, max_reasonable_drift);
+            glonass_clock_drift = (glonass_clock_drift > 0) ? 
+                max_reasonable_drift : -max_reasonable_drift;
+        }
         
-        // Extract solution
-        solution.x = state[0];
-        solution.y = state[1];
-        solution.z = state[2];
-        solution.clock_bias = state[3];
-        solution.glonass_clock_bias = 0.0;  // Not used in GPS-only mode
-        solution.num_satellites = gps_idx.size();
+        // For pedestrian applications, velocities should be under max_velocity_
+        if (velocity_magnitude > max_velocity_) {
+            ROS_WARN("Velocity magnitude %.2f m/s exceeds expected maximum of %.1f m/s", 
+                     velocity_magnitude, max_velocity_);
+            
+            // If dramatically unreasonable, scale it down
+            if (velocity_magnitude > 5 * max_velocity_) {
+                ROS_ERROR("Extremely high velocity detected (%.2f km/h)! Capping velocity.", 
+                         velocity_magnitude * 3.6);
+                
+                // Scale down velocity to reasonable maximum
+                double scale = max_velocity_ / velocity_magnitude;
+                vx *= scale;
+                vy *= scale;
+                vz *= scale;
+                velocity_magnitude = max_velocity_;
+            }
+        }
         
-        // Convert to geodetic coordinates
-        CoordinateConverter::ecefToLla(
-            solution.x, solution.y, solution.z,
-            solution.latitude, solution.longitude, solution.altitude);
+        // Store results
+        solution.vx = vx;
+        solution.vy = vy;
+        solution.vz = vz;
+        solution.clock_drift = gps_clock_drift;  // Store GPS clock drift as primary
         
-        ROS_INFO("GPS-only solution: ECEF [%.2f, %.2f, %.2f] m, clock bias %.2f m", 
-                 solution.x, solution.y, solution.z, solution.clock_bias);
-        ROS_INFO("             lat/lon [%.6f, %.6f], alt %.2f m", 
-                 solution.latitude * 180.0/M_PI, solution.longitude * 180.0/M_PI, solution.altitude);
-        
-        // Calculate DOP values
-        calculateGpsDOP(satellites, gps_idx, solution);
+        ROS_INFO("Final multi-system velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h)",
+                 vx, vy, vz, velocity_magnitude * 3.6);
+        ROS_INFO("Final clock drifts: GPS=%.2f m/s, GLONASS=%.2f m/s", 
+                 gps_clock_drift, glonass_clock_drift);
         
         return true;
     }
     
-    // Solve for position using multiple GNSS systems
-    bool solveMultiSystemWLS(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution, bool use_all_satellites = false) {
-        ROS_INFO("Starting multi-system WLS solver with %zu total satellites", satellites.size());
+    void calculateElevationAzimuth(
+        double rx, double ry, double rz,
+        double sx, double sy, double sz,
+        double& elevation, double& azimuth) {
         
-        // Create vectors of indices for satellites by system
-        std::vector<uint32_t> gps_idx, glo_idx;
+        // Print input values for debugging elevation issues
+        ROS_DEBUG("Elevation calculation inputs:");
+        ROS_DEBUG("  Receiver: [%.2f, %.2f, %.2f]", rx, ry, rz);
+        ROS_DEBUG("  Satellite: [%.2f, %.2f, %.2f]", sx, sy, sz);
         
-        // Apply elevation filter unless in initialization mode
+        // Compute vector from receiver to satellite
+        double dx = sx - rx;
+        double dy = sy - ry;
+        double dz = sz - rz;
+        
+        // Length of the vector (range)
+        double range = sqrt(dx*dx + dy*dy + dz*dz);
+        
+        // Check for valid range
+        if (range < 1e-6) {
+            ROS_WARN("Invalid range in elevation calculation");
+            elevation = 0.0;
+            azimuth = 0.0;
+            return;
+        }
+        
+        // Convert receiver ECEF to LLA
+        double lat, lon, alt;
+        CoordinateConverter::ecefToLla(rx, ry, rz, lat, lon, alt);
+        
+        // Debug LLA conversion
+        ROS_DEBUG("  Receiver LLA: [%.6f°, %.6f°, %.2fm]", 
+                   lat * 180.0/M_PI, lon * 180.0/M_PI, alt);
+        
+        // Compute ENU vector from receiver to satellite
+        // Rotation matrix from ECEF to ENU
+        double sin_lat = sin(lat);
+        double cos_lat = cos(lat);
+        double sin_lon = sin(lon);
+        double cos_lon = cos(lon);
+        
+        // Rotate ECEF vector to ENU
+        double e = -sin_lon * dx + cos_lon * dy;
+        double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
+        double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
+        
+        // Debug ENU vector
+        ROS_DEBUG("  ENU vector: [%.2f, %.2f, %.2f]", e, n, u);
+        
+        // Compute elevation and azimuth
+        double horizontal_distance = sqrt(e*e + n*n);
+        
+        elevation = atan2(u, horizontal_distance);
+        azimuth = atan2(e, n);
+        
+        // Normalize azimuth to [0, 2π)
+        if (azimuth < 0) {
+            azimuth += 2 * M_PI;
+        }
+        
+        // Debug final values
+        ROS_DEBUG("  Computed: elev = %.2f° (%.6f rad), azim = %.2f° (%.6f rad)", 
+                   elevation * 180.0/M_PI, elevation, 
+                   azimuth * 180.0/M_PI, azimuth);
+    }
+    
+    void calculateMeasurementWeight(SatelliteInfo& sat_info) {
+        // GVINS approach - weight based on sin²(elevation)
+        // Use absolute elevation angle for weighting to handle negative elevations during initialization
+        double elevation_deg = sat_info.elevation * 180.0 / M_PI;
+        double abs_elevation = fabs(sat_info.elevation);
+        double sin_el = sin(abs_elevation);
+        double elevation_weight = std::max(0.01, sin_el * sin_el);
+        
+        // Calculate weight based on CN0 (carrier-to-noise density ratio)
+        double cn0_weight = 1.0;
+        if (sat_info.cn0 > 0) {
+            // Use a more gradual scaling with CN0
+            cn0_weight = std::min(1.0, std::max(0.2, (sat_info.cn0 - min_cn0_) / 30.0));
+        }
+        
+        // URA-based weight
+        double ura_weight = 1.0;
+        if (sat_info.ura > 0) {
+            // Adjust based on URA - lower URA means higher weight
+            ura_weight = 1.0 / sat_info.ura;
+        }
+        
+        // Combined weight (product of elevation and CN0 weights)
+        sat_info.weight = elevation_weight * cn0_weight * ura_weight;
+        
+        // Set pseudorange standard deviation based on weight (for whitening)
+        sat_info.psr_std = pseudorange_noise_ / sqrt(sat_info.weight);
+        
+        ROS_DEBUG("Satellite %d: elevation=%.1f°, CN0=%.1f dB-Hz, URA=%.1f, weight=%.3f", 
+                   sat_info.sat_id, elevation_deg, sat_info.cn0, sat_info.ura, sat_info.weight);
+    }
+    
+    // Solve for position using GPS satellites only
+    bool solveGpsOnlyWLS(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution, bool use_all_satellites = false) {
+        ROS_INFO("Starting GPS-only WLS solver with %zu total satellites", satellites.size());
+        
+        // Extract GPS satellites
+        std::vector<uint32_t> gps_idx;
         for (uint32_t i = 0; i < satellites.size(); ++i) {
-            if (use_all_satellites || satellites[i].elevation * 180.0/M_PI >= cut_off_degree_) {
-                if (satellites[i].system == GPS) {
-                    gps_idx.push_back(i);
-                } else if (satellites[i].system == GLONASS) {
-                    glo_idx.push_back(i);
-                }
+            if (satellites[i].system == GPS && 
+                (use_all_satellites || satellites[i].elevation * 180.0/M_PI >= cut_off_degree_)) {
+                gps_idx.push_back(i);
             }
         }
         
-        ROS_INFO("Satellites by system: GPS=%zu, GLONASS=%zu", gps_idx.size(), glo_idx.size());
-        
-        // Need at least 5 satellites for multi-system (5 parameters)
-        size_t total_usable = gps_idx.size() + glo_idx.size();
-        if (total_usable < 5) {
-            ROS_WARN("Too few satellites for multi-system solution: %zu (need at least 5)", total_usable);
-            
-            // Try GPS-only as fallback if we have enough GPS satellites
-            if (gps_idx.size() >= 4) {
-                ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
-                return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
-            }
-            
+        if (gps_idx.size() < 4) {
+            ROS_WARN("Too few GPS satellites for positioning: %zu (need at least 4)", gps_idx.size());
             return false;
         }
         
-        // Need at least 1 satellite from each system
-        if (gps_idx.size() == 0 || glo_idx.size() == 0) {
-            ROS_WARN("Need at least 1 satellite from each system for multi-system solution");
-            
-            // Try GPS-only as fallback if we have enough GPS satellites
-            if (gps_idx.size() >= 4) {
-                ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
-                return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
-            }
-            
-            return false;
-        }
+        ROS_INFO("Using %zu GPS satellites for position fix", gps_idx.size());
         
-        // 5-parameter state: [x, y, z, gps_clock_bias, glonass_clock_bias]
-        double state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+        // 4-parameter state for GPS-only: [x, y, z, clock_bias]
+        double state[4] = {0.0, 0.0, 0.0, 0.0};
         
         // Use the Earth surface as a starting point if not initialized
         if (!initialized_) {
@@ -2510,8 +2583,7 @@ private:
             state[0] = x0;
             state[1] = y0;
             state[2] = z0;
-            state[3] = 0.0;  // GPS clock bias
-            state[4] = 0.0;  // GLONASS clock bias
+            state[3] = 0.0;  // Initial clock bias
             
             ROS_INFO("Starting with Earth surface position: [%.1f, %.1f, %.1f]", x0, y0, z0);
         } else {
@@ -2520,20 +2592,19 @@ private:
             state[1] = current_solution_.y;
             state[2] = current_solution_.z;
             state[3] = current_solution_.clock_bias;
-            state[4] = current_solution_.glonass_clock_bias;
             
-            ROS_INFO("Using current position as initial state: [%.1f, %.1f, %.1f], GPS clock=%.1f, GLO clock=%.1f",
-                    state[0], state[1], state[2], state[3], state[4]);
+            ROS_INFO("Using current position as initial state: [%.1f, %.1f, %.1f], clock=%.1f",
+                    state[0], state[1], state[2], state[3]);
         }
         
         // Use multiple iterations for better convergence
         bool valid_solution = false;
-        double prev_state[5];
+        double prev_state[4];
         double prev_cost = 1e10;
         
         for (int iter = 0; iter < 3 && !valid_solution; iter++) {
             // Save current state for validation
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 4; i++) {
                 prev_state[i] = state[i];
             }
             
@@ -2543,850 +2614,699 @@ private:
             // Vector to store loss functions to manage their memory
             std::vector<ceres::LossFunction*> loss_functions;
             
-            // Add residual blocks for each satellite
-            for (uint32_t i = 0; i < satellites.size(); ++i) {
-                const auto& sat = satellites[i];
+            // Add residual blocks for each GPS satellite
+            for (const auto& idx : gps_idx) {
+                const auto& sat = satellites[idx];
                 
-                // Skip satellites that don't pass elevation filter unless in initialization mode
-                if (!use_all_satellites && sat.elevation * 180.0/M_PI < cut_off_degree_) {
-                    continue;
-                }
-                
-                ceres::CostFunction* cost_function = MultiSystemPseudorangeResidual::Create(sat);
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(5.0);
-                loss_functions.push_back(loss_function);
-                
-                problem.AddResidualBlock(
-                    cost_function,
-                    loss_function,
-                    state);
-            }
-            
-            // Configure the solver
-            ceres::Solver::Options options;
-            options.linear_solver_type = ceres::DENSE_QR;
-            options.minimizer_progress_to_stdout = false;
-            options.max_num_iterations = 10;  // Fewer iterations per outer loop
-            options.function_tolerance = 1e-6;
-            
-            // Run the solver
-            ceres::Solver::Summary summary;
-            ceres::Solve(options, &problem, &summary);
-            
-            if (!summary.IsSolutionUsable()) {
-                ROS_WARN("Multi-system solver failed at iteration %d: %s", iter, summary.BriefReport().c_str());
-                continue;
-            }
-            
-            // Log intermediate solution
-            ROS_INFO("Iteration %d solution: [%.2f, %.2f, %.2f], GPS=%.2f, GLO=%.2f, cost=%.6f", 
-                    iter, state[0], state[1], state[2], state[3], state[4], summary.final_cost);
-            
-            // Calculate magnitude of position
-            double position_magnitude = sqrt(state[0]*state[0] + state[1]*state[1] + state[2]*state[2]);
-            
-            // Check if solution degraded
-            if (iter > 0 && summary.final_cost > prev_cost * 1.5) {
-                ROS_WARN("Solution degraded in iteration %d, reverting to previous", iter);
-                // Revert to previous state
-                for (int i = 0; i < 5; i++) {
-                    state[i] = prev_state[i];
-                }
-                break;
-            }
-            
-            // Check if solution is near Earth's surface
-            if (position_magnitude > 6000000.0 && position_magnitude < 7000000.0) {
-                // Convert to lat/lon/alt for further validation
-                double lat, lon, alt;
-                CoordinateConverter::ecefToLla(state[0], state[1], state[2], lat, lon, alt);
-                
-                // Validate altitude
-                if (alt > -10000.0 && alt < 10000.0) {
-                    valid_solution = true;
-                } else {
-                    ROS_WARN("Solution altitude (%.1f m) is outside reasonable range", alt);
-                    
-                    // Try opposite side of Earth if this is first iteration
-                    if (iter == 0) {
-                        state[0] = -state[0];
-                        state[1] = -state[1];
-                        state[2] = -state[2];
-                        ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
-                                state[0], state[1], state[2]);
-                    }
-                }
-            } else {
-                ROS_WARN("Position magnitude (%.1f m) is not near Earth radius", position_magnitude);
-                
-                // Try opposite side of Earth if this is first iteration
-                if (iter == 0) {
-                    state[0] = -state[0];
-                    state[1] = -state[1];
-                    state[2] = -state[2];
-                    ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
-                            state[0], state[1], state[2]);
-                }
-            }
-            
-            // Store current cost for next iteration
-            prev_cost = summary.final_cost;
-        }
-        
-        if (!valid_solution) {
-            ROS_WARN("Could not find a valid multi-system solution after multiple attempts");
-            
-            // Try GPS-only as fallback if we have enough GPS satellites
-            if (gps_idx.size() >= 4) {
-                ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
-                return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
-            }
-            
-            return false;
-        }
-        
-        // Extract solution
-        solution.x = state[0];
-        solution.y = state[1];
-        solution.z = state[2];
-        solution.clock_bias = state[3];  // GPS clock bias
-        solution.glonass_clock_bias = state[4];  // GLONASS clock bias
-        solution.num_satellites = total_usable;
-        
-        // Convert to geodetic coordinates
-        CoordinateConverter::ecefToLla(
-            solution.x, solution.y, solution.z,
-            solution.latitude, solution.longitude, solution.altitude);
-        
-        ROS_INFO("Multi-system solution: ECEF [%.2f, %.2f, %.2f] m", 
-                solution.x, solution.y, solution.z);
-        ROS_INFO("                 lat/lon [%.6f, %.6f], alt %.2f m", 
+                ceres::CostFunction* cost_function = GpsPseudorangeResidual::Create(sat);
+               ceres::LossFunction* loss_function = new ceres::HuberLoss(5.0);
+               loss_functions.push_back(loss_function);
+               
+               problem.AddResidualBlock(
+                   cost_function,
+                   loss_function,
+                   state);
+           }
+           
+           // Configure the solver - standard options for stability
+           ceres::Solver::Options options;
+           options.linear_solver_type = ceres::DENSE_QR;
+           options.minimizer_progress_to_stdout = false;
+           options.max_num_iterations = 10;  // Fewer iterations per outer loop
+           options.function_tolerance = 1e-6;
+           
+           // Run the solver
+           ceres::Solver::Summary summary;
+           ceres::Solve(options, &problem, &summary);
+           
+           if (!summary.IsSolutionUsable()) {
+               ROS_WARN("GPS-only solver failed at iteration %d: %s", iter, summary.BriefReport().c_str());
+               continue;
+           }
+           
+           // Log intermediate solution
+           ROS_INFO("Iteration %d solution: [%.2f, %.2f, %.2f], clock=%.2f, cost=%.6f", 
+                  iter, state[0], state[1], state[2], state[3], summary.final_cost);
+           
+           // Calculate magnitude of position
+           double position_magnitude = sqrt(state[0]*state[0] + state[1]*state[1] + state[2]*state[2]);
+           
+           // Check if solution degraded
+           if (iter > 0 && summary.final_cost > prev_cost * 1.5) {
+               ROS_WARN("Solution degraded in iteration %d, reverting to previous", iter);
+               // Revert to previous state
+               for (int i = 0; i < 4; i++) {
+                   state[i] = prev_state[i];
+               }
+               break;
+           }
+           
+           // Check if solution is near Earth's surface
+           if (position_magnitude > 6000000.0 && position_magnitude < 7000000.0) {
+               // Convert to lat/lon/alt for further validation
+               double lat, lon, alt;
+               CoordinateConverter::ecefToLla(state[0], state[1], state[2], lat, lon, alt);
+               
+               // Validate altitude
+               if (alt > -10000.0 && alt < 10000.0) {
+                   valid_solution = true;
+               } else {
+                   ROS_WARN("Solution altitude (%.1f m) is outside reasonable range", alt);
+                   
+                   // Try opposite side of Earth if this is first iteration
+                   if (iter == 0) {
+                       state[0] = -state[0];
+                       state[1] = -state[1];
+                       state[2] = -state[2];
+                       ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
+                              state[0], state[1], state[2]);
+                   }
+               }
+           } else {
+               ROS_WARN("Position magnitude (%.1f m) is not near Earth radius", position_magnitude);
+               
+               // Try opposite side of Earth if this is first iteration
+               if (iter == 0) {
+                   state[0] = -state[0];
+                   state[1] = -state[1];
+                   state[2] = -state[2];
+                   ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
+                         state[0], state[1], state[2]);
+               }
+           }
+           
+           // Store current cost for next iteration
+           prev_cost = summary.final_cost;
+       }
+       
+       if (!valid_solution) {
+           ROS_WARN("Could not find a valid GPS-only solution after multiple attempts");
+           return false;
+       }
+       
+       // Print output state for debugging
+       ROS_INFO("GPS-only solution state: [%.2f, %.2f, %.2f], clock=%.2f", 
+               state[0], state[1], state[2], state[3]);
+       
+       // Extract solution
+       solution.x = state[0];
+       solution.y = state[1];
+       solution.z = state[2];
+       solution.clock_bias = state[3];
+       solution.glonass_clock_bias = 0.0;  // Not used in GPS-only mode
+       solution.num_satellites = gps_idx.size();
+       
+       // Convert to geodetic coordinates
+       CoordinateConverter::ecefToLla(
+           solution.x, solution.y, solution.z,
+           solution.latitude, solution.longitude, solution.altitude);
+       
+       ROS_INFO("GPS-only solution: ECEF [%.2f, %.2f, %.2f] m, clock bias %.2f m", 
+                solution.x, solution.y, solution.z, solution.clock_bias);
+       ROS_INFO("             lat/lon [%.6f, %.6f], alt %.2f m", 
                 solution.latitude * 180.0/M_PI, solution.longitude * 180.0/M_PI, solution.altitude);
-        ROS_INFO("                 clocks: GPS=%.2f m, GLONASS=%.2f m", 
-                solution.clock_bias, solution.glonass_clock_bias);
-        
-        // Calculate DOP values
-        std::vector<uint32_t> all_idx;
-        all_idx.insert(all_idx.end(), gps_idx.begin(), gps_idx.end());
-        all_idx.insert(all_idx.end(), glo_idx.begin(), glo_idx.end());
-        calculateMultiSystemDOP(satellites, all_idx, solution);
-        
-        return true;
-    }
-    
-    // Solve for velocity using GPS satellites only with RTKLIB-style Doppler processing
-    bool solveGpsOnlyVelocityWLS_RTKLIB(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution) {
-        // Create a vector of indices for GPS satellites with valid Doppler
-        std::vector<uint32_t> good_idx;
-        
-        // Log all available Doppler measurements
-        ROS_INFO("All GPS Doppler measurements:");
-        for (uint32_t i = 0; i < satellites.size(); ++i) {
-            const auto& sat = satellites[i];
-            if (sat.system == GPS && sat.doppler != 0.0) {
-                ROS_INFO("  Sat %d: Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°", 
-                        sat.sat_id, sat.doppler, sat.cn0, sat.elevation * 180.0/M_PI);
-            }
-        }
-        
-        // Select satellites for velocity calculation
-        for (uint32_t i = 0; i < satellites.size(); ++i) {
-            const auto& sat = satellites[i];
-            if (sat.system == GPS && 
-                sat.doppler != 0.0 &&
-                std::isfinite(sat.doppler) &&  // Check for NaN/Inf
-                sat.elevation * 180.0/M_PI >= cut_off_degree_) {
-                
-                // Filter out satellites with very large clock bias
-                if (std::abs(sat.sat_clock_bias * SPEED_OF_LIGHT) > 100000.0) {
-                    ROS_WARN("Skipping satellite %d with large clock bias (%.2f m) for velocity", 
-                             sat.sat_id, sat.sat_clock_bias * SPEED_OF_LIGHT);
-                    continue;
-                }
-                
-                good_idx.push_back(i);
-            }
-        }
-        
-        if (good_idx.size() < 4) {
-            ROS_WARN("Too few GPS satellites with valid Doppler for velocity: %zu (need 4)", good_idx.size());
-            return false;
-        }
-        
-        // Print selected Doppler values for velocity calculation
-        ROS_INFO("GPS satellites selected for velocity calculation:");
-        for (const auto& idx : good_idx) {
-            const auto& sat = satellites[idx];
-            ROS_INFO("  Satellite %d: Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°", 
-                    sat.sat_id, sat.doppler, sat.cn0, sat.elevation * 180.0/M_PI);
-        }
-        
-        // 4-parameter state for GPS-only velocity: [vx, vy, vz, clock_drift]
-        double velocity_state[4] = {0.0, 0.0, 0.0, 0.0};
-        
-        // Initialize with zeros for better stability
-        if (initialized_) {
-            // Check if current velocity is reasonable
-            double current_speed = sqrt(
-                current_solution_.vx * current_solution_.vx + 
-                current_solution_.vy * current_solution_.vy + 
-                current_solution_.vz * current_solution_.vz);
-            
-            if (current_speed > 0.001 && current_speed < max_velocity_/2.0) {
-                // Only use current velocity if it's reasonable
-                velocity_state[0] = current_solution_.vx;
-                velocity_state[1] = current_solution_.vy;
-                velocity_state[2] = current_solution_.vz;
-            }
-            
-            // Initialize clock drift to zero (don't propagate from previous solution)
-        }
-        
-        // Set up the Ceres problem
-        ceres::Problem problem;
-        
-        // Vector to store loss functions to manage their memory
-        std::vector<ceres::LossFunction*> loss_functions;
-        
-        // Add residual blocks for each GPS satellite
-        for (const auto& idx : good_idx) {
-            const auto& sat = satellites[idx];
-            
-            // Create a copy with adjusted standard deviation based on CN0
-            SatelliteInfo mod_sat = sat;
-            
-            // Higher CN0 means more precise Doppler
-            double cn0_scale = std::max(0.5, std::min(2.0, sat.cn0 / 35.0));
-            mod_sat.dopp_std = 2.0 / cn0_scale;  // Base std of 2 Hz, scaled by CN0
-            
-            // Using RTKLIB-style Doppler residual
-            ceres::CostFunction* cost_function = GpsDopplerResidual::Create(mod_sat);
-            ceres::LossFunction* loss_function = new ceres::HuberLoss(3.0);
-            loss_functions.push_back(loss_function);
-            
-            problem.AddResidualBlock(
-                cost_function,
-                loss_function,
-                velocity_state);
-        }
-        
-        // Configure the solver
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        options.minimizer_progress_to_stdout = false;
-        options.max_num_iterations = 20;
-        options.function_tolerance = 1e-8;
-        
-        // Run the solver
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-        
-        if (!summary.IsSolutionUsable()) {
-            ROS_WARN("GPS-only velocity solver failed: %s", summary.BriefReport().c_str());
-            return false;
-        }
-        
-        // Print raw solution first
-        double raw_magnitude = sqrt(
-            velocity_state[0]*velocity_state[0] + 
-            velocity_state[1]*velocity_state[1] + 
-            velocity_state[2]*velocity_state[2]);
-            
-        ROS_INFO("Raw GPS velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), clock drift=%.2f m/s",
-                velocity_state[0], velocity_state[1], velocity_state[2], 
-                raw_magnitude * 3.6, velocity_state[3]);
-        
-        // Check for unrealistic clock drift (larger than 1 ppm of c)
-        double max_reasonable_drift = SPEED_OF_LIGHT * 1e-6;  // ~300 m/s
-        if (std::abs(velocity_state[3]) > max_reasonable_drift) {
-            ROS_WARN("Unrealistic clock drift: %.2f m/s. Limiting to %.2f m/s", 
-                     velocity_state[3], max_reasonable_drift);
-            velocity_state[3] = velocity_state[3] > 0 ? 
-                max_reasonable_drift : -max_reasonable_drift;
-        }
-        
-        // For pedestrian data, velocities should be under max_velocity_
-        if (raw_magnitude > max_velocity_) {
-            ROS_WARN("Velocity magnitude %.2f m/s exceeds expected pedestrian speed (%.1f m/s). Limiting velocity.",
-                     raw_magnitude, max_velocity_);
-            
-            // Scale down velocity to max_velocity_
-            double scale = max_velocity_ / raw_magnitude;
-            velocity_state[0] *= scale;
-            velocity_state[1] *= scale;
-            velocity_state[2] *= scale;
-            
-            // Recalculate magnitude
-            double limited_magnitude = sqrt(
-                velocity_state[0]*velocity_state[0] + 
-                velocity_state[1]*velocity_state[1] + 
-                velocity_state[2]*velocity_state[2]);
-                
-            ROS_INFO("Limited velocity: [%.2f, %.2f, %.2f] m/s (%.1f km/h)",
-                    velocity_state[0], velocity_state[1], velocity_state[2], 
-                    limited_magnitude * 3.6);
-        }
-        
-        // Extract solution
-        solution.vx = velocity_state[0];
-        solution.vy = velocity_state[1];
-        solution.vz = velocity_state[2];
-        solution.clock_drift = velocity_state[3];
-        
-        double final_magnitude = sqrt(
-            solution.vx*solution.vx + 
-            solution.vy*solution.vy + 
-            solution.vz*solution.vz);
-            
-        ROS_INFO("Final GPS-only velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), clock drift=%.2f m/s", 
-                 solution.vx, solution.vy, solution.vz, 
-                 final_magnitude * 3.6,  // Convert to km/h
-                 solution.clock_drift);
-        
-        return true;
-    }
-    
-    // Solve for velocity using multiple GNSS systems with RTKLIB-style Doppler processing
-    bool solveMultiSystemVelocityWLS_RTKLIB(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution) {
-        // Log all available Doppler measurements first
-        ROS_INFO("All available Doppler measurements:");
-        for (uint32_t i = 0; i < satellites.size(); ++i) {
-            const auto& sat = satellites[i];
-            if (sat.doppler != 0.0) {
-                std::string sys_name = (sat.system == GPS) ? "GPS" : 
-                                     ((sat.system == GLONASS) ? "GLONASS" : "Other");
-                                     
-                ROS_INFO("  Sat %d (%s): Doppler=%.1f Hz, CN0=%.1f dB-Hz, Elev=%.1f°", 
-                        sat.sat_id, sys_name.c_str(), sat.doppler, sat.cn0,
-                        sat.elevation * 180.0/M_PI);
-            }
-        }
-        
-        // Create vectors for satellite selection
-        std::vector<uint32_t> good_idx;
-        int gps_count = 0, glonass_count = 0;
-        
-        // Select satellites for velocity calculation
-        for (uint32_t i = 0; i < satellites.size(); ++i) {
-            const auto& sat = satellites[i];
-            if (sat.doppler != 0.0 &&
-                std::isfinite(sat.doppler) &&  // Check for NaN/Inf
-                sat.elevation * 180.0/M_PI >= cut_off_degree_) {
-                
-                // Filter out satellites with very large clock bias
-                if (std::abs(sat.sat_clock_bias * SPEED_OF_LIGHT) > 100000.0) {
-                    ROS_WARN("Skipping satellite %d with large clock bias (%.2f m) for velocity", 
-                             sat.sat_id, sat.sat_clock_bias * SPEED_OF_LIGHT);
-                    continue;
-                }
-                
-                if (sat.system == GPS) {
-                    gps_count++;
-                } else if (sat.system == GLONASS) {
-                    glonass_count++;
-                }
-                
-                good_idx.push_back(i);
-            }
-        }
-        
-        ROS_INFO("Selected %d GPS and %d GLONASS satellites for velocity calculation",
-                 gps_count, glonass_count);
-        
-        // Need at least 5 satellites for multi-system (one for system time offset)
-        if (good_idx.size() < 5 || gps_count < 1 || glonass_count < 1) {
-            ROS_WARN("Insufficient satellites for multi-system velocity: %zu GPS, %d GLONASS (need 5 total with at least 1 from each)",
-                     good_idx.size(), gps_count, glonass_count);
-                     
-            // Try GPS-only as fallback
-            ROS_INFO("Trying GPS-only velocity as fallback");
-            return solveGpsOnlyVelocityWLS_RTKLIB(satellites, solution);
-        }
-        
-        // 5-parameter state: [vx, vy, vz, gps_clock_drift, glonass_clock_drift]
-        double velocity_state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
-        
-        // Initialize with zeros for better stability
-        if (initialized_) {
-            // Check if current velocity is reasonable
-            double current_speed = sqrt(
-                current_solution_.vx * current_solution_.vx + 
-                current_solution_.vy * current_solution_.vy + 
-                current_solution_.vz * current_solution_.vz);
-            
-            if (current_speed > 0.001 && current_speed < max_velocity_/2.0) {
-                // Only use current velocity if it's reasonable
-                velocity_state[0] = current_solution_.vx;
-                velocity_state[1] = current_solution_.vy;
-                velocity_state[2] = current_solution_.vz;
-            }
-            
-            // Initialize clock drifts to zero (don't propagate from previous solution)
-        }
-        
-        // Set up the Ceres problem
-        ceres::Problem problem;
-        std::vector<ceres::LossFunction*> loss_functions;
-        
-        // Add residual blocks for each satellite
-        for (const auto& idx : good_idx) {
-            const auto& sat = satellites[idx];
-            
-            // Create a copy with adjusted standard deviation based on CN0
-            SatelliteInfo mod_sat = sat;
-            
-            // Higher CN0 means more precise Doppler
-            double cn0_scale = std::max(0.5, std::min(2.0, sat.cn0 / 35.0));
-            mod_sat.dopp_std = 2.0 / cn0_scale;  // Base std of 2 Hz, scaled by CN0
-            
-            // Using RTKLIB-style Doppler residual
-            ceres::CostFunction* cost_function = MultiSystemDopplerResidual::Create(mod_sat);
-            ceres::LossFunction* loss_function = new ceres::HuberLoss(3.0);
-            loss_functions.push_back(loss_function);
-            
-            problem.AddResidualBlock(
-                cost_function,
-                loss_function,
-                velocity_state);
-        }
-        
-        // Configure the solver
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        options.minimizer_progress_to_stdout = false;
-        options.max_num_iterations = 20;
-        options.function_tolerance = 1e-8;
-        
-        // Run the solver
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, &problem, &summary);
-        
-        if (!summary.IsSolutionUsable()) {
-            ROS_WARN("Multi-system velocity solver failed: %s", summary.BriefReport().c_str());
-            
-            // Try GPS-only as fallback
-            ROS_INFO("Trying GPS-only velocity as fallback");
-            return solveGpsOnlyVelocityWLS_RTKLIB(satellites, solution);
-        }
-        
-        // Print raw solution first
-        double raw_magnitude = sqrt(
-            velocity_state[0]*velocity_state[0] + 
-            velocity_state[1]*velocity_state[1] + 
-            velocity_state[2]*velocity_state[2]);
-            
-        ROS_INFO("Raw multi-system velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), GPS drift=%.2f m/s, GLO drift=%.2f m/s",
-                velocity_state[0], velocity_state[1], velocity_state[2], 
-                raw_magnitude * 3.6, velocity_state[3], velocity_state[4]);
-        
-        // Check for unrealistic clock drifts (larger than 1 ppm of c)
-        double max_reasonable_drift = SPEED_OF_LIGHT * 1e-6;  // ~300 m/s
-        
-        // GPS clock drift
-        if (std::abs(velocity_state[3]) > max_reasonable_drift) {
-            ROS_WARN("Unrealistic GPS clock drift: %.2f m/s. Limiting to %.2f m/s", 
-                     velocity_state[3], max_reasonable_drift);
-            velocity_state[3] = velocity_state[3] > 0 ? 
-                max_reasonable_drift : -max_reasonable_drift;
-        }
-        
-        // GLONASS clock drift
-        if (std::abs(velocity_state[4]) > max_reasonable_drift) {
-            ROS_WARN("Unrealistic GLONASS clock drift: %.2f m/s. Limiting to %.2f m/s", 
-                     velocity_state[4], max_reasonable_drift);
-            velocity_state[4] = velocity_state[4] > 0 ? 
-                max_reasonable_drift : -max_reasonable_drift;
-        }
-        
-        // For pedestrian data, velocities should be under max_velocity_
-        if (raw_magnitude > max_velocity_) {
-            ROS_WARN("Velocity magnitude %.2f m/s exceeds expected pedestrian speed (%.1f m/s). Limiting velocity.",
-                     raw_magnitude, max_velocity_);
-            
-            // Scale down velocity to max_velocity_
-            double scale = max_velocity_ / raw_magnitude;
-            velocity_state[0] *= scale;
-            velocity_state[1] *= scale;
-            velocity_state[2] *= scale;
-            
-            // Recalculate magnitude
-            double limited_magnitude = sqrt(
-                velocity_state[0]*velocity_state[0] + 
-                velocity_state[1]*velocity_state[1] + 
-                velocity_state[2]*velocity_state[2]);
-                
-            ROS_INFO("Limited velocity: [%.2f, %.2f, %.2f] m/s (%.1f km/h)",
-                    velocity_state[0], velocity_state[1], velocity_state[2], 
-                    limited_magnitude * 3.6);
-        }
-        
-        // Extract solution
-        solution.vx = velocity_state[0];
-        solution.vy = velocity_state[1];
-        solution.vz = velocity_state[2];
-        solution.clock_drift = velocity_state[3];  // Store GPS clock drift
-        
-        double final_magnitude = sqrt(
-            solution.vx*solution.vx + 
-            solution.vy*solution.vy + 
-            solution.vz*solution.vz);
-            
-        ROS_INFO("Final multi-system velocity solution: [%.2f, %.2f, %.2f] m/s (%.1f km/h), GPS drift=%.2f m/s, GLO drift=%.2f m/s", 
-                 solution.vx, solution.vy, solution.vz, 
-                 final_magnitude * 3.6,  // Convert to km/h
-                 velocity_state[3], velocity_state[4]);
-        
-        return true;
-    }
-    
-    // Calculate DOP values for GPS-only solutions
-    void calculateGpsDOP(const std::vector<SatelliteInfo>& satellites, 
-                         const std::vector<uint32_t>& good_idx,
-                         GnssSolution& solution) {
-        // We need the geometry matrix for DOP calculation
-        Eigen::MatrixXd G(good_idx.size(), 4);  // 4 params for GPS-only
-        
-        // Fill the geometry matrix
-        for (size_t i = 0; i < good_idx.size(); i++) {
-            const auto& sat = satellites[good_idx[i]];
-            
-            // Unit vector from receiver to satellite
-            double dx = sat.sat_pos_x - solution.x;
-            double dy = sat.sat_pos_y - solution.y;
-            double dz = sat.sat_pos_z - solution.z;
-            double range = sqrt(dx*dx + dy*dy + dz*dz);
-            
-            // Normalize to unit vector
-            if (range > 1e-10) {
-                dx /= range;
-                dy /= range;
-                dz /= range;
-            }
-            
-            // Fill the geometry matrix
-            G(i, 0) = -dx;  // x component
-            G(i, 1) = -dy;  // y component
-            G(i, 2) = -dz;  // z component
-            G(i, 3) = 1.0;  // clock bias
-        }
-        
-        // Create weight matrix (diagonal) based on satellite weights
-        Eigen::MatrixXd W = Eigen::MatrixXd::Identity(good_idx.size(), good_idx.size());
-        for (size_t i = 0; i < good_idx.size(); i++) {
-            W(i, i) = satellites[good_idx[i]].weight;
-        }
-        
-        // Compute the covariance matrix
-        Eigen::MatrixXd cov_matrix;
-        try {
-            cov_matrix = (G.transpose() * W * G).inverse();
-            
-            // Calculate DOP values
-            solution.gdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2) + cov_matrix(3,3));
-            solution.pdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2));
-            solution.hdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1));
-            solution.vdop = sqrt(cov_matrix(2,2));
-            solution.tdop = sqrt(cov_matrix(3,3));
-            
-            // Store the covariance
-            solution.covariance = cov_matrix;
-            
-            ROS_INFO("DOP values: GDOP=%.2f, PDOP=%.2f, HDOP=%.2f, VDOP=%.2f, TDOP=%.2f",
-                    solution.gdop, solution.pdop, solution.hdop, solution.vdop, solution.tdop);
-        } catch (const std::exception& e) {
-            ROS_WARN("Exception in GPS-only DOP calculation: %s", e.what());
-            // Set default values
-            solution.gdop = 99.9;
-            solution.pdop = 99.9;
-            solution.hdop = 99.9;
-            solution.vdop = 99.9;
-            solution.tdop = 99.9;
-            
-            // Set identity covariance as fallback
-            solution.covariance = Eigen::Matrix<double, 4, 4>::Identity();
-        }
-    }
-    
-    // Calculate DOP values for multi-system solutions
-    void calculateMultiSystemDOP(const std::vector<SatelliteInfo>& satellites, 
-                                const std::vector<uint32_t>& good_idx,
-                                GnssSolution& solution) {
-        // For multi-system DOP, we'll use a modified G matrix that includes both clock bias terms
-        Eigen::MatrixXd G(good_idx.size(), 5);  // 5 params for multi-system
-        
-        // Fill the geometry matrix
-        for (size_t i = 0; i < good_idx.size(); i++) {
-            const auto& sat = satellites[good_idx[i]];
-            
-            // Unit vector from receiver to satellite
-            double dx = sat.sat_pos_x - solution.x;
-            double dy = sat.sat_pos_y - solution.y;
-            double dz = sat.sat_pos_z - solution.z;
-            double range = sqrt(dx*dx + dy*dy + dz*dz);
-            
-            // Normalize to unit vector
-            if (range > 1e-10) {
-                dx /= range;
-                dy /= range;
-                dz /= range;
-            }
-            
-            // Fill the geometry matrix
-            G(i, 0) = -dx;  // x component
-            G(i, 1) = -dy;  // y component
-            G(i, 2) = -dz;  // z component
-            
-            // Set clock bias column based on system
-            if (sat.system == GPS) {
-                G(i, 3) = 1.0;  // GPS clock bias
-                G(i, 4) = 0.0;  // No GLONASS contribution
-            } else if (sat.system == GLONASS) {
-                G(i, 3) = 0.0;  // No GPS contribution 
-                G(i, 4) = 1.0;  // GLONASS clock bias
-            } else {
-                // Default to GPS for other systems
-                G(i, 3) = 1.0;
-                G(i, 4) = 0.0;
-            }
-        }
-        
-        // Create weight matrix (diagonal) based on satellite weights
-        Eigen::MatrixXd W = Eigen::MatrixXd::Identity(good_idx.size(), good_idx.size());
-        for (size_t i = 0; i < good_idx.size(); i++) {
-            W(i, i) = satellites[good_idx[i]].weight;
-        }
-        
-        // Compute the covariance matrix
-        Eigen::MatrixXd cov_matrix;
-        try {
-            cov_matrix = (G.transpose() * W * G).inverse();
-            
-            // Calculate DOP values (focusing on position)
-            solution.gdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2) + 
-                                cov_matrix(3,3) + cov_matrix(4,4));
-            solution.pdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2));
-            solution.hdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1));
-            solution.vdop = sqrt(cov_matrix(2,2));
-            solution.tdop = sqrt(cov_matrix(3,3) + cov_matrix(4,4));  // Combined time DOP
-            
-            // Store the covariance, but since we're using a larger matrix,
-            // we need to extract the 4x4 part for compatibility
-            Eigen::Matrix<double, 4, 4> reduced_cov = Eigen::Matrix<double, 4, 4>::Zero();
-            for (int i = 0; i < 3; i++) {
-                for (int j = 0; j < 3; j++) {
-                    reduced_cov(i, j) = cov_matrix(i, j);
-                }
-            }
-            // Use the GPS clock bias for the 4th component
-            reduced_cov(3, 3) = cov_matrix(3, 3);
-            solution.covariance = reduced_cov;
-            
-            ROS_INFO("DOP values: GDOP=%.2f, PDOP=%.2f, HDOP=%.2f, VDOP=%.2f, TDOP=%.2f",
-                    solution.gdop, solution.pdop, solution.hdop, solution.vdop, solution.tdop);
-        } catch (const std::exception& e) {
-            ROS_WARN("Exception in multi-system DOP calculation: %s", e.what());
-            // Set default values
-            solution.gdop = 99.9;
-            solution.pdop = 99.9;
-            solution.hdop = 99.9;
-            solution.vdop = 99.9;
-            solution.tdop = 99.9;
-            
-            // Set identity covariance as fallback
-            solution.covariance = Eigen::Matrix<double, 4, 4>::Identity();
-        }
-    }
-    
-    void debugSatelliteGeometry(const std::vector<SatelliteInfo>& satellites) {
-        // Skip if we don't have satellites
-        if (satellites.empty()) {
-            return;
-        }
-        
-        // Debug only the first satellite position computation in detail
-        const auto& first_sat = satellites[0];
-        
-        ROS_INFO("Detailed satellite geometry debugging:");
-        ROS_INFO("  Receiver position: [%.2f, %.2f, %.2f]", 
-                current_solution_.x, current_solution_.y, current_solution_.z);
-        
-        // Convert to LLA for better understanding
-        double lat, lon, alt;
-        CoordinateConverter::ecefToLla(
-            current_solution_.x, current_solution_.y, current_solution_.z, 
-            lat, lon, alt);
-        
-        ROS_INFO("  Receiver LLA: [%.6f°, %.6f°, %.2fm]", 
-                lat * 180.0/M_PI, lon * 180.0/M_PI, alt);
-        
-        // Validate the ECEF position by converting back
-        double x, y, z;
-        CoordinateConverter::llaToEcef(lat, lon, alt, x, y, z);
-        
-        ROS_INFO("  Converted back to ECEF: [%.2f, %.2f, %.2f] (validation)", x, y, z);
-        ROS_INFO("  Difference from original: [%.6f, %.6f, %.6f]", 
-                x - current_solution_.x, y - current_solution_.y, z - current_solution_.z);
-        
-        // Show satellite position and derived info
-        std::string system_str;
-        switch(first_sat.system) {
-            case GPS: system_str = "GPS"; break;
-            case GLONASS: system_str = "GLONASS"; break;
-            case GALILEO: system_str = "GALILEO"; break;
-            case BEIDOU: system_str = "BEIDOU"; break;
-            default: system_str = "UNKNOWN"; break;
-        }
-        
-        ROS_INFO("  Satellite ID: %d (system: %s)", first_sat.sat_id, system_str.c_str());
-        ROS_INFO("  Satellite position: [%.2f, %.2f, %.2f]", 
-                first_sat.sat_pos_x, first_sat.sat_pos_y, first_sat.sat_pos_z);
-        
-        // Compute and show receiver-to-satellite vector and range
-        double dx = first_sat.sat_pos_x - current_solution_.x;
-        double dy = first_sat.sat_pos_y - current_solution_.y;
-        double dz = first_sat.sat_pos_z - current_solution_.z;
-        double range = sqrt(dx*dx + dy*dy + dz*dz);
-        
-        ROS_INFO("  Vector to satellite: [%.2f, %.2f, %.2f], range: %.2f km", 
-                dx, dy, dz, range/1000.0);
-        
-        // Show computed elevation and azimuth
-        ROS_INFO("  Computed elevation: %.2f° (%.6f rad)", 
-                first_sat.elevation * 180.0/M_PI, first_sat.elevation);
-        ROS_INFO("  Computed azimuth: %.2f° (%.6f rad)", 
-                first_sat.azimuth * 180.0/M_PI, first_sat.azimuth);
-        
-        // Compute ENU vector directly for validation
-        // Rotation matrix from ECEF to ENU
-        double sin_lat = sin(lat), cos_lat = cos(lat);
-        double sin_lon = sin(lon), cos_lon = cos(lon);
-        
-        // Rotate ECEF vector to ENU
-        double e = -sin_lon * dx + cos_lon * dy;
-        double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
-        double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
-        
-        ROS_INFO("  ENU vector: E=%.2f, N=%.2f, U=%.2f", e, n, u);
-        
-        // Double-check elevation calculation
-        double horiz_dist = sqrt(e*e + n*n);
-        double check_elev = atan2(u, horiz_dist);
-        
-        ROS_INFO("  Validation elevation: %.2f°", check_elev * 180.0/M_PI);
-        ROS_INFO("  Difference: %.6f°", (check_elev - first_sat.elevation) * 180.0/M_PI);
-    }
-    
-    void publishResults(const std_msgs::Header& header, const GnssSolution& solution) {
-        // 1. Publish NavSatFix message
-        sensor_msgs::NavSatFix navsatfix;
-        navsatfix.header = header;
-        navsatfix.status.status = sensor_msgs::NavSatStatus::STATUS_FIX;
-        navsatfix.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
-        navsatfix.latitude = solution.latitude * 180.0 / M_PI;  // Convert to degrees
-        navsatfix.longitude = solution.longitude * 180.0 / M_PI;
-        navsatfix.altitude = solution.altitude;
-        
-        // Fill in covariance (position only)
-        // Map from ECEF covariance to lat/lon/alt (simplified)
-        navsatfix.position_covariance[0] = solution.covariance(0, 0);
-        navsatfix.position_covariance[4] = solution.covariance(1, 1);
-        navsatfix.position_covariance[8] = solution.covariance(2, 2);
-        navsatfix.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
-        
-        // 2. Publish Odometry message
-        nav_msgs::Odometry odom;
-        odom.header = header;
-        odom.header.frame_id = "ecef";
-        odom.child_frame_id = frame_id_;
-        
-        // Set position in ECEF
-        odom.pose.pose.position.x = solution.x;
-        odom.pose.pose.position.y = solution.y;
-        odom.pose.pose.position.z = solution.z;
-        odom.pose.pose.orientation.w = 1.0;  // Identity quaternion
-        
-        // Set velocity in ECEF
-        odom.twist.twist.linear.x = solution.vx;
-        odom.twist.twist.linear.y = solution.vy;
-        odom.twist.twist.linear.z = solution.vz;
-        
-        // Set covariance
-        for (int i = 0; i < 3; ++i) {
-            for (int j = 0; j < 3; ++j) {
-                odom.pose.covariance[i * 6 + j] = solution.covariance(i, j);
-            }
-        }
-        
-        // 3. Publish PoseWithCovarianceStamped message (ENU format)
-        geometry_msgs::PoseWithCovarianceStamped pose;
-        pose.header = header;
-        pose.header.frame_id = "map";  // Local ENU frame
-        
-        // Convert ECEF to local ENU
-        // Need a reference point for ENU - using the first fix
-        static bool reference_set = false;
-        static double ref_lat, ref_lon, ref_alt;
-        static double ref_ecef_x, ref_ecef_y, ref_ecef_z;
-        
-        if (!reference_set && initialized_) {
-            ref_lat = solution.latitude;
-            ref_lon = solution.longitude;
-            ref_alt = solution.altitude;
-            ref_ecef_x = solution.x;
-            ref_ecef_y = solution.y;
-            ref_ecef_z = solution.z;
-            reference_set = true;
-            
-            ROS_INFO("Set ENU reference: Lat=%.7f°, Lon=%.7f°, Alt=%.2fm", 
-                    ref_lat * 180.0 / M_PI, ref_lon * 180.0 / M_PI, ref_alt);
-        }
-        
-        if (reference_set) {
-            // Calculate ENU position relative to reference
-            double dx = solution.x - ref_ecef_x;
-            double dy = solution.y - ref_ecef_y;
-            double dz = solution.z - ref_ecef_z;
-            
-            // Rotation matrix from ECEF to ENU
-            double sin_lat = sin(ref_lat);
-            double cos_lat = cos(ref_lat);
-            double sin_lon = sin(ref_lon);
-            double cos_lon = cos(ref_lon);
-            
-            // Rotate ECEF displacement to ENU
-            double e = -sin_lon * dx + cos_lon * dy;
-            double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
-            double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
-            
-            pose.pose.pose.position.x = e;
-            pose.pose.pose.position.y = n;
-            pose.pose.pose.position.z = u;
-            pose.pose.pose.orientation.w = 1.0;  // Identity quaternion
-            
-            // Transform velocity from ECEF to ENU
-            double ve = -sin_lon * solution.vx + cos_lon * solution.vy;
-            double vn = -sin_lat * cos_lon * solution.vx - sin_lat * sin_lon * solution.vy + cos_lat * solution.vz;
-            double vu = cos_lat * cos_lon * solution.vx + cos_lat * sin_lon * solution.vy + sin_lat * solution.vz;
-            
-            // Transform covariance from ECEF to ENU (simplified)
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    pose.pose.covariance[i * 6 + j] = solution.covariance(i, j);
-                }
-            }
-        } else {
-            // Until we have a reference, just set zeros
-            pose.pose.pose.position.x = 0.0;
-            pose.pose.pose.position.y = 0.0;
-            pose.pose.pose.position.z = 0.0;
-            pose.pose.pose.orientation.w = 1.0;
-        }
-        
-        // Publish all messages
-        navsatfix_pub_.publish(navsatfix);
-        odom_pub_.publish(odom);
-        pose_pub_.publish(pose);
-    }
+       
+       // Calculate DOP values
+       calculateGpsDOP(satellites, gps_idx, solution);
+       
+       return true;
+   }
+   
+   // Solve for position using multiple GNSS systems
+   bool solveMultiSystemWLS(const std::vector<SatelliteInfo>& satellites, GnssSolution& solution, bool use_all_satellites = false) {
+       ROS_INFO("Starting multi-system WLS solver with %zu total satellites", satellites.size());
+       
+       // Create vectors of indices for satellites by system
+       std::vector<uint32_t> gps_idx, glo_idx;
+       
+       // Apply elevation filter unless in initialization mode
+       for (uint32_t i = 0; i < satellites.size(); ++i) {
+           if (use_all_satellites || satellites[i].elevation * 180.0/M_PI >= cut_off_degree_) {
+               if (satellites[i].system == GPS) {
+                   gps_idx.push_back(i);
+               } else if (satellites[i].system == GLONASS) {
+                   glo_idx.push_back(i);
+               }
+           }
+       }
+       
+       ROS_INFO("Satellites by system: GPS=%zu, GLONASS=%zu", gps_idx.size(), glo_idx.size());
+       
+       // Need at least 5 satellites for multi-system (5 parameters)
+       size_t total_usable = gps_idx.size() + glo_idx.size();
+       if (total_usable < 5) {
+           ROS_WARN("Too few satellites for multi-system solution: %zu (need at least 5)", total_usable);
+           
+           // Try GPS-only as fallback if we have enough GPS satellites
+           if (gps_idx.size() >= 4) {
+               ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
+               return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
+           }
+           
+           return false;
+       }
+       
+       // Need at least 1 satellite from each system
+       if (gps_idx.size() == 0 || glo_idx.size() == 0) {
+           ROS_WARN("Need at least 1 satellite from each system for multi-system solution");
+           
+           // Try GPS-only as fallback if we have enough GPS satellites
+           if (gps_idx.size() >= 4) {
+               ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
+               return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
+           }
+           
+           return false;
+       }
+       
+       // 5-parameter state: [x, y, z, gps_clock_bias, glonass_clock_bias]
+       double state[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+       
+       // Use the Earth surface as a starting point if not initialized
+       if (!initialized_) {
+           // Start at a point on Earth's surface using proper WGS84 model
+           double lat_rad = initial_latitude_ * M_PI / 180.0;
+           double lon_rad = initial_longitude_ * M_PI / 180.0;
+           double N = WGS84_a / sqrt(1.0 - WGS84_e_sq * sin(lat_rad) * sin(lat_rad));
+           double x0 = (N + initial_altitude_) * cos(lat_rad) * cos(lon_rad);
+           double y0 = (N + initial_altitude_) * cos(lat_rad) * sin(lon_rad);
+           double z0 = (N * (1.0 - WGS84_e_sq) + initial_altitude_) * sin(lat_rad);
+           
+           state[0] = x0;
+           state[1] = y0;
+           state[2] = z0;
+           state[3] = 0.0;  // GPS clock bias
+           state[4] = 0.0;  // GLONASS clock bias
+           
+           ROS_INFO("Starting with Earth surface position: [%.1f, %.1f, %.1f]", x0, y0, z0);
+       } else {
+           // Use current solution
+           state[0] = current_solution_.x;
+           state[1] = current_solution_.y;
+           state[2] = current_solution_.z;
+           state[3] = current_solution_.clock_bias;
+           state[4] = current_solution_.glonass_clock_bias;
+           
+           ROS_INFO("Using current position as initial state: [%.1f, %.1f, %.1f], GPS clock=%.1f, GLO clock=%.1f",
+                   state[0], state[1], state[2], state[3], state[4]);
+       }
+       
+       // Use multiple iterations for better convergence
+       bool valid_solution = false;
+       double prev_state[5];
+       double prev_cost = 1e10;
+       
+       for (int iter = 0; iter < 3 && !valid_solution; iter++) {
+           // Save current state for validation
+           for (int i = 0; i < 5; i++) {
+               prev_state[i] = state[i];
+           }
+           
+           // Set up the Ceres problem
+           ceres::Problem problem;
+           
+           // Vector to store loss functions to manage their memory
+           std::vector<ceres::LossFunction*> loss_functions;
+           
+           // Add residual blocks for each satellite
+           for (uint32_t i = 0; i < satellites.size(); ++i) {
+               const auto& sat = satellites[i];
+               
+               // Skip satellites that don't pass elevation filter unless in initialization mode
+               if (!use_all_satellites && sat.elevation * 180.0/M_PI < cut_off_degree_) {
+                   continue;
+               }
+               
+               ceres::CostFunction* cost_function = MultiSystemPseudorangeResidual::Create(sat);
+               ceres::LossFunction* loss_function = new ceres::HuberLoss(5.0);
+               loss_functions.push_back(loss_function);
+               
+               problem.AddResidualBlock(
+                   cost_function,
+                   loss_function,
+                   state);
+           }
+           
+           // Configure the solver
+           ceres::Solver::Options options;
+           options.linear_solver_type = ceres::DENSE_QR;
+           options.minimizer_progress_to_stdout = false;
+           options.max_num_iterations = 10;  // Fewer iterations per outer loop
+           options.function_tolerance = 1e-6;
+           
+           // Run the solver
+           ceres::Solver::Summary summary;
+           ceres::Solve(options, &problem, &summary);
+           
+           if (!summary.IsSolutionUsable()) {
+               ROS_WARN("Multi-system solver failed at iteration %d: %s", iter, summary.BriefReport().c_str());
+               continue;
+           }
+           
+           // Log intermediate solution
+           ROS_INFO("Iteration %d solution: [%.2f, %.2f, %.2f], GPS=%.2f, GLO=%.2f, cost=%.6f", 
+                   iter, state[0], state[1], state[2], state[3], state[4], summary.final_cost);
+           
+           // Calculate magnitude of position
+           double position_magnitude = sqrt(state[0]*state[0] + state[1]*state[1] + state[2]*state[2]);
+           
+           // Check if solution degraded
+           if (iter > 0 && summary.final_cost > prev_cost * 1.5) {
+               ROS_WARN("Solution degraded in iteration %d, reverting to previous", iter);
+               // Revert to previous state
+               for (int i = 0; i < 5; i++) {
+                   state[i] = prev_state[i];
+               }
+               break;
+           }
+           
+           // Check if solution is near Earth's surface
+           if (position_magnitude > 6000000.0 && position_magnitude < 7000000.0) {
+               // Convert to lat/lon/alt for further validation
+               double lat, lon, alt;
+               CoordinateConverter::ecefToLla(state[0], state[1], state[2], lat, lon, alt);
+               
+               // Validate altitude
+               if (alt > -10000.0 && alt < 10000.0) {
+                   valid_solution = true;
+               } else {
+                   ROS_WARN("Solution altitude (%.1f m) is outside reasonable range", alt);
+                   
+                   // Try opposite side of Earth if this is first iteration
+                   if (iter == 0) {
+                       state[0] = -state[0];
+                       state[1] = -state[1];
+                       state[2] = -state[2];
+                       ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
+                               state[0], state[1], state[2]);
+                   }
+               }
+           } else {
+               ROS_WARN("Position magnitude (%.1f m) is not near Earth radius", position_magnitude);
+               
+               // Try opposite side of Earth if this is first iteration
+               if (iter == 0) {
+                   state[0] = -state[0];
+                   state[1] = -state[1];
+                   state[2] = -state[2];
+                   ROS_WARN("Trying opposite side of Earth: [%.1f, %.1f, %.1f]", 
+                           state[0], state[1], state[2]);
+               }
+           }
+           
+           // Store current cost for next iteration
+           prev_cost = summary.final_cost;
+       }
+       
+       if (!valid_solution) {
+           ROS_WARN("Could not find a valid multi-system solution after multiple attempts");
+           
+           // Try GPS-only as fallback if we have enough GPS satellites
+           if (gps_idx.size() >= 4) {
+               ROS_INFO("Falling back to GPS-only solution with %zu satellites", gps_idx.size());
+               return solveGpsOnlyWLS(satellites, solution, use_all_satellites);
+           }
+           
+           return false;
+       }
+       
+       // Extract solution
+       solution.x = state[0];
+       solution.y = state[1];
+       solution.z = state[2];
+       solution.clock_bias = state[3];  // GPS clock bias
+       solution.glonass_clock_bias = state[4];  // GLONASS clock bias
+       solution.num_satellites = total_usable;
+       
+       // Convert to geodetic coordinates
+       CoordinateConverter::ecefToLla(
+           solution.x, solution.y, solution.z,
+           solution.latitude, solution.longitude, solution.altitude);
+       
+       ROS_INFO("Multi-system solution: ECEF [%.2f, %.2f, %.2f] m", 
+               solution.x, solution.y, solution.z);
+       ROS_INFO("                 lat/lon [%.6f, %.6f], alt %.2f m", 
+               solution.latitude * 180.0/M_PI, solution.longitude * 180.0/M_PI, solution.altitude);
+       ROS_INFO("                 clocks: GPS=%.2f m, GLONASS=%.2f m", 
+               solution.clock_bias, solution.glonass_clock_bias);
+       
+       // Calculate DOP values
+       std::vector<uint32_t> all_idx;
+       all_idx.insert(all_idx.end(), gps_idx.begin(), gps_idx.end());
+       all_idx.insert(all_idx.end(), glo_idx.begin(), glo_idx.end());
+       calculateMultiSystemDOP(satellites, all_idx, solution);
+       
+       return true;
+   }
+   
+   // Calculate DOP values for GPS-only solutions
+   void calculateGpsDOP(const std::vector<SatelliteInfo>& satellites, 
+                        const std::vector<uint32_t>& good_idx,
+                        GnssSolution& solution) {
+       // We need the geometry matrix for DOP calculation
+       Eigen::MatrixXd G(good_idx.size(), 4);  // 4 params for GPS-only
+       
+       // Fill the geometry matrix
+       for (size_t i = 0; i < good_idx.size(); i++) {
+           const auto& sat = satellites[good_idx[i]];
+           
+           // Unit vector from receiver to satellite
+           double dx = sat.sat_pos_x - solution.x;
+           double dy = sat.sat_pos_y - solution.y;
+           double dz = sat.sat_pos_z - solution.z;
+           double range = sqrt(dx*dx + dy*dy + dz*dz);
+           
+           // Normalize to unit vector
+           if (range > 1e-10) {
+               dx /= range;
+               dy /= range;
+               dz /= range;
+           }
+           
+           // Fill the geometry matrix
+           G(i, 0) = -dx;  // x component
+           G(i, 1) = -dy;  // y component
+           G(i, 2) = -dz;  // z component
+           G(i, 3) = 1.0;  // clock bias
+       }
+       
+       // Create weight matrix (diagonal) based on satellite weights
+       Eigen::MatrixXd W = Eigen::MatrixXd::Identity(good_idx.size(), good_idx.size());
+       for (size_t i = 0; i < good_idx.size(); i++) {
+           W(i, i) = satellites[good_idx[i]].weight;
+       }
+       
+       // Compute the covariance matrix
+       Eigen::MatrixXd cov_matrix;
+       try {
+           cov_matrix = (G.transpose() * W * G).inverse();
+           
+           // Calculate DOP values
+           solution.gdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2) + cov_matrix(3,3));
+           solution.pdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2));
+           solution.hdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1));
+           solution.vdop = sqrt(cov_matrix(2,2));
+           solution.tdop = sqrt(cov_matrix(3,3));
+           
+           // Store the covariance
+           solution.covariance = cov_matrix;
+           
+           ROS_INFO("DOP values: GDOP=%.2f, PDOP=%.2f, HDOP=%.2f, VDOP=%.2f, TDOP=%.2f",
+                   solution.gdop, solution.pdop, solution.hdop, solution.vdop, solution.tdop);
+       } catch (const std::exception& e) {
+           ROS_WARN("Exception in GPS-only DOP calculation: %s", e.what());
+           // Set default values
+           solution.gdop = 99.9;
+           solution.pdop = 99.9;
+           solution.hdop = 99.9;
+           solution.vdop = 99.9;
+           solution.tdop = 99.9;
+           
+           // Set identity covariance as fallback
+           solution.covariance = Eigen::Matrix<double, 4, 4>::Identity();
+       }
+   }
+   
+   // Calculate DOP values for multi-system solutions
+   void calculateMultiSystemDOP(const std::vector<SatelliteInfo>& satellites, 
+                               const std::vector<uint32_t>& good_idx,
+                               GnssSolution& solution) {
+       // For multi-system DOP, we'll use a modified G matrix that includes both clock bias terms
+       Eigen::MatrixXd G(good_idx.size(), 5);  // 5 params for multi-system
+       
+       // Fill the geometry matrix
+       for (size_t i = 0; i < good_idx.size(); i++) {
+           const auto& sat = satellites[good_idx[i]];
+           
+           // Unit vector from receiver to satellite
+           double dx = sat.sat_pos_x - solution.x;
+           double dy = sat.sat_pos_y - solution.y;
+           double dz = sat.sat_pos_z - solution.z;
+           double range = sqrt(dx*dx + dy*dy + dz*dz);
+           
+           // Normalize to unit vector
+           if (range > 1e-10) {
+               dx /= range;
+               dy /= range;
+               dz /= range;
+           }
+           
+           // Fill the geometry matrix
+           G(i, 0) = -dx;  // x component
+           G(i, 1) = -dy;  // y component
+           G(i, 2) = -dz;  // z component
+           
+           // Set clock bias column based on system
+           if (sat.system == GPS) {
+               G(i, 3) = 1.0;  // GPS clock bias
+               G(i, 4) = 0.0;  // No GLONASS contribution
+           } else if (sat.system == GLONASS) {
+               G(i, 3) = 0.0;  // No GPS contribution 
+               G(i, 4) = 1.0;  // GLONASS clock bias
+           } else {
+               // Default to GPS for other systems
+               G(i, 3) = 1.0;
+               G(i, 4) = 0.0;
+           }
+       }
+       
+       // Create weight matrix (diagonal) based on satellite weights
+       Eigen::MatrixXd W = Eigen::MatrixXd::Identity(good_idx.size(), good_idx.size());
+       for (size_t i = 0; i < good_idx.size(); i++) {
+           W(i, i) = satellites[good_idx[i]].weight;
+       }
+       
+       // Compute the covariance matrix
+       Eigen::MatrixXd cov_matrix;
+       try {
+           cov_matrix = (G.transpose() * W * G).inverse();
+           
+           // Calculate DOP values (focusing on position)
+           solution.gdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2) + 
+                               cov_matrix(3,3) + cov_matrix(4,4));
+           solution.pdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1) + cov_matrix(2,2));
+           solution.hdop = sqrt(cov_matrix(0,0) + cov_matrix(1,1));
+           solution.vdop = sqrt(cov_matrix(2,2));
+           solution.tdop = sqrt(cov_matrix(3,3) + cov_matrix(4,4));  // Combined time DOP
+           
+           // Store the covariance, but since we're using a larger matrix,
+           // we need to extract the 4x4 part for compatibility
+           Eigen::Matrix<double, 4, 4> reduced_cov = Eigen::Matrix<double, 4, 4>::Zero();
+           for (int i = 0; i < 3; i++) {
+               for (int j = 0; j < 3; j++) {
+                   reduced_cov(i, j) = cov_matrix(i, j);
+               }
+           }
+           // Use the GPS clock bias for the 4th component
+           reduced_cov(3, 3) = cov_matrix(3, 3);
+           solution.covariance = reduced_cov;
+           
+           ROS_INFO("DOP values: GDOP=%.2f, PDOP=%.2f, HDOP=%.2f, VDOP=%.2f, TDOP=%.2f",
+                   solution.gdop, solution.pdop, solution.hdop, solution.vdop, solution.tdop);
+       } catch (const std::exception& e) {
+           ROS_WARN("Exception in multi-system DOP calculation: %s", e.what());
+           // Set default values
+           solution.gdop = 99.9;
+           solution.pdop = 99.9;
+           solution.hdop = 99.9;
+           solution.vdop = 99.9;
+           solution.tdop = 99.9;
+           
+           // Set identity covariance as fallback
+           solution.covariance = Eigen::Matrix<double, 4, 4>::Identity();
+       }
+   }
+   
+   void debugSatelliteGeometry(const std::vector<SatelliteInfo>& satellites) {
+       // Skip if we don't have satellites
+       if (satellites.empty()) {
+           return;
+       }
+       
+       // Debug only the first satellite position computation in detail
+       const auto& first_sat = satellites[0];
+       
+       ROS_INFO("Detailed satellite geometry debugging:");
+       ROS_INFO("  Receiver position: [%.2f, %.2f, %.2f]", 
+               current_solution_.x, current_solution_.y, current_solution_.z);
+       
+       // Convert to LLA for better understanding
+       double lat, lon, alt;
+       CoordinateConverter::ecefToLla(
+           current_solution_.x, current_solution_.y, current_solution_.z, 
+           lat, lon, alt);
+       
+       ROS_INFO("  Receiver LLA: [%.6f°, %.6f°, %.2fm]", 
+               lat * 180.0/M_PI, lon * 180.0/M_PI, alt);
+       
+       // Validate the ECEF position by converting back
+       double x, y, z;
+       CoordinateConverter::llaToEcef(lat, lon, alt, x, y, z);
+       
+       ROS_INFO("  Converted back to ECEF: [%.2f, %.2f, %.2f] (validation)", x, y, z);
+       ROS_INFO("  Difference from original: [%.6f, %.6f, %.6f]", 
+               x - current_solution_.x, y - current_solution_.y, z - current_solution_.z);
+       
+       // Show satellite position and derived info
+       std::string system_str;
+       switch(first_sat.system) {
+           case GPS: system_str = "GPS"; break;
+           case GLONASS: system_str = "GLONASS"; break;
+           case GALILEO: system_str = "GALILEO"; break;
+           case BEIDOU: system_str = "BEIDOU"; break;
+           default: system_str = "UNKNOWN"; break;
+       }
+       
+       ROS_INFO("  Satellite ID: %d (system: %s)", first_sat.sat_id, system_str.c_str());
+       ROS_INFO("  Satellite position: [%.2f, %.2f, %.2f]", 
+               first_sat.sat_pos_x, first_sat.sat_pos_y, first_sat.sat_pos_z);
+       
+       // Compute and show receiver-to-satellite vector and range
+       double dx = first_sat.sat_pos_x - current_solution_.x;
+       double dy = first_sat.sat_pos_y - current_solution_.y;
+       double dz = first_sat.sat_pos_z - current_solution_.z;
+       double range = sqrt(dx*dx + dy*dy + dz*dz);
+       
+       ROS_INFO("  Vector to satellite: [%.2f, %.2f, %.2f], range: %.2f km", 
+               dx, dy, dz, range/1000.0);
+       
+       // Show computed elevation and azimuth
+       ROS_INFO("  Computed elevation: %.2f° (%.6f rad)", 
+               first_sat.elevation * 180.0/M_PI, first_sat.elevation);
+       ROS_INFO("  Computed azimuth: %.2f° (%.6f rad)", 
+               first_sat.azimuth * 180.0/M_PI, first_sat.azimuth);
+       
+       // Compute ENU vector directly for validation
+       // Rotation matrix from ECEF to ENU
+       double sin_lat = sin(lat), cos_lat = cos(lat);
+       double sin_lon = sin(lon), cos_lon = cos(lon);
+       
+       // Rotate ECEF vector to ENU
+       double e = -sin_lon * dx + cos_lon * dy;
+       double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
+       double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
+       
+       ROS_INFO("  ENU vector: E=%.2f, N=%.2f, U=%.2f", e, n, u);
+       
+       // Double-check elevation calculation
+       double horiz_dist = sqrt(e*e + n*n);
+       double check_elev = atan2(u, horiz_dist);
+       
+       ROS_INFO("  Validation elevation: %.2f°", check_elev * 180.0/M_PI);
+       ROS_INFO("  Difference: %.6f°", (check_elev - first_sat.elevation) * 180.0/M_PI);
+   }
+   
+   void publishResults(const std_msgs::Header& header, const GnssSolution& solution) {
+       // 1. Publish NavSatFix message
+       sensor_msgs::NavSatFix navsatfix;
+       navsatfix.header = header;
+       navsatfix.status.status = sensor_msgs::NavSatStatus::STATUS_FIX;
+       navsatfix.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
+       navsatfix.latitude = solution.latitude * 180.0 / M_PI;  // Convert to degrees
+       navsatfix.longitude = solution.longitude * 180.0 / M_PI;
+       navsatfix.altitude = solution.altitude;
+       
+       // Fill in covariance (position only)
+       // Map from ECEF covariance to lat/lon/alt (simplified)
+       navsatfix.position_covariance[0] = solution.covariance(0, 0);
+       navsatfix.position_covariance[4] = solution.covariance(1, 1);
+       navsatfix.position_covariance[8] = solution.covariance(2, 2);
+       navsatfix.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+       
+       // 2. Publish Odometry message
+       nav_msgs::Odometry odom;
+       odom.header = header;
+       odom.header.frame_id = "ecef";
+       odom.child_frame_id = frame_id_;
+       
+       // Set position in ECEF
+       odom.pose.pose.position.x = solution.x;
+       odom.pose.pose.position.y = solution.y;
+       odom.pose.pose.position.z = solution.z;
+       odom.pose.pose.orientation.w = 1.0;  // Identity quaternion
+       
+       // Set velocity in ECEF
+       odom.twist.twist.linear.x = solution.vx;
+       odom.twist.twist.linear.y = solution.vy;
+       odom.twist.twist.linear.z = solution.vz;
+       
+       // Set covariance
+       for (int i = 0; i < 3; ++i) {
+           for (int j = 0; j < 3; ++j) {
+               odom.pose.covariance[i * 6 + j] = solution.covariance(i, j);
+           }
+       }
+       
+       // 3. Publish PoseWithCovarianceStamped message (ENU format)
+       geometry_msgs::PoseWithCovarianceStamped pose;
+       pose.header = header;
+       pose.header.frame_id = "map";  // Local ENU frame
+       
+       // Convert ECEF to local ENU
+       // Need a reference point for ENU - using the first fix
+       static bool reference_set = false;
+       static double ref_lat, ref_lon, ref_alt;
+       static double ref_ecef_x, ref_ecef_y, ref_ecef_z;
+       
+       if (!reference_set && initialized_) {
+           ref_lat = solution.latitude;
+           ref_lon = solution.longitude;
+           ref_alt = solution.altitude;
+           ref_ecef_x = solution.x;
+           ref_ecef_y = solution.y;
+           ref_ecef_z = solution.z;
+           reference_set = true;
+           
+           ROS_INFO("Set ENU reference: Lat=%.7f°, Lon=%.7f°, Alt=%.2fm", 
+                   ref_lat * 180.0 / M_PI, ref_lon * 180.0 / M_PI, ref_alt);
+       }
+       
+       if (reference_set) {
+           // Calculate ENU position relative to reference
+           double dx = solution.x - ref_ecef_x;
+           double dy = solution.y - ref_ecef_y;
+           double dz = solution.z - ref_ecef_z;
+           
+           // Rotation matrix from ECEF to ENU
+           double sin_lat = sin(ref_lat);
+           double cos_lat = cos(ref_lat);
+           double sin_lon = sin(ref_lon);
+           double cos_lon = cos(ref_lon);
+           
+           // Rotate ECEF displacement to ENU
+           double e = -sin_lon * dx + cos_lon * dy;
+           double n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
+           double u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
+           
+           pose.pose.pose.position.x = e;
+           pose.pose.pose.position.y = n;
+           pose.pose.pose.position.z = u;
+           pose.pose.pose.orientation.w = 1.0;  // Identity quaternion
+           
+           // Transform velocity from ECEF to ENU
+           double ve = -sin_lon * solution.vx + cos_lon * solution.vy;
+           double vn = -sin_lat * cos_lon * solution.vx - sin_lat * sin_lon * solution.vy + cos_lat * solution.vz;
+           double vu = cos_lat * cos_lon * solution.vx + cos_lat * sin_lon * solution.vy + sin_lat * solution.vz;
+           
+           // Transform covariance from ECEF to ENU (simplified)
+           for (int i = 0; i < 3; ++i) {
+               for (int j = 0; j < 3; ++j) {
+                   pose.pose.covariance[i * 6 + j] = solution.covariance(i, j);
+               }
+           }
+       } else {
+           // Until we have a reference, just set zeros
+           pose.pose.pose.position.x = 0.0;
+           pose.pose.pose.position.y = 0.0;
+           pose.pose.pose.position.z = 0.0;
+           pose.pose.pose.orientation.w = 1.0;
+       }
+       
+       // Publish all messages
+       navsatfix_pub_.publish(navsatfix);
+       odom_pub_.publish(odom);
+       pose_pub_.publish(pose);
+   }
 };
 
 int main(int argc, char** argv) {
