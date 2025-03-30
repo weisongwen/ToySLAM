@@ -34,20 +34,24 @@
          doc="Disable elevation mask filtering (for debugging)" />
     <arg name="force_use_ephemeris" default="true"
          doc="Force using ephemeris regardless of age" />
-    <arg name="use_abs_elevation_during_init" default="true"
-         doc="Use absolute value of elevation during initialization" />
     
     <!-- ============================== SOLUTION SETTINGS ============================== -->
     <arg name="use_doppler" default="true" 
          doc="Use Doppler measurements for velocity estimation" />
+    <arg name="max_velocity" default="100.0"
+         doc="Maximum expected velocity in m/s (360 km/h)" />
     <arg name="apply_iono_correction" default="true" 
          doc="Apply ionospheric correction using Klobuchar model" />
+    <arg name="gps_only_mode" default="true"
+         doc="Use only GPS satellites (not GLONASS) for more stable solutions" />
     
-    <!-- ============================== DEBUG SETTINGS ============================== -->
-    <arg name="output_debug_info" default="true" 
-         doc="Output detailed debugging information" />
-    <arg name="debug_output_path" default="" 
-         doc="Path to write debug output file (if enabled)" />
+    <!-- ============================== DATA LOGGING ============================== -->
+    <arg name="output_csv_path" default="$(find ToySLAM)/data/spp_results.csv"
+         doc="Path to save SPP results in CSV format" />
+    <arg name="log_raw_data" default="false"
+         doc="Log raw satellite measurements to file" />
+    <arg name="raw_data_path" default=""
+         doc="Path to save raw GNSS measurement data (if enabled)" />
     
     <!-- ============================== TOPIC CONFIGURATION ============================== -->
     <!-- Topics for GNSS data -->
@@ -68,7 +72,7 @@
     <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(find ToySLAM)/rviz/gnssSpp.rviz" />
     
     <!-- ============================== GNSS SPP NODE ============================== -->
-    <node name="gnssSpp" pkg="ToySLAM" type="gnssSpp" output="screen" >
+    <node name="gnssSpp" pkg="ToySLAM" type="gnssSpp" output="screen" launch-prefix="gdb -ex run --args">
         <!-- Frame configuration -->
         <param name="frame_id" value="$(arg frame_id)" />
         
@@ -83,20 +87,21 @@
         <param name="cut_off_degree" value="$(arg cut_off_degree)" />
         
         <!-- Filter controls -->
-        <!-- Filter controls -->
         <param name="disable_cn0_filter" value="$(arg disable_cn0_filter)" />
         <param name="disable_elevation_filter" value="$(arg disable_elevation_filter)" />
         <param name="use_initialization_mode" value="$(arg use_initialization_mode)" />
         <param name="force_use_ephemeris" value="$(arg force_use_ephemeris)" />
-        <param name="use_abs_elevation_during_init" value="$(arg use_abs_elevation_during_init)" />
         
         <!-- Solution settings -->
         <param name="use_doppler" value="$(arg use_doppler)" />
+        <param name="max_velocity" value="$(arg max_velocity)" />
         <param name="apply_iono_correction" value="$(arg apply_iono_correction)" />
+        <param name="gps_only_mode" value="$(arg gps_only_mode)" />
         
-        <!-- Debug settings -->
-        <param name="output_debug_info" value="$(arg output_debug_info)" />
-        <param name="debug_output_path" value="$(arg debug_output_path)" />
+        <!-- Data logging -->
+        <param name="output_csv_path" value="$(arg output_csv_path)" />
+        <param name="log_raw_data" value="$(arg log_raw_data)" />
+        <param name="raw_data_path" value="$(arg raw_data_path)" />
         
         <!-- Remap topics -->
         <remap from="/ublox_driver/ephem" to="$(arg ephem_topic)" />
