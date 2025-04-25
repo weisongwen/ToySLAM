@@ -46,7 +46,7 @@
          doc="Use only GPS satellites (not GLONASS) for more stable solutions" />
     
     <!-- ============================== DATA LOGGING ============================== -->
-    <arg name="output_csv_path" default="$(find ToySLAM)/data/spp_results.csv"
+    <arg name="output_csv_path" default="/home/wws/Download/spp_results.csv"
          doc="Path to save SPP results in CSV format" />
     <arg name="log_raw_data" default="false"
          doc="Log raw satellite measurements to file" />
@@ -72,7 +72,7 @@
     <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" args="-d $(find ToySLAM)/rviz/gnssSpp.rviz" />
     
     <!-- ============================== GNSS SPP NODE ============================== -->
-    <node name="gnssSpp" pkg="ToySLAM" type="gnssSpp" output="screen" launch-prefix="gdb -ex run --args">
+    <node name="gnssSpp" pkg="ToySLAM" type="gnssSpp" output="screen" >
         <!-- Frame configuration -->
         <param name="frame_id" value="$(arg frame_id)" />
         
