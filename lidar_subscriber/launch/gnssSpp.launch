@@ -1,8 +1,6 @@
 <launch>
     <!-- ============================== GNSS SPP MODE ============================== -->
     <!-- Configuration for GNSS Single Point Positioning node -->
-    <arg name="use_initialization_mode" default="true" 
-         doc="Use more permissive settings during initialization to get first fix" />
          
     <!-- ============================== FRAME CONFIGURATION ============================== -->
     <arg name="frame_id" default="gnss" 
@@ -19,46 +17,48 @@
     
     <!-- ============================== MEASUREMENT SETTINGS ============================== -->
     <!-- Filtering settings for GNSS measurements -->
-    <arg name="min_cn0" default="5.0" 
+    <arg name="min_cn0" default="10.0" 
          doc="Minimum carrier-to-noise ratio (dB-Hz) - signals below this strength are ignored" />
     <arg name="min_satellites" default="4" 
          doc="Minimum number of satellites required for position solution" />
-    <arg name="cut_off_degree" default="0.0"
+    <arg name="cut_off_degree" default="10.0"
          doc="Elevation cutoff angle (degrees) for position calculation" />
     
     <!-- ============================== FILTER CONTROLS ============================== -->
     <!-- Debug options to bypass filters -->
     <arg name="disable_cn0_filter" default="false" 
          doc="Disable CN0 filtering (for debugging)" />
-    <arg name="disable_elevation_filter" default="true" 
+    <arg name="disable_elevation_filter" default="false" 
          doc="Disable elevation mask filtering (for debugging)" />
     <arg name="force_use_ephemeris" default="true"
          doc="Force using ephemeris regardless of age" />
     
     <!-- ============================== SOLUTION SETTINGS ============================== -->
-    <arg name="use_doppler" default="true" 
-         doc="Use Doppler measurements for velocity estimation" />
-    <arg name="max_velocity" default="100.0"
-         doc="Maximum expected velocity in m/s (360 km/h)" />
     <arg name="apply_iono_correction" default="true" 
          doc="Apply ionospheric correction using Klobuchar model" />
-    <arg name="gps_only_mode" default="true"
-         doc="Use only GPS satellites (not GLONASS) for more stable solutions" />
+    <arg name="current_gps_week" default="2134"
+         doc="Current GPS week number for time conversion" />
+    <arg name="current_leap_seconds" default="18.0"
+         doc="Current GPS-UTC leap seconds" />
+    
+    <!-- ============================== POSITION CORRECTION ============================== -->
+    <arg name="apply_position_offset" default="false"
+         doc="Apply position offset to correct local datum difference" />
+    <arg name="position_offset_east" default="-50.0"
+         doc="Position offset in East direction (meters)" />
+    <arg name="position_offset_north" default="-15.0"
+         doc="Position offset in North direction (meters)" />
+    <arg name="position_offset_up" default="0.0"
+         doc="Position offset in Up direction (meters)" />
     
     <!-- ============================== DATA LOGGING ============================== -->
     <arg name="output_csv_path" default="/home/wws/Download/spp_results.csv"
          doc="Path to save SPP results in CSV format" />
-    <arg name="log_raw_data" default="false"
-         doc="Log raw satellite measurements to file" />
-    <arg name="raw_data_path" default=""
-         doc="Path to save raw GNSS measurement data (if enabled)" />
     
     <!-- ============================== TOPIC CONFIGURATION ============================== -->
     <!-- Topics for GNSS data -->
     <arg name="ephem_topic" default="/ublox_driver/ephem" 
          doc="Topic for GPS ephemeris data" />
-    <arg name="glo_ephem_topic" default="/ublox_driver/glo_ephem" 
-         doc="Topic for GLONASS ephemeris data" />
     <arg name="iono_params_topic" default="/ublox_driver/iono_params" 
          doc="Topic for ionospheric parameters" />
     <arg name="range_meas_topic" default="/ublox_driver/range_meas" 
@@ -89,23 +89,24 @@
         <!-- Filter controls -->
         <param name="disable_cn0_filter" value="$(arg disable_cn0_filter)" />
         <param name="disable_elevation_filter" value="$(arg disable_elevation_filter)" />
-        <param name="use_initialization_mode" value="$(arg use_initialization_mode)" />
         <param name="force_use_ephemeris" value="$(arg force_use_ephemeris)" />
         
         <!-- Solution settings -->
-        <param name="use_doppler" value="$(arg use_doppler)" />
-        <param name="max_velocity" value="$(arg max_velocity)" />
         <param name="apply_iono_correction" value="$(arg apply_iono_correction)" />
-        <param name="gps_only_mode" value="$(arg gps_only_mode)" />
+        <param name="current_gps_week" value="$(arg current_gps_week)" />
+        <param name="current_leap_seconds" value="$(arg current_leap_seconds)" />
+        
+        <!-- Position offset correction -->
+        <param name="apply_position_offset" value="$(arg apply_position_offset)" />
+        <param name="position_offset_east" value="$(arg position_offset_east)" />
+        <param name="position_offset_north" value="$(arg position_offset_north)" />
+        <param name="position_offset_up" value="$(arg position_offset_up)" />
         
         <!-- Data logging -->
         <param name="output_csv_path" value="$(arg output_csv_path)" />
-        <param name="log_raw_data" value="$(arg log_raw_data)" />
-        <param name="raw_data_path" value="$(arg raw_data_path)" />
         
         <!-- Remap topics -->
         <remap from="/ublox_driver/ephem" to="$(arg ephem_topic)" />
-        <remap from="/ublox_driver/glo_ephem" to="$(arg glo_ephem_topic)" />
         <remap from="/ublox_driver/iono_params" to="$(arg iono_params_topic)" />
         <remap from="/ublox_driver/range_meas" to="$(arg range_meas_topic)" />
     </node>
