@@ -1,65 +1,42 @@
-# ToySLAM: A ROS Package for 3D Point Cloud Registration using NDT for PolyU course AAE4011
+# ToySLAM
 
-## Overview
-**ToySLAM** is a lightweight ROS package for 3D point cloud registration using the Normal Distributions Transform (NDT) algorithm. Designed for educational purposes and experimentation, this package provides a modular pipeline to process, align, and visualize point clouds in real-time. It serves as a foundational framework for SLAM (Simultaneous Localization and Mapping) applications and can be extended for robotics or autonomous systems.
+This project is a factor graph-based, GNSS/IMU fusion system designed to provide localization for autonomous driving and robotics applications. It is developed within the Robot Operating System (ROS) framework.
 
-[SLAM Dataset](https://www.dropbox.com/scl/fi/c9a4spcbqupvvcsacwbtf/2025-02-06-17-20-03.bag?rlkey=jkk60x2sn3awbcd5w1tx0mxgf&dl=0)
+## Project Structure
 
-## Features
-- **Modular Architecture**: Four standalone nodes for processing, alignment, mapping, and visualization.
-- **NDT-Based Registration**: Efficient alignment of 3D point clouds using the NDT implementation.
-- **Real-Time Visualization**: Live preview of registered point clouds and **trajectory** in RViz.
-- **Configurable Parameters**: Tune algorithm behavior via ROS parameters for optimal performance.
-- **Configurable Parameters**: Tune algorithm behavior via ROS parameters for optimal performance.
+This workspace (`toyslam_ws/src`) contains the following core ROS packages:
 
-### Nodes
-1. **lidar_subscriber_node.cpp**: subscribe the 3D LiDAR point clouds from the rosbag file and save the point clouds to the PCD files.
-2. **ndt_omp_mapping_node.cpp**: read the PCD file continuously and perform the ICP for the continuous PCD files. Output the 4x4 transformation matrix.
-3. **ndt_omp_node.cpp**: similar to the File 2, but also plot the trajectory in the Rviz of ROS.
-4. **ndt_rosbag_mapping_node.cpp**: Directly read the 3D point clouds from the rosbag file and perform the ICP continuously.
-
-### Folder tree
-
-```
-.
-├── CMakeLists.txt
-├── package.xml
-└── src
-    ├── lidar_subscriber_node.cpp
-    ├── ndt_omp_mapping_node.cpp
-    ├── ndt_omp_node.cpp
-    └── ndt_rosbag_mapping_node.cpp
-```
+- `gnss_imu_fusion`: The core package of the project, implementing the full pipeline for sensor data processing, factor graph construction, and state estimation.
+- `gnss_comm`: Provides common GNSS data structures (message definitions) and processing utilities.
+- `nmea_parser`: A parser for NMEA-formatted GNSS data.
+- `novatel_span_driver`: A ROS driver for NovAtel SPAN series of integrated navigation systems.
+- `nlosexclusion`: A utility package for processing and excluding Non-Line-of-Sight (NLOS) satellite signals.
 
 ## Dependencies
-- **ROS Noetic** (or other [ROS](http://www.ros.org/) distributions)
-- **PCL 1.10+** (`libpcl-dev`, `ros-<distro>-pcl-ros`)
-- **Eigen3**
-- **RViz** for visualization
 
-## Installation
-1. Clone this repository into your ROS workspace:
-   ```bash
-   cd ~/catkin_ws/src
-   git clone https://github.com/weisongwen/ToySLAM
-   catkin_make
-   rosrun ToySLAM  ndt_rosbag_mapping_node /home/wws/Download/UrbanNav-HK_Whampoa-20210521_sensors.bag
-   ```
+- **ROS**: Melodic or Noetic
+- **Ceres Solver**: For non-linear optimization
+- **Eigen**: For matrix operations
+- **Glog**: Google Logging Library
 
+## How to Build
 
-## NEW updates for further extension (Optional)
-1. ```uwb_node.cpp```
-    - simulate the UWB ranging measurements and do the positioning
-    - ```roslaunch ToySLAM fusion.launch ```
+1.  Clone this repository into the `src` directory of your Catkin workspace.
+2.  Build the project by running `catkin_make` or `catkin build` from the root of your workspace.
 
-2. ```uwb_imu_node.cpp```
-    - UWB/IMU fusion via sliding window optimization
-    - ```rosrun ToySLAM uwb_imu_node ```
+```bash
+cd ~/your_catkin_ws
+catkin_make
+```
 
-3. ```uwb_imu_sim_node.cpp```
-    - UWB/IMU data simulation. Perform the least square estimation for UWB ranging measurements with visualization
-    - ```roslaunch ToySLAM uwb_imu_fusion_sim.launch ```
-4. ```uwb_imu_EKF_node.cpp```
-    - UWB/IMU fusion with EKF. The simulated IMU data is not correct, please use the dataset ```2025-02-06-16-30-08.bag```
-    - ```rosrun ToySLAM uwb_imu_EKF_node ```
-    - ```rosbag play 2025-02-06-16-30-08.bag ```
+## How to Run
+
+1.  First, modify the configuration file `src/gnss_imu_fusion/config/params.yaml` to match your sensor topic names, extrinsic parameters, etc.
+2.  Launch the fusion node by running the launch file:
+
+```bash
+source devel/setup.bash
+roslaunch gnss_imu_fusion gnss_imu_fusion.launch
+```
+3.  Play your sensor data from a `rosbag` file.
+4.  You can visualize the real-time pose and trajectory in RViz. A pre-configured RViz file is available in `src/gnss_imu_fusion/rviz/`.
